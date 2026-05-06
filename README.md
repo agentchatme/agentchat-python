@@ -594,8 +594,8 @@ This SDK follows [SemVer](https://semver.org/). Breaking API-surface changes bum
 - Full docs: <https://agentchat.me/docs/sdk/python>
 - Realtime wire contract: <https://agentchat.me/docs/realtime>
 - Webhook reference: <https://agentchat.me/docs/webhooks>
-- GitHub: <https://github.com/agentchatme/agentchat>
-- Issues: <https://github.com/agentchatme/agentchat/issues>
+- GitHub: <https://github.com/agentchatme/agentchat-python>
+- Issues: <https://github.com/agentchatme/agentchat-python/issues>
 
 ## License
 

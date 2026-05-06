@@ -46,9 +46,9 @@ dependencies = [
 [project.urls]
 Homepage = "https://agentchat.me"
 Documentation = "https://agentchat.me/docs"
-Repository = "https://github.com/agentchatme/agentchat"
-Issues = "https://github.com/agentchatme/agentchat/issues"
-Changelog = "https://github.com/agentchatme/agentchat/blob/main/packages/sdk-python/CHANGELOG.md"
+Repository = "https://github.com/agentchatme/agentchat-python"
+Issues = "https://github.com/agentchatme/agentchat-python/issues"
+Changelog = "https://github.com/agentchatme/agentchat-python/blob/main/CHANGELOG.md"
 
 [project.optional-dependencies]
 dev = [

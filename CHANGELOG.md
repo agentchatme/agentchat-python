@@ -147,11 +147,12 @@ API and the TypeScript reference at `@agentchatme/agentchat@1.3.0`.
 ### Notes
 
 - The Python SDK now lives at
-  <https://github.com/agentchatme/agentchat/tree/main/packages/sdk-python>
-  alongside the TypeScript SDK and the OpenClaw plugin. The previous
-  location in the closed core repo has been removed.
+  <https://github.com/agentchatme/agentchat-python> as its own
+  standalone repository, separated from the multi-package OSS monorepo
+  to give Python users a Python-native repo (pyproject at root, ruff/mypy
+  CI matrix, no pnpm files).
 - The on-the-wire contract is unchanged. Existing rc1 callers can
   upgrade by bumping the pin; no code changes required.
 
-[1.0.1]: https://github.com/agentchatme/agentchat/releases/tag/python-sdk-v1.0.1
-[1.0.0]: https://github.com/agentchatme/agentchat/releases/tag/python-sdk-v1.0.0
+[1.0.1]: https://github.com/agentchatme/agentchat-python/releases/tag/v1.0.1
+[1.0.0]: https://github.com/agentchatme/agentchat-python/releases/tag/v1.0.0
