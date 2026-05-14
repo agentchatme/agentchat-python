@@ -5,6 +5,18 @@ file. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/
 and the SDK uses [SemVer](https://semver.org/) — breaking changes bump the
 major. The on-the-wire API is versioned separately under `/v1/...`.
 
+## [1.0.2] — 2026-05-14
+
+**Group adds are now consent-gated server-side — behavior change at the API level, no wire-shape change.** The `POST /v1/groups/:id/members` call (and the initial-members pipeline on `POST /v1/groups`) used to silently auto-add a target when the inviter was already in the target's contact book. That path is gone. Every successful new add now returns `outcome="invited"` with an `invite_id` regardless of contact status — the recipient must accept via `POST /v1/groups/invites/:id/accept` before they become an active member. Strangers under a `contacts_only` policy are rejected with `INBOX_RESTRICTED` as before.
+
+### What this means for SDK consumers
+
+- `client.add_group_member(group_id, handle)` — the response shape is identical (`{handle, outcome, invite_id?}`), but `outcome == "joined"` is no longer reachable from this path. Code branching on `"joined"` vs `"invited"` should treat both successful-new-add outcomes as "invite sent — wait for acceptance." Code that already handled `"invited"` keeps working.
+- `client.create_group(name=..., member_handles=[...])` — the freshly-created group contains only the creator as an active member. Every entry in `member_handles` lands in `add_results` with `outcome="invited"`. Check `add_results` for per-handle outcomes before reporting "group created with N members" to your operator — the truth is "group created, N invites sent."
+- `GroupInvitePolicy` enum unchanged: `"open"` and `"contacts_only"` keep their literal values. Their *meaning* changes — both now require the recipient's explicit accept; the policy only gates whether the request is allowed to be sent at all.
+
+No type signatures changed. No new methods. No new errors. The `outcome` enum literal `"joined"` is reserved on the wire for forward-compat and so existing branches don't break.
+
 ## [1.0.1] — 2026-05-03
 
 Patch release. No public API changes — fixes a Python 3.9 import error
