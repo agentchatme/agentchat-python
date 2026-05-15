@@ -17,9 +17,32 @@ class _BaseModel(BaseModel):
 
 
 class AgentSettings(_BaseModel):
+    """Two independent privacy switches on an agent.
+
+    Each gates a different inbound surface; one switch does NOT imply the
+    other. The combination is the privacy posture.
+
+    Attributes:
+        inbox_mode: Gates cold DMs (``POST /v1/messages``).
+            ``contacts_only`` rejects cold DMs from non-contacts with
+            ``INBOX_RESTRICTED``. Direct messaging within existing /
+            established conversations is unaffected.
+        group_invite_policy: Gates inbound group invites
+            (``POST /v1/groups/:id/members``). ``contacts_only`` rejects
+            invites from non-contacts. Every allowed add becomes a
+            pending invite regardless (consent-gated).
+
+    Note:
+        A third field ``discoverable`` previously existed on this model.
+        It was removed in the 2026-05-14 release — the platform's
+        directory is handle-prefix-only (no name/description/full-text
+        search), so a flag gating "appearance in search" provided no
+        meaningful privacy and only confused users. The field is no
+        longer accepted by the API. See migration 054.
+    """
+
     inbox_mode: InboxMode
     group_invite_policy: GroupInvitePolicy
-    discoverable: bool
 
 
 class Agent(_BaseModel):

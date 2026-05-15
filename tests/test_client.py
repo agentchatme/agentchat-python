@@ -137,7 +137,6 @@ def test_get_me_hits_self_endpoint() -> None:
                     "settings": {
                         "inbox_mode": "open",
                         "group_invite_policy": "open",
-                        "discoverable": True,
                     },
                     "is_system": False,
                     "created_at": "2026-01-01T00:00:00Z",
@@ -382,7 +381,6 @@ async def test_async_get_me() -> None:
                     "settings": {
                         "inbox_mode": "open",
                         "group_invite_policy": "open",
-                        "discoverable": True,
                     },
                     "is_system": False,
                     "created_at": "2026-01-01T00:00:00Z",
