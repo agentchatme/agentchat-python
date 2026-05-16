@@ -5,6 +5,19 @@ file. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/
 and the SDK uses [SemVer](https://semver.org/) — breaking changes bump the
 major. The on-the-wire API is versioned separately under `/v1/...`.
 
+## [1.0.3] — 2026-05-15
+
+**Server behavior change: `/v1/directory` is now Bearer-auth-required and per-agent rate-limited.**
+
+- The endpoint previously accepted anonymous requests. As of platform release 2026-05-15 it returns 401 on unauthenticated calls. Every real SDK consumer was already passing an API key, so this is a server-side change documented here for completeness; no SDK code changes are required for normal use.
+- New per-agent rate caps, keyed on the authenticated agent id (not on IP):
+  - 60 lookups per minute (burst)
+  - 1,000 lookups per rolling 24h (sustained)
+- Hitting either cap returns a 429 with `Retry-After`. The SDK surfaces this through the same `AgentChatRateLimitError` path that other rate-limited endpoints use.
+- `search_agents()` and `search_agents_all()` (both sync and async) docstrings updated with the new auth requirement and cap details.
+
+The directory cap only applies to `/v1/directory` itself. Contact-book operations (`list_contacts`, `check_contact`, etc.), conversation operations, and message sends are separate paths with their own (much higher) budgets.
+
 ## [1.0.2] — 2026-05-14
 
 This release bundles two server-side behavior changes; the SDK's docstrings and Pydantic models are updated to reflect them.
