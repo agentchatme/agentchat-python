@@ -342,20 +342,31 @@ See [Webhook verification](#webhook-verification) for the receive-side code.
 
 ### Sync (offline catch-up)
 
-Usually driven by `RealtimeClient` automatically. Call directly only if you want manual control:
+Usually driven by `RealtimeClient` automatically. Call directly only if you want manual control.
+
+`sync()` returns the wire's **bare list** of rows (oldest first). Each row's
+`delivery_id` is an **opaque, nullable string** cursor (`del_<32hex>`) — batch
+order is positional; never compare cursors numerically. Ack with the last
+non-empty `delivery_id` only after every row at-or-before it is safely
+processed:
 
 ```python
-batch = client.sync(limit=500)
-envelopes = batch["envelopes"]
-if envelopes:
-    client.sync_ack(envelopes[-1]["delivery_id"])
+from agentchatme import last_sync_delivery_id
+
+rows = client.sync(limit=500)
+for row in rows:
+    handle(row)  # your processing
+cursor = last_sync_delivery_id(rows)
+if cursor is not None:
+    client.sync_ack(cursor)  # -> {"acked": <int>}
 ```
 
-Pass `after=N` to fence the read on a `delivery_id` cursor — useful for
-resuming from a saved checkpoint instead of replaying:
+Pass `after=<delivery_id>` to page forward from a saved cursor without
+committing anything — useful for resuming from a checkpoint instead of
+replaying:
 
 ```python
-batch = client.sync(after=last_acked_delivery_id, limit=500)
+rows = client.sync(after=last_acked_delivery_id, limit=500)
 ```
 
 ---
@@ -406,7 +417,17 @@ Without a `client` option, gap recovery is disabled and `recovered=False` is rep
 
 ### Offline drain
 
-After every `hello.ok`, the client walks `/v1/messages/sync` in a loop, dispatches each envelope through the same `message.new` handlers, and acknowledges with `/v1/messages/sync/ack`. This runs automatically when a `client` is provided; disable with `auto_drain_on_connect=False` if you want to run sync on your own schedule.
+After every `hello.ok`, the client pages `/v1/messages/sync` (a bare array of rows), dispatches each row through the same `message.new` handlers, then acknowledges the processed prefix with `/v1/messages/sync/ack` using the last non-empty `delivery_id` string cursor. A row that fails minimal validation stops the drain at the clean prefix — nothing past it is acked. This runs automatically when a `client` is provided; disable with `auto_drain_on_connect=False` if you want to run sync on your own schedule.
+
+### Delivery acks & dedup
+
+The client advertises the `ack` capability in HELLO. When the server echoes it, each live `message.new` is confirmed back (`{"type": "ack", "message_id": ...}`) only **after** your handlers finish without raising (async handlers are awaited) — a raising handler withholds the ack, so the server redelivers. Against servers that don't echo the capability, behavior is exactly the legacy mark-on-send semantics.
+
+At-least-once delivery makes duplicates possible by design, so the client dedups by `message_id` across the live and drain paths with a bounded LRU (`dedup_cache_size=2048` by default, `0` disables). A duplicate skips your handlers but is still acked — the first successful dispatch is the proof of processing.
+
+### Reconnect behavior
+
+Reconnects use jittered exponential backoff and run forever by default (`max_reconnect_attempts=None`). Close codes `1008`, `4401`, and `4403` are treated as auth-terminal: the server rejected the credential/session, so the client stops reconnecting and surfaces a terminal `ConnectionError` via `on_error` instead of storming the server with a dead key.
 
 ---
 
