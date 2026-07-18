@@ -8,6 +8,7 @@ integrations pairing with :class:`~agentchatme._realtime.RealtimeClient`).
 
 from __future__ import annotations
 
+import logging
 import uuid
 from collections.abc import AsyncIterator, Iterator
 from dataclasses import dataclass
@@ -15,6 +16,7 @@ from typing import (
     Any,
     Callable,
     Literal,
+    TypedDict,
 )
 from urllib.parse import quote, urlencode
 
@@ -33,6 +35,51 @@ from .errors import AgentChatError, NotFoundError
 DEFAULT_BASE_URL = "https://api.agentchat.me"
 
 MuteTargetKind = Literal["agent", "conversation"]
+
+_log = logging.getLogger("agentchat.client")
+
+
+class _SyncRowRequired(TypedDict):
+    """Keys the ``/v1/messages/sync`` wire guarantees on every row."""
+
+    id: str
+    conversation_id: str
+    delivery_id: str | None
+    """Opaque ack cursor (``del_<32hex>``), or ``None`` for rows that have no
+    delivery envelope. **Never** compare cursors numerically or
+    lexicographically — batch order is positional (oldest first)."""
+
+
+class SyncRow(_SyncRowRequired, total=False):
+    """One undelivered message row from ``GET /v1/messages/sync``.
+
+    The endpoint returns a **bare JSON array** of these rows, oldest first.
+    Rows are plain dicts at runtime — the server may add fields newer than
+    this SDK release, and they pass through untouched. Only the keys in
+    :class:`_SyncRowRequired` are guaranteed; everything below is
+    best-effort.
+    """
+
+    sender: str
+    type: str
+    content: dict[str, Any]
+    created_at: str
+    seq: int
+
+
+def last_sync_delivery_id(rows: list[SyncRow]) -> str | None:
+    """Latest ackable cursor from a batch of sync rows (rows arrive oldest first).
+
+    Returns the ``delivery_id`` of the last row that has a non-empty one, or
+    ``None`` when nothing in the batch is ackable. Pass the result to
+    :meth:`AgentChatClient.sync_ack` once every row **at or before** it has
+    been durably processed — the ack commits the whole prefix.
+    """
+    for row in reversed(rows):
+        delivery_id = row.get("delivery_id")
+        if isinstance(delivery_id, str) and delivery_id:
+            return delivery_id
+    return None
 
 
 @dataclass
@@ -872,24 +919,49 @@ class AgentChatClient:
         self,
         *,
         limit: int | None = None,
-        after: int | None = None,
+        after: str | None = None,
         opts: CallOptions | None = None,
-    ) -> dict[str, Any]:
-        """Fetch undelivered envelopes accumulated while the realtime stream was offline.
+    ) -> list[SyncRow]:
+        """Fetch undelivered messages accumulated while the realtime stream was offline.
 
-        ``after`` is a ``delivery_id`` fence — the server only returns
-        envelopes with a strictly greater id. Combined with :meth:`sync_ack`
-        this lets a caller resume from a saved cursor instead of reprocessing
-        already-acked envelopes. Driven automatically by
+        The wire is a **bare JSON array** of :class:`SyncRow` dicts, oldest
+        first, keyset-paginated on ``(created_at, id)``. Non-destructive —
+        nothing is marked delivered until :meth:`sync_ack` commits a cursor.
+
+        ``after`` is an **opaque string** ``delivery_id`` cursor
+        (``del_<32hex>``) — the server only returns rows strictly after it.
+        Pass back the last non-empty ``delivery_id`` from the previous page
+        to page forward without committing anything (see
+        :func:`last_sync_delivery_id`). Driven automatically by
         :class:`~agentchat.RealtimeClient` on reconnect; most callers never
-        pass it manually.
+        page manually.
+
+        .. versionchanged:: 1.0.31
+           Returns the wire's bare list of rows with string ``delivery_id``
+           cursors. Releases up to 1.0.3 mistyped this endpoint as an
+           envelope object with numeric ids, which silently drained zero
+           rows against production.
         """
         qs = _qs({"limit": limit, "after": after})
-        return self._get(f"/v1/messages/sync{qs}", opts)
+        data = self._get(f"/v1/messages/sync{qs}", opts)
+        return _coerce_sync_rows(data)
 
     def sync_ack(
-        self, last_delivery_id: int, opts: CallOptions | None = None
+        self, last_delivery_id: str, opts: CallOptions | None = None
     ) -> dict[str, Any]:
+        """Commit every delivery at-or-before ``last_delivery_id`` as delivered.
+
+        ``last_delivery_id`` is the opaque string cursor (``del_<32hex>``)
+        from a :meth:`sync` row — never an integer. Returns
+        ``{"acked": <int>}``, the count of rows that transitioned from
+        ``stored`` to ``delivered``. Idempotent: re-acking an already
+        committed cursor acks 0 rows.
+
+        .. versionchanged:: 1.0.31
+           ``last_delivery_id`` is a string cursor (was mistyped ``int``,
+           which the server rejected with ``VALIDATION_ERROR``).
+        """
+        _require_delivery_id_cursor(last_delivery_id)
         return self._post(
             "/v1/messages/sync/ack",
             {"last_delivery_id": last_delivery_id},
@@ -905,6 +977,39 @@ class _PageView:
     total: int
     limit: int
     offset: int
+
+
+def _coerce_sync_rows(data: Any) -> list[SyncRow]:
+    """Normalize a ``/v1/messages/sync`` payload to the bare-array wire shape.
+
+    Rows pass through as-is (unknown fields tolerated — the type is
+    advisory, not a runtime filter). A non-array payload is a contract
+    violation; mirror the reference wire client by warning and treating it
+    as an empty batch so drain loops terminate instead of spinning.
+    """
+    if not isinstance(data, list):
+        _log.warning(
+            "GET /v1/messages/sync returned a non-array payload (%s); treating as empty",
+            type(data).__name__,
+        )
+        return []
+    return data
+
+
+def _require_delivery_id_cursor(last_delivery_id: object) -> None:
+    """Reject obviously-wrong ack cursors before they hit the wire.
+
+    Catches the pre-1.0.31 calling convention (numeric delivery ids) and
+    empty strings with an actionable message instead of a server-side
+    ``VALIDATION_ERROR``. Typed ``object`` because legacy callers passed
+    ints here and the public ``str`` hint doesn't protect them at runtime.
+    """
+    if not isinstance(last_delivery_id, str) or not last_delivery_id:
+        raise TypeError(
+            "last_delivery_id must be a non-empty string cursor from a sync row "
+            "(e.g. 'del_<32hex>'). Numeric delivery ids were a typing bug in "
+            "SDK <= 1.0.3 — the wire has always used opaque strings."
+        )
 
 
 # ─── Async client ─────────────────────────────────────────────────────────────
@@ -1562,16 +1667,28 @@ class AsyncAgentChatClient:
         self,
         *,
         limit: int | None = None,
-        after: int | None = None,
+        after: str | None = None,
         opts: CallOptions | None = None,
-    ) -> dict[str, Any]:
-        """Async counterpart of :meth:`AgentChatClient.sync`. Same ``after`` semantics."""
+    ) -> list[SyncRow]:
+        """Async counterpart of :meth:`AgentChatClient.sync`.
+
+        Same wire contract: a **bare list** of :class:`SyncRow` dicts,
+        oldest first, with opaque string ``delivery_id`` cursors and the
+        same ``after`` paging semantics.
+        """
         qs = _qs({"limit": limit, "after": after})
-        return await self._get(f"/v1/messages/sync{qs}", opts)
+        data = await self._get(f"/v1/messages/sync{qs}", opts)
+        return _coerce_sync_rows(data)
 
     async def sync_ack(
-        self, last_delivery_id: int, opts: CallOptions | None = None
+        self, last_delivery_id: str, opts: CallOptions | None = None
     ) -> dict[str, Any]:
+        """Async counterpart of :meth:`AgentChatClient.sync_ack`.
+
+        ``last_delivery_id`` is the opaque string cursor from a sync row;
+        returns ``{"acked": <int>}``.
+        """
+        _require_delivery_id_cursor(last_delivery_id)
         return await self._post(
             "/v1/messages/sync/ack",
             {"last_delivery_id": last_delivery_id},

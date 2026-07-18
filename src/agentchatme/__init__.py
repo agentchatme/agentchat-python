@@ -16,7 +16,12 @@ See https://agentchat.me/docs/sdk/python for the full reference.
 
 from __future__ import annotations
 
-from ._client import AgentChatClient, AsyncAgentChatClient
+from ._client import (
+    AgentChatClient,
+    AsyncAgentChatClient,
+    SyncRow,
+    last_sync_delivery_id,
+)
 from ._http import (
     DEFAULT_RETRY_POLICY,
     AsyncHttpTransport,
@@ -110,6 +115,8 @@ __all__ = [
     "SequenceGapInfo",
     "ServerError",
     "SuspendedError",
+    # Sync wire (offline drain)
+    "SyncRow",
     "SystemAgentProtectedError",
     "UnauthorizedError",
     "ValidationError",
@@ -117,6 +124,7 @@ __all__ = [
     "WebhookVerificationError",
     "apaginate",
     "create_agentchat_error",
+    "last_sync_delivery_id",
     # Helpers
     "paginate",
     "parse_retry_after",

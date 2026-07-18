@@ -3,9 +3,13 @@
 Mirrors the TypeScript ``RealtimeClient`` behavior:
 
 - HELLO handshake with 4 s ack timeout (authenticates over wire, never URL)
+- Capability-negotiated delivery acks (``ack``): at-least-once delivery
+  with per-message confirmation after handler dispatch
+- Bounded message-id dedup across the live and offline-drain paths
 - Per-conversation seq ordering with out-of-order buffering
 - Gap detection with optional ``AsyncAgentChatClient``-backed recovery
-- Jittered exponential reconnect, disposed flag, offline ``/sync`` drain
+- Jittered exponential reconnect (halting on auth-terminal close codes),
+  disposed flag, offline ``/sync`` drain speaking the bare-array wire
 
 The client is async-only because Python's WebSocket story is asyncio-native.
 Pair it with an :class:`~agentchat.AsyncAgentChatClient` for gap recovery and
@@ -21,6 +25,7 @@ import json
 import logging
 import random
 import time
+from collections import OrderedDict
 from collections.abc import Awaitable, Coroutine
 from dataclasses import dataclass, field
 from typing import (
@@ -31,10 +36,11 @@ from typing import (
     Union,
 )
 
+from ._client import last_sync_delivery_id
 from .errors import ConnectionError as _RealtimeConnectionError
 
 if TYPE_CHECKING:
-    from ._client import AsyncAgentChatClient
+    from ._client import AsyncAgentChatClient, SyncRow
 
 
 # ───────────────────────── Public type aliases ─────────────────────────
@@ -74,6 +80,12 @@ class SequenceGapInfo:
 SequenceGapHandler = Callable[[SequenceGapInfo], Union[None, Awaitable[None]]]
 
 
+# Default bound on the message-id dedup LRU shared by the live and drain
+# paths. At-least-once delivery makes duplicates a design feature; 2048 ids
+# comfortably covers a reconnect/drain burst without unbounded growth.
+_DEFAULT_DEDUP_CACHE_SIZE = 2048
+
+
 @dataclass
 class RealtimeOptions:
     """Configuration for :class:`RealtimeClient`."""
@@ -87,6 +99,8 @@ class RealtimeOptions:
     client: AsyncAgentChatClient | None = None
     on_sequence_gap: SequenceGapHandler | None = None
     auto_drain_on_connect: bool | None = None  # None → True iff client set
+    dedup_cache_size: int = _DEFAULT_DEDUP_CACHE_SIZE
+    """Bound on the message-id dedup LRU (live + drain). ``0`` disables dedup."""
 
 
 # ───────────────────────── Internal constants ─────────────────────────
@@ -107,14 +121,75 @@ _MAX_BUFFERED_PER_CONVERSATION = 500
 # Maximum rows requested in a single ``get_messages`` gap-fill.
 _GAP_FILL_LIMIT = 200
 
-# Sync drain page size sentinel — matches server default.
+# Sync drain page size. Passed explicitly as ``limit`` so the short-page
+# check compares against the size WE requested — the server-side default
+# (200) is larger and may drift independently of this SDK.
 _SYNC_PAGE_SIZE = 100
+
+# Capability strings advertised in the HELLO frame. The server echoes the
+# subset it accepted on ``hello.ok``; anything not echoed stays disabled
+# locally (a ``hello.ok`` without ``capabilities`` means legacy server).
+_CLIENT_CAPABILITIES = ("ack",)
+
+# Close codes after which reconnecting is pointless: the server rejected
+# this credential/session, not this connection. 1008 is the standard
+# policy-violation code used for auth rejects; 4401/4403 are the
+# application-level unauthorized/forbidden codes.
+_AUTH_TERMINAL_CLOSE_CODES = frozenset({1008, 4401, 4403})
+
+
+@dataclass
+class _PendingEnvelope:
+    """A ``message.new`` frame buffered by the ordering layer, plus its
+    delivery-ack eligibility.
+
+    ``ws_ack`` records where the envelope entered the client: ``True`` for
+    frames received on the live socket (ack-mode confirms them per-message
+    after dispatch), ``False`` for rows injected by the REST drain or a
+    gap-fill (those are committed via the ``/sync/ack`` cursor instead).
+    The flag travels with the frame through the out-of-order buffer so a
+    live frame that sat behind a seq gap still acks once dispatched.
+    """
+
+    message: dict[str, Any]
+    ws_ack: bool
+
+
+class _BoundedLruSet:
+    """Bounded LRU membership set used for message-id dedup.
+
+    :meth:`hit` refreshes recency on lookup so an id that keeps re-arriving
+    (drain ↔ live races, server redelivery) cannot age out while it is
+    still hot. Once ``capacity`` is exceeded the least-recently-seen id is
+    evicted. A capacity of zero (or less) disables the set entirely.
+    """
+
+    __slots__ = ("_capacity", "_entries")
+
+    def __init__(self, capacity: int) -> None:
+        self._capacity = capacity
+        self._entries: OrderedDict[str, None] = OrderedDict()
+
+    def hit(self, key: str) -> bool:
+        """Return ``True`` (and refresh recency) if ``key`` was seen before."""
+        if key not in self._entries:
+            return False
+        self._entries.move_to_end(key)
+        return True
+
+    def add(self, key: str) -> None:
+        if self._capacity <= 0:
+            return
+        self._entries[key] = None
+        self._entries.move_to_end(key)
+        while len(self._entries) > self._capacity:
+            self._entries.popitem(last=False)
 
 
 @dataclass
 class _OrderState:
     next_expected_seq: int | None = None
-    buffer: dict[int, dict[str, Any]] = field(default_factory=dict)
+    buffer: dict[int, _PendingEnvelope] = field(default_factory=dict)
     gap_task: asyncio.Task[None] | None = None
     gap_started_at: float | None = None
     gap_started_expected_seq: int | None = None
@@ -155,6 +230,7 @@ class RealtimeClient:
         client: AsyncAgentChatClient | None = None,
         on_sequence_gap: SequenceGapHandler | None = None,
         auto_drain_on_connect: bool | None = None,
+        dedup_cache_size: int | None = None,
         websocket_connect: Callable[..., Awaitable[Any]] | None = None,
     ) -> None:
         if options is None:
@@ -176,6 +252,11 @@ class RealtimeClient:
                 client=client,
                 on_sequence_gap=on_sequence_gap,
                 auto_drain_on_connect=auto_drain_on_connect,
+                dedup_cache_size=(
+                    dedup_cache_size
+                    if dedup_cache_size is not None
+                    else _DEFAULT_DEDUP_CACHE_SIZE
+                ),
             )
 
         if options.auto_drain_on_connect is None:
@@ -193,6 +274,17 @@ class RealtimeClient:
         self._authenticated = False
         self._disposed = False
         self._order_states: dict[str, _OrderState] = {}
+        # Delivery-ack mode: on only when THIS connection's hello.ok echoed
+        # the `ack` capability. Reset on every connect/close.
+        self._ack_mode = False
+        # Set by the HELLO watchdog before it closes the socket, so the
+        # recv loop can tell our own 1008 self-close (transient handshake
+        # timeout → keep reconnecting) from a server-sent auth-terminal one.
+        self._watchdog_closed_socket = False
+        # Message-id dedup shared by the live and drain paths. Survives
+        # reconnects deliberately: redelivery across connections is exactly
+        # the duplicate source it exists to absorb.
+        self._dedup = _BoundedLruSet(options.dedup_cache_size)
 
         self._handlers: dict[str, set[MessageHandler]] = {}
         self._error_handlers: set[ErrorHandler] = set()
@@ -235,10 +327,20 @@ class RealtimeClient:
             raise error from err
 
         self._authenticated = False
+        self._ack_mode = False
+        self._watchdog_closed_socket = False
 
         try:
             await self._ws.send(
-                json.dumps({"type": "hello", "api_key": self._opts.api_key})
+                json.dumps(
+                    {
+                        "type": "hello",
+                        "api_key": self._opts.api_key,
+                        # Advertised capabilities; the server ignores unknown
+                        # strings and echoes the accepted subset on hello.ok.
+                        "capabilities": list(_CLIENT_CAPABILITIES),
+                    }
+                )
             )
         except Exception as err:
             await self._emit_error(
@@ -278,6 +380,10 @@ class RealtimeClient:
         await self._emit_error(_RealtimeConnectionError("HELLO ack timeout"))
         ws = self._ws
         if ws is not None:
+            # Mark the close as self-inflicted: 1008 is also an
+            # auth-terminal code when the SERVER sends it, but a handshake
+            # timeout is transient and must keep the reconnect loop alive.
+            self._watchdog_closed_socket = True
             with contextlib.suppress(Exception):
                 await ws.close(code=1008, reason="HELLO ack timeout")
 
@@ -298,6 +404,12 @@ class RealtimeClient:
                     if message.get("type") == "hello.ok":
                         self._authenticated = True
                         self._reconnect_attempts = 0
+                        # Delivery-ack capability negotiation: enable only
+                        # if the server echoed `ack`. A hello.ok without a
+                        # capabilities list is a legacy server → stay in
+                        # mark-on-send semantics and send no ack frames.
+                        caps = message.get("capabilities")
+                        self._ack_mode = isinstance(caps, list) and "ack" in caps
                         if self._hello_ack_task is not None:
                             self._hello_ack_task.cancel()
                             self._hello_ack_task = None
@@ -310,7 +422,9 @@ class RealtimeClient:
                     continue
 
                 if message.get("type") == "message.new":
-                    await self._process_ordered_message(message)
+                    # Live socket frames are ack-eligible; drain/gap-fill
+                    # injections are not (they commit via the REST cursor).
+                    await self._process_ordered_message(message, ws_ack=True)
                     continue
 
                 await self._dispatch(message)
@@ -335,6 +449,7 @@ class RealtimeClient:
                 self._hello_ack_task.cancel()
                 self._hello_ack_task = None
             self._authenticated = False
+            self._ack_mode = False
 
             await self._emit_disconnect(
                 {
@@ -346,15 +461,50 @@ class RealtimeClient:
 
             self._reset_order_states()
             if not self._disposed:
-                self._schedule_reconnect()
+                if (
+                    close_code in _AUTH_TERMINAL_CLOSE_CODES
+                    and not self._watchdog_closed_socket
+                ):
+                    # The server rejected the session itself (bad/revoked
+                    # key, forbidden account state) — retrying the same
+                    # credential forever is a reconnect storm, not
+                    # resilience. Surface a terminal error and stop; a
+                    # deliberate `connect()` after fixing the credential
+                    # still works.
+                    await self._emit_error(
+                        _RealtimeConnectionError(
+                            f"WebSocket closed with auth-terminal code {close_code}"
+                            f" ({close_reason or 'no reason given'}); reconnect"
+                            " disabled — fix the API key or account state and"
+                            " reconnect explicitly."
+                        )
+                    )
+                else:
+                    self._schedule_reconnect()
 
     # ─── Offline drain ───────────────────────────────────────────────
 
     async def drain_offline_envelopes(self) -> None:
-        """Drain envelopes accumulated while the socket was disconnected.
+        """Drain undelivered messages accumulated while the socket was down.
 
-        Routes each envelope through the same ``message.new`` ordering
-        pipeline as live frames, then calls ``/v1/messages/sync/ack``.
+        Speaks the real ``/v1/messages/sync`` wire: a **bare array** of
+        message rows whose ``delivery_id`` is an opaque, nullable string
+        cursor — never an integer, never compared numerically. Pages with
+        the ``after`` cursor until a short page.
+
+        Per page: rows are routed through the same ``message.new``
+        ordering pipeline as live frames, **then** the batch is committed
+        via ``POST /v1/messages/sync/ack`` with the positional cursor —
+        the last non-empty ``delivery_id`` of the processed prefix.
+        Dispatch-first/ack-second means a crash mid-page re-delivers
+        instead of losing rows (the message-id dedup cache absorbs the
+        replays).
+
+        Rows are validated minimally before dispatch. On the first invalid
+        row only the clean prefix before it is processed and acked; the
+        drain never acks or pages past a row it could not parse — that
+        would mark a message delivered that was never surfaced.
+
         Safe to call multiple times within a connection cycle — the
         server's ack pointer only advances.
         """
@@ -362,50 +512,75 @@ class RealtimeClient:
         if client is None:
             return
 
+        after: str | None = None
         while True:
             try:
-                batch = await client.sync()
+                rows = await client.sync(limit=_SYNC_PAGE_SIZE, after=after)
             except Exception as err:
                 await self._emit_error(
                     _RealtimeConnectionError(f"sync drain failed: {err}")
                 )
                 return
 
-            envelopes = (
-                batch.get("envelopes") if isinstance(batch, dict) else None
-            ) or []
-            if not isinstance(envelopes, list) or not envelopes:
+            if not isinstance(rows, list) or not rows:
                 return
 
-            highest_delivery_id = -1
-            for env in envelopes:
-                if not isinstance(env, dict):
-                    continue
-                did = env.get("delivery_id")
-                if (
-                    isinstance(did, int)
-                    and not isinstance(did, bool)
-                    and did > highest_delivery_id
-                ):
-                    highest_delivery_id = did
-                msg = env.get("message")
-                if not isinstance(msg, dict):
-                    continue
+            # Clean-prefix rule: stop at the FIRST row that fails minimal
+            # validation. The ack cursor commits everything at-or-before
+            # it, so a skipped-but-acked row would be silently lost.
+            prefix: list[SyncRow] = []
+            invalid_index: int | None = None
+            for index, row in enumerate(rows):
+                if not _is_valid_sync_row(row):
+                    invalid_index = index
+                    break
+                prefix.append(row)
+
+            for row in prefix:
                 await self._process_ordered_message(
-                    {"type": "message.new", "payload": msg}
+                    {"type": "message.new", "payload": row}, ws_ack=False
                 )
 
-            if highest_delivery_id >= 0:
+            # Positional cursor: batch order is authoritative; ids are
+            # opaque. Rows with a null delivery_id are covered by the next
+            # non-null cursor at-or-after them in a later page.
+            cursor = last_sync_delivery_id(prefix)
+            if cursor is not None:
                 try:
-                    await client.sync_ack(highest_delivery_id)
+                    await client.sync_ack(cursor)
                 except Exception as err:
                     await self._emit_error(
                         _RealtimeConnectionError(f"sync ack failed: {err}")
                     )
                     return
 
-            if len(envelopes) < _SYNC_PAGE_SIZE:
+            if invalid_index is not None:
+                await self._emit_error(
+                    _RealtimeConnectionError(
+                        f"sync drain: row {invalid_index} failed validation;"
+                        f" processed the {len(prefix)}-row clean prefix and"
+                        " stopped without acking past it"
+                    )
+                )
                 return
+
+            if len(rows) < _SYNC_PAGE_SIZE:
+                return
+
+            if cursor is None or cursor == after:
+                # A full page that cannot advance the cursor (e.g. every
+                # delivery_id was null) would re-read the same rows
+                # forever. Stop and surface it; the next drain retries
+                # from the server's committed pointer.
+                await self._emit_error(
+                    _RealtimeConnectionError(
+                        "sync drain: full page without an advancing"
+                        " delivery_id cursor; stopping to avoid a re-read loop"
+                    )
+                )
+                return
+
+            after = cursor
 
     # ─── Reconnect ───────────────────────────────────────────────────
 
@@ -543,15 +718,82 @@ class RealtimeClient:
         for h in list(self._disconnect_handlers):
             await _invoke(h, info)
 
-    async def _dispatch(self, message: dict[str, Any]) -> None:
+    async def _dispatch(self, message: dict[str, Any]) -> bool:
+        """Fan a frame out to its registered handlers.
+
+        Returns ``True`` when every handler completed without raising —
+        the precondition for a delivery ack. Handler exceptions never
+        propagate (they are logged and the remaining handlers still run),
+        but any of them marks the dispatch failed so ack-mode withholds
+        the ack and the server redelivers. Zero registered handlers count
+        as a clean dispatch: the frame was consumed, exactly as the
+        legacy mark-on-send semantics treated it.
+        """
         event = message.get("type")
         if not isinstance(event, str):
-            return
+            return False
         handlers = self._handlers.get(event)
         if not handlers:
-            return
+            return True
+        ok = True
         for h in list(handlers):
-            await _invoke(h, message)
+            if not await _invoke(h, message):
+                ok = False
+        return ok
+
+    async def _deliver_message_new(
+        self, message: dict[str, Any], *, ws_ack: bool
+    ) -> None:
+        """Single delivery choke point for ``message.new`` envelopes.
+
+        Every path that hands an envelope to handlers — live in-order,
+        buffered drain, gap resolution, REST drain injection, shutdown
+        flush — funnels through here so dedup and delivery acks behave
+        identically everywhere:
+
+        - **Dedup** (bounded LRU on ``message_id``, live + drain): a hit
+          skips dispatch but still acks — the prior successful dispatch is
+          the proof of processing.
+        - **Ack-after-dispatch**: with the ``ack`` capability negotiated,
+          confirm ``{"type": "ack", "message_id": ...}`` only after every
+          handler (async ones awaited) completed without raising. A
+          handler exception ⇒ no ack ⇒ the envelope stays ``stored``
+          server-side and re-arrives via drain/redelivery.
+        """
+        message_id = _extract_message_id(message)
+
+        if message_id is not None and self._dedup.hit(message_id):
+            if ws_ack:
+                await self._send_delivery_ack(message_id)
+            return
+
+        dispatched_cleanly = await self._dispatch(message)
+        if not dispatched_cleanly or message_id is None:
+            return
+
+        self._dedup.add(message_id)
+        if ws_ack:
+            await self._send_delivery_ack(message_id)
+
+    async def _send_delivery_ack(self, message_id: str) -> None:
+        """Send a delivery-ack frame if this connection negotiated ack-mode.
+
+        Best-effort by design: a lost ack (socket died mid-send) leaves
+        the envelope ``stored`` server-side; it re-arrives on the next
+        drain/redelivery, where the dedup cache turns it into
+        skip-dispatch + re-ack. Never raises into the dispatch pipeline.
+        """
+        if not self._ack_mode:
+            return
+        ws = self._ws
+        if ws is None:
+            return
+        try:
+            await ws.send(json.dumps({"type": "ack", "message_id": message_id}))
+        except Exception:
+            _log.debug(
+                "delivery ack send failed for %s", message_id, exc_info=True
+            )
 
     def _spawn(self, coro: Coroutine[Any, Any, Any]) -> None:
         task: asyncio.Task[Any] = asyncio.create_task(coro)
@@ -565,19 +807,27 @@ class RealtimeClient:
     # gap-fill-failed path, where we surface ``recovered=False`` and
     # advance the cursor past the hole).
 
-    async def _process_ordered_message(self, message: dict[str, Any]) -> None:
+    async def _process_ordered_message(
+        self, message: dict[str, Any], *, ws_ack: bool = False
+    ) -> None:
+        """Route one ``message.new`` envelope through seq ordering.
+
+        ``ws_ack`` tags the envelope's origin (live socket vs drain/gap
+        injection) and follows it through the buffer — see
+        :class:`_PendingEnvelope`.
+        """
         payload = message.get("payload")
         if not isinstance(payload, dict):
-            await self._dispatch(message)
+            await self._deliver_message_new(message, ws_ack=ws_ack)
             return
         conversation_id = payload.get("conversation_id")
         if not isinstance(conversation_id, str):
-            await self._dispatch(message)
+            await self._deliver_message_new(message, ws_ack=ws_ack)
             return
 
         seq = _extract_seq(message)
         if seq is None:
-            await self._dispatch(message)
+            await self._deliver_message_new(message, ws_ack=ws_ack)
             return
 
         state = self._order_states.get(conversation_id)
@@ -588,14 +838,14 @@ class RealtimeClient:
         # First arrival for this conversation in this connection — anchor.
         if state.next_expected_seq is None:
             state.next_expected_seq = seq + 1
-            await self._dispatch(message)
+            await self._deliver_message_new(message, ws_ack=ws_ack)
             return
 
         if seq < state.next_expected_seq:
             return  # duplicate — drain↔live race or server double-publish
 
         if seq == state.next_expected_seq:
-            await self._dispatch(message)
+            await self._deliver_message_new(message, ws_ack=ws_ack)
             state.next_expected_seq = seq + 1
             await self._drain_consecutive(conversation_id, state)
             self._maybe_clear_gap_timer(state)
@@ -603,7 +853,7 @@ class RealtimeClient:
             return
 
         # seq > next_expected_seq — out of order. Buffer + arm gap timer.
-        state.buffer[seq] = message
+        state.buffer[seq] = _PendingEnvelope(message=message, ws_ack=ws_ack)
 
         if len(state.buffer) > _MAX_BUFFERED_PER_CONVERSATION:
             await self._resolve_gap(
@@ -695,7 +945,12 @@ class RealtimeClient:
                 continue
             if row_seq in state.buffer:
                 continue
-            state.buffer[row_seq] = {"type": "message.new", "payload": row}
+            # Gap-fill rows came from REST history, not the live socket —
+            # not WS-ack-eligible; their delivery envelopes (if any) are
+            # settled by the next sync drain + dedup.
+            state.buffer[row_seq] = _PendingEnvelope(
+                message={"type": "message.new", "payload": row}, ws_ack=False
+            )
 
         drained = await self._drain_consecutive(conversation_id, state)
         if drained:
@@ -722,8 +977,8 @@ class RealtimeClient:
             return False
         drained = False
         while state.next_expected_seq in state.buffer:
-            msg = state.buffer.pop(state.next_expected_seq)
-            await self._dispatch(msg)
+            pending = state.buffer.pop(state.next_expected_seq)
+            await self._deliver_message_new(pending.message, ws_ack=pending.ws_ack)
             state.next_expected_seq += 1
             drained = True
         if drained:
@@ -757,7 +1012,8 @@ class RealtimeClient:
         else:
             highest_dispatched = -1
         for s in seqs:
-            await self._dispatch(state.buffer[s])
+            pending = state.buffer[s]
+            await self._deliver_message_new(pending.message, ws_ack=pending.ws_ack)
             if s > highest_dispatched:
                 highest_dispatched = s
         state.buffer.clear()
@@ -813,7 +1069,10 @@ class RealtimeClient:
                 continue
             seqs = sorted(state.buffer.keys())
             for s in seqs:
-                await self._dispatch(state.buffer[s])
+                pending = state.buffer[s]
+                await self._deliver_message_new(
+                    pending.message, ws_ack=pending.ws_ack
+                )
             state.buffer.clear()
             if self._opts.on_sequence_gap is not None:
                 if state.gap_started_expected_seq is not None:
@@ -844,16 +1103,23 @@ class RealtimeClient:
 _log = logging.getLogger("agentchat.realtime")
 
 
-async def _invoke(handler: Any, arg: Any) -> None:
+async def _invoke(handler: Any, arg: Any) -> bool:
+    """Call a user handler (awaiting async ones). Returns ``False`` on raise.
+
+    User-hook exceptions must not break the recv/reconnect loop, but they
+    shouldn't vanish silently either — they're logged so apps can route
+    them through their normal observability stack, and the ``False``
+    return lets ack-mode withhold the delivery ack (handler failure ⇒
+    server-side redelivery) without changing dispatch fan-out.
+    """
     try:
         result = handler(arg)
         if inspect.isawaitable(result):
             await result
     except Exception:
-        # User-hook exceptions must not break the recv/reconnect loop, but
-        # they shouldn't vanish silently either — surface via logger so apps
-        # can route them through their normal observability stack.
         _log.warning("realtime handler raised", exc_info=True)
+        return False
+    return True
 
 
 async def _invoke0(handler: Any) -> None:
@@ -873,6 +1139,43 @@ def _extract_seq(message: dict[str, Any]) -> int | None:
     if isinstance(seq, int) and not isinstance(seq, bool):
         return seq
     return None
+
+
+def _extract_message_id(message: dict[str, Any]) -> str | None:
+    """Message id from a ``message.new`` frame's payload, if present."""
+    payload = message.get("payload")
+    if not isinstance(payload, dict):
+        return None
+    message_id = payload.get("id")
+    if isinstance(message_id, str) and message_id:
+        return message_id
+    return None
+
+
+def _is_valid_sync_row(row: object) -> bool:
+    """Minimal structural validation for one ``/v1/messages/sync`` row.
+
+    Mirrors the reference wire schema: ``id`` and ``conversation_id`` are
+    required strings; ``delivery_id`` is a required string-or-null key;
+    the optional envelope fields must be well-typed when present. Unknown
+    extra fields always pass — additive server changes must never stall
+    a drain.
+    """
+    if not isinstance(row, dict):
+        return False
+    if not isinstance(row.get("id"), str):
+        return False
+    if not isinstance(row.get("conversation_id"), str):
+        return False
+    if "delivery_id" not in row:
+        return False
+    delivery_id = row["delivery_id"]
+    if delivery_id is not None and not isinstance(delivery_id, str):
+        return False
+    for key in ("sender", "type", "created_at"):
+        if key in row and not isinstance(row[key], str):
+            return False
+    return "content" not in row or isinstance(row["content"], dict)
 
 
 def _min_buffered_seq(state: _OrderState) -> int | None:

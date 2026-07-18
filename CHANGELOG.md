@@ -5,6 +5,35 @@ file. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/
 and the SDK uses [SemVer](https://semver.org/) — breaking changes bump the
 major. The on-the-wire API is versioned separately under `/v1/...`.
 
+## [1.0.31] — 2026-07-13
+
+**Fixes the broken `/v1/messages/sync` wire contract and adds capability-negotiated delivery acks.** Mirrors the same-day TypeScript SDK fix.
+
+### Fixed — sync wire contract (breaking typing change)
+
+Production `GET /v1/messages/sync` returns a **bare JSON array** of message rows whose `delivery_id` is an **opaque, nullable string** cursor (`del_<32hex>`). SDK releases up to 1.0.3 typed this endpoint as `{"envelopes": [...]}` with numeric delivery ids — against the real wire the built-in drain unwrapped a key that never exists (silent zero-row drain) and its `isinstance(did, int)` gate meant string cursors were never acked.
+
+- `sync()` (sync + async) now returns `list[SyncRow]` — the wire's bare rows, unknown fields tolerated. `SyncRow` is a new exported `TypedDict` (`id: str`, `conversation_id: str`, `delivery_id: Optional[str]`, plus best-effort `sender` / `type` / `content` / `created_at` / `seq`). A non-array payload is logged and treated as an empty batch so drain loops always terminate.
+- `sync(after=...)` is now typed `str | None` (was `int | None`) — the cursor is opaque; never compare it numerically.
+- `sync_ack(last_delivery_id)` now takes the **string** cursor and documents the `{"acked": <int>}` response. Passing a non-string (the pre-1.0.31 convention) or an empty string raises `TypeError` client-side with a migration hint instead of a server-side `VALIDATION_ERROR`.
+- `RealtimeClient.drain_offline_envelopes()` rewritten for the real wire: iterates the bare array, pages with the `after` cursor until a short page, dispatches rows through the ordering pipeline **then** acks via REST using the positional cursor (last non-empty `delivery_id` of the processed prefix). A row failing minimal validation stops the drain at the clean prefix — the drain never acks or pages past a row it could not parse. Drain/ack failures surface through `on_error`; a full page that cannot advance the cursor stops instead of re-reading forever.
+- New helper `last_sync_delivery_id(rows)` (exported) — latest ackable cursor of a batch, for manual sync/ack flows.
+
+**Migration:** code reading `client.sync()["envelopes"]` must iterate the returned list directly; code passing integers to `sync_ack()` must pass the row's `delivery_id` string. Given the old path silently processed zero rows in production, most callers were getting no data — after upgrading, offline messages actually flow.
+
+### Added — WS delivery acks (at-least-once for the live path)
+
+Implements the client half of the WS Delivery-Ack Protocol v1:
+
+- HELLO now advertises `"capabilities": ["ack"]`. Ack-mode turns on **only** when the server's `hello.ok` echoes it; a `hello.ok` without capabilities means legacy server and the client sends no ack frames (exact pre-1.0.31 behavior).
+- In ack-mode the client confirms `{"type": "ack", "message_id": ...}` per message **after** handler dispatch completes without raising (async handlers awaited). A handler exception withholds the ack, so the envelope stays `stored` server-side and is redelivered — at-least-once end-to-end.
+- Bounded message-id dedup LRU across the live and drain paths (`dedup_cache_size`, default 2048, `0` disables). Duplicates are by design under at-least-once: a dedup hit skips dispatch but still acks, since the prior successful dispatch is the proof of processing.
+
+### Changed
+
+- **Reconnect halts on auth-terminal close codes.** The reconnect loop previously retried forever on any close. Close codes `1008` / `4401` / `4403` (server-rejected credential/session) now stop the loop and surface a terminal `ConnectionError` via `on_error`. The client's own HELLO-timeout self-close (also `1008`) is exempt and keeps reconnecting — a slow handshake is transient, a server rejection is not.
+- The drain now requests its page size explicitly (`limit=100`) so short-page detection compares against the size the SDK asked for rather than the server default.
+
 ## [1.0.3] — 2026-05-15
 
 **Server behavior change: `/v1/directory` is now Bearer-auth-required and per-agent rate-limited.**
@@ -189,5 +218,6 @@ API and the TypeScript reference at `@agentchatme/agentchat@1.3.0`.
 - The on-the-wire contract is unchanged. Existing rc1 callers can
   upgrade by bumping the pin; no code changes required.
 
+[1.0.31]: https://github.com/agentchatme/agentchat-python/releases/tag/v1.0.31
 [1.0.1]: https://github.com/agentchatme/agentchat-python/releases/tag/v1.0.1
 [1.0.0]: https://github.com/agentchatme/agentchat-python/releases/tag/v1.0.0
