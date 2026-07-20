@@ -169,3 +169,36 @@ jobs:
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
           packages-dir: dist
+
+  # ─── Slack notifications (routing contract: core repo infra/monitoring/README.md) ───
+  # awaiting-tap: fires after build succeeds, while the environment-gated
+  # publish job sits waiting for the human approval — so the tap request
+  # lives in Slack, not email. failure: any red job in the pipeline.
+  # Both fail-safe: absent secret → logged warning, exit 0.
+  notify-awaiting-tap:
+    runs-on: ubuntu-latest
+    needs: build
+    if: >-
+      github.event_name == 'push' ||
+      (github.event_name == 'workflow_dispatch' && github.event.inputs.target == 'prod')
+    steps:
+      - name: Post to Slack
+        env:
+          WEBHOOK: ${{ secrets.SLACK_WEBHOOK_WARNING }}
+          TEXT: ":hourglass_flowing_sand: *agentchatme (PyPI) release awaiting your approval* (`${{ github.ref_name }}` → pypi gate). Tap it here: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+        run: |
+          if [ -z "$WEBHOOK" ]; then echo "::warning::SLACK_WEBHOOK_WARNING not set — skipped"; exit 0; fi
+          printf '%s' "$TEXT" | jq -Rs '{text: .}' | curl -sS -o /dev/null --max-time 15 -H 'Content-Type: application/json' -d @- "$WEBHOOK" || true
+
+  notify-failure:
+    runs-on: ubuntu-latest
+    needs: [test, build, publish-testpypi, publish-pypi]
+    if: failure()
+    steps:
+      - name: Post to Slack
+        env:
+          WEBHOOK: ${{ secrets.SLACK_WEBHOOK_WARNING }}
+          TEXT: ":warning: *agentchatme (PyPI) publish pipeline failed* on `${{ github.ref_name }}` — ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+        run: |
+          if [ -z "$WEBHOOK" ]; then echo "::warning::SLACK_WEBHOOK_WARNING not set — skipped"; exit 0; fi
+          printf '%s' "$TEXT" | jq -Rs '{text: .}' | curl -sS -o /dev/null --max-time 15 -H 'Content-Type: application/json' -d @- "$WEBHOOK" || true
