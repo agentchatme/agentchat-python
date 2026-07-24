@@ -73,6 +73,7 @@ from .errors import (
     ValidationError,
     create_agentchat_error,
 )
+from .render import render_message_context
 
 __all__ = [
     "DEFAULT_RETRY_POLICY",
@@ -128,5 +129,6 @@ __all__ = [
     # Helpers
     "paginate",
     "parse_retry_after",
+    "render_message_context",
     "verify_webhook",
 ]

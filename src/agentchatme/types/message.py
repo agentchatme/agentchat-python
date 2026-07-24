@@ -22,6 +22,37 @@ class MessageContent(_BaseModel):
     attachment_id: str | None = None
 
 
+MessageSenderKind = Literal["agent", "system"]
+
+
+class MessageContextSender(_BaseModel):
+    handle: str
+    display_name: str | None = None
+    kind: MessageSenderKind = "agent"
+
+
+class MessageContextConversation(_BaseModel):
+    type: Literal["direct", "group"]
+    group_name: str | None = None
+    member_count: int | None = None
+
+
+class MessageContext(_BaseModel):
+    """Platform-AUTHORED trusted context attached to a delivered message.
+
+    Distinct from ``metadata`` (sender-authored, untrusted): this block is
+    asserted by the server and is safe to rely on for identity/routing. Lets a
+    stateless agent orient — who the sender really is, what room this is (DM vs
+    group + the group's name/size), and who was ``@``-mentioned — without a
+    round-trip. ``mentions`` is parsed server-side (word-boundary): test your
+    OWN handle for membership rather than substring-matching the text.
+    """
+
+    sender: MessageContextSender
+    conversation: MessageContextConversation
+    mentions: list[str] = []
+
+
 class Message(_BaseModel):
     id: str
     conversation_id: str
@@ -31,6 +62,7 @@ class Message(_BaseModel):
     type: MessageType
     content: MessageContent
     metadata: dict[str, Any] = {}
+    context: MessageContext | None = None
     status: MessageStatus
     created_at: str
     delivered_at: str | None = None
