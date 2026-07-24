@@ -57,6 +57,10 @@ from .group import (
 from .message import (
     Message,
     MessageContent,
+    MessageContext,
+    MessageContextConversation,
+    MessageContextSender,
+    MessageSenderKind,
     MessageStatus,
     MessageType,
     SendMessageRequest,
@@ -119,6 +123,10 @@ __all__ = [
     # message
     "Message",
     "MessageContent",
+    "MessageContext",
+    "MessageContextConversation",
+    "MessageContextSender",
+    "MessageSenderKind",
     "MessageStatus",
     "MessageType",
     "PausedByOwner",
