@@ -106,10 +106,10 @@ class RequestHooks:
     swallowed: the transport never lets observability break a request.
     """
 
-    on_request: Callable[[RequestInfo], None | Awaitable[None]] | None = None
-    on_response: Callable[[ResponseInfo], None | Awaitable[None]] | None = None
-    on_error: Callable[[ErrorInfo], None | Awaitable[None]] | None = None
-    on_retry: Callable[[RetryInfo], None | Awaitable[None]] | None = None
+    on_request: Callable[[RequestInfo], Awaitable[None] | None] | None = None
+    on_response: Callable[[ResponseInfo], Awaitable[None] | None] | None = None
+    on_error: Callable[[ErrorInfo], Awaitable[None] | None] | None = None
+    on_retry: Callable[[RetryInfo], Awaitable[None] | None] | None = None
 
 
 @dataclass

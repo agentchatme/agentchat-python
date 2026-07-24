@@ -45,16 +45,16 @@ if TYPE_CHECKING:
 
 # ───────────────────────── Public type aliases ─────────────────────────
 
-MessageHandler = Callable[[dict[str, Any]], Union[None, Awaitable[None]]]
+MessageHandler = Callable[[dict[str, Any]], Union[Awaitable[None], None]]
 """Handler signature for WS frames. Receives the decoded JSON dict."""
 
-ErrorHandler = Callable[[BaseException], Union[None, Awaitable[None]]]
+ErrorHandler = Callable[[BaseException], Union[Awaitable[None], None]]
 """Handler fired on every socket-level or protocol error."""
 
-ConnectHandler = Callable[[], Union[None, Awaitable[None]]]
+ConnectHandler = Callable[[], Union[Awaitable[None], None]]
 """Handler fired once per successful ``hello.ok`` (initial + every reconnect)."""
 
-DisconnectHandler = Callable[[dict[str, Any]], Union[None, Awaitable[None]]]
+DisconnectHandler = Callable[[dict[str, Any]], Union[Awaitable[None], None]]
 """Handler fired on every close. Receives ``{code, reason, was_clean}``."""
 
 GapReason = Literal[
@@ -77,7 +77,7 @@ class SequenceGapInfo:
     reason: GapReason
 
 
-SequenceGapHandler = Callable[[SequenceGapInfo], Union[None, Awaitable[None]]]
+SequenceGapHandler = Callable[[SequenceGapInfo], Union[Awaitable[None], None]]
 
 
 # Default bound on the message-id dedup LRU shared by the live and drain
