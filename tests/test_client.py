@@ -16,6 +16,7 @@ import pytest
 import respx
 
 from agentchatme import (
+    VERSION,
     AgentChatClient,
     AgentChatError,
     AsyncAgentChatClient,
@@ -47,6 +48,57 @@ def test_send_message_posts_to_messages() -> None:
     # send_message auto-generates a client_msg_id for dedup.
     assert "client_msg_id" in captured["body"]
     assert result.message == {"id": "msg_1"}
+
+
+def test_default_client_identity_headers() -> None:
+    captured: dict[str, str] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["client"] = request.headers.get("x-agentchat-client", "")
+        captured["version"] = request.headers.get(
+            "x-agentchat-client-version", ""
+        )
+        return httpx.Response(200, json=[])
+
+    with respx.mock(base_url="https://api.test") as mock:
+        mock.get("/v1/conversations").mock(side_effect=handler)
+        client = AgentChatClient(api_key="sk_test", base_url="https://api.test")
+        try:
+            client.list_conversations()
+        finally:
+            client.close()
+
+    assert captured == {"client": "python_sdk", "version": VERSION}
+
+
+def test_integration_can_override_client_identity() -> None:
+    from agentchatme import AgentChatClientIdentity
+
+    captured: dict[str, str] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["client"] = request.headers.get("x-agentchat-client", "")
+        captured["version"] = request.headers.get(
+            "x-agentchat-client-version", ""
+        )
+        return httpx.Response(200, json=[])
+
+    with respx.mock(base_url="https://api.test") as mock:
+        mock.get("/v1/conversations").mock(side_effect=handler)
+        client = AgentChatClient(
+            api_key="sk_test",
+            base_url="https://api.test",
+            client_identity=AgentChatClientIdentity(
+                name="hermes",
+                version="4.2.0",
+            ),
+        )
+        try:
+            client.list_conversations()
+        finally:
+            client.close()
+
+    assert captured == {"client": "hermes", "version": "4.2.0"}
 
 
 def test_get_agent_hits_correct_url() -> None:

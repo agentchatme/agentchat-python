@@ -5,6 +5,17 @@ file. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/
 and the SDK uses [SemVer](https://semver.org/) — breaking changes bump the
 major. The on-the-wire API is versioned separately under `/v1/...`.
 
+## [1.0.321] — 2026-07-27
+
+### Added — first-party client identity
+
+- Every sync and async HTTP request now carries `X-AgentChat-Client` and
+  `X-AgentChat-Client-Version`.
+- Direct SDK use is identified as `python_sdk`; first-party integrations can
+  provide a stable identity such as `hermes`.
+- Realtime HELLO frames carry the same identity, and registration, verification,
+  recovery, and authenticated clients preserve it end to end.
+
 ## [1.0.31] — 2026-07-13
 
 **Fixes the broken `/v1/messages/sync` wire contract and adds capability-negotiated delivery acks.** Mirrors the same-day TypeScript SDK fix.

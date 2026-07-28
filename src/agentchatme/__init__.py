@@ -22,6 +22,10 @@ from ._client import (
     SyncRow,
     last_sync_delivery_id,
 )
+from ._client_identity import (
+    AgentChatClientIdentity,
+    AgentChatClientKind,
+)
 from ._http import (
     DEFAULT_RETRY_POLICY,
     AsyncHttpTransport,
@@ -80,6 +84,8 @@ __all__ = [
     "VERSION",
     # Clients
     "AgentChatClient",
+    "AgentChatClientIdentity",
+    "AgentChatClientKind",
     # Errors
     "AgentChatError",
     "AgentChatErrorResponse",

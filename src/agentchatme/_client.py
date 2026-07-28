@@ -22,6 +22,10 @@ from urllib.parse import quote, urlencode
 
 import httpx
 
+from ._client_identity import (
+    AgentChatClientIdentity,
+    client_identity_headers,
+)
 from ._http import (
     AsyncHttpTransport,
     HttpTransport,
@@ -206,6 +210,7 @@ class AgentChatClient:
         hooks: RequestHooks | None = None,
         on_backlog_warning: BacklogWarningHandler | None = None,
         http_client: httpx.Client | None = None,
+        client_identity: AgentChatClientIdentity | None = None,
     ) -> None:
         self.base_url = base_url
         self._http = HttpTransport(
@@ -215,6 +220,7 @@ class AgentChatClient:
                 timeout_ms=timeout_ms,
                 retry=retry or HttpTransportOptions(base_url=base_url).retry,
                 hooks=hooks or RequestHooks(),
+                default_headers=client_identity_headers(client_identity),
             ),
             client=http_client,
         )
@@ -239,13 +245,19 @@ class AgentChatClient:
         display_name: str | None = None,
         description: str | None = None,
         base_url: str = DEFAULT_BASE_URL,
+        client_identity: AgentChatClientIdentity | None = None,
     ) -> dict[str, Any]:
         """Kick off registration. Server emails a 6-digit OTP to ``email``.
 
         Complete the flow with :meth:`verify` using the returned
         ``pending_id``.
         """
-        transport = HttpTransport(HttpTransportOptions(base_url=base_url))
+        transport = HttpTransport(
+            HttpTransportOptions(
+                base_url=base_url,
+                default_headers=client_identity_headers(client_identity),
+            )
+        )
         try:
             res = transport.request(
                 "POST",
@@ -268,12 +280,18 @@ class AgentChatClient:
         code: str,
         *,
         base_url: str = DEFAULT_BASE_URL,
+        client_identity: AgentChatClientIdentity | None = None,
     ) -> tuple[dict[str, Any], str, AgentChatClient]:
         """Complete registration. Returns ``(agent, api_key, client)``.
 
         **The API key is shown only once — store it securely.**
         """
-        transport = HttpTransport(HttpTransportOptions(base_url=base_url))
+        transport = HttpTransport(
+            HttpTransportOptions(
+                base_url=base_url,
+                default_headers=client_identity_headers(client_identity),
+            )
+        )
         try:
             res = transport.request(
                 "POST",
@@ -286,13 +304,27 @@ class AgentChatClient:
         data = res.data
         api_key = str(data["api_key"])
         agent = data.get("agent") or {}
-        return agent, api_key, AgentChatClient(api_key=api_key, base_url=base_url)
+        return agent, api_key, AgentChatClient(
+            api_key=api_key,
+            base_url=base_url,
+            client_identity=client_identity,
+        )
 
     @staticmethod
-    def recover(email: str, *, base_url: str = DEFAULT_BASE_URL) -> dict[str, Any]:
+    def recover(
+        email: str,
+        *,
+        base_url: str = DEFAULT_BASE_URL,
+        client_identity: AgentChatClientIdentity | None = None,
+    ) -> dict[str, Any]:
         """Start account recovery. Always returns successfully — a missing
         account is masked to prevent email-existence enumeration."""
-        transport = HttpTransport(HttpTransportOptions(base_url=base_url))
+        transport = HttpTransport(
+            HttpTransportOptions(
+                base_url=base_url,
+                default_headers=client_identity_headers(client_identity),
+            )
+        )
         try:
             res = transport.request(
                 "POST",
@@ -310,9 +342,15 @@ class AgentChatClient:
         code: str,
         *,
         base_url: str = DEFAULT_BASE_URL,
+        client_identity: AgentChatClientIdentity | None = None,
     ) -> tuple[str, str, AgentChatClient]:
         """Complete recovery. Returns ``(handle, api_key, client)``."""
-        transport = HttpTransport(HttpTransportOptions(base_url=base_url))
+        transport = HttpTransport(
+            HttpTransportOptions(
+                base_url=base_url,
+                default_headers=client_identity_headers(client_identity),
+            )
+        )
         try:
             res = transport.request(
                 "POST",
@@ -324,7 +362,9 @@ class AgentChatClient:
             transport.close()
         data = res.data
         return str(data["handle"]), str(data["api_key"]), AgentChatClient(
-            api_key=str(data["api_key"]), base_url=base_url
+            api_key=str(data["api_key"]),
+            base_url=base_url,
+            client_identity=client_identity,
         )
 
     # ─── Request helpers ──────────────────────────────────────────────────────
@@ -1030,6 +1070,7 @@ class AsyncAgentChatClient:
         hooks: RequestHooks | None = None,
         on_backlog_warning: BacklogWarningHandler | None = None,
         http_client: httpx.AsyncClient | None = None,
+        client_identity: AgentChatClientIdentity | None = None,
     ) -> None:
         self.base_url = base_url
         self._http = AsyncHttpTransport(
@@ -1039,6 +1080,7 @@ class AsyncAgentChatClient:
                 timeout_ms=timeout_ms,
                 retry=retry or HttpTransportOptions(base_url=base_url).retry,
                 hooks=hooks or RequestHooks(),
+                default_headers=client_identity_headers(client_identity),
             ),
             client=http_client,
         )
@@ -1063,8 +1105,14 @@ class AsyncAgentChatClient:
         display_name: str | None = None,
         description: str | None = None,
         base_url: str = DEFAULT_BASE_URL,
+        client_identity: AgentChatClientIdentity | None = None,
     ) -> dict[str, Any]:
-        async with AsyncHttpTransport(HttpTransportOptions(base_url=base_url)) as transport:
+        async with AsyncHttpTransport(
+            HttpTransportOptions(
+                base_url=base_url,
+                default_headers=client_identity_headers(client_identity),
+            )
+        ) as transport:
             res = await transport.request(
                 "POST",
                 "/v1/register",
@@ -1084,8 +1132,14 @@ class AsyncAgentChatClient:
         code: str,
         *,
         base_url: str = DEFAULT_BASE_URL,
+        client_identity: AgentChatClientIdentity | None = None,
     ) -> tuple[dict[str, Any], str, AsyncAgentChatClient]:
-        async with AsyncHttpTransport(HttpTransportOptions(base_url=base_url)) as transport:
+        async with AsyncHttpTransport(
+            HttpTransportOptions(
+                base_url=base_url,
+                default_headers=client_identity_headers(client_identity),
+            )
+        ) as transport:
             res = await transport.request(
                 "POST",
                 "/v1/register/verify",
@@ -1097,14 +1151,26 @@ class AsyncAgentChatClient:
         return (
             data.get("agent") or {},
             api_key,
-            AsyncAgentChatClient(api_key=api_key, base_url=base_url),
+            AsyncAgentChatClient(
+                api_key=api_key,
+                base_url=base_url,
+                client_identity=client_identity,
+            ),
         )
 
     @staticmethod
     async def recover(
-        email: str, *, base_url: str = DEFAULT_BASE_URL
+        email: str,
+        *,
+        base_url: str = DEFAULT_BASE_URL,
+        client_identity: AgentChatClientIdentity | None = None,
     ) -> dict[str, Any]:
-        async with AsyncHttpTransport(HttpTransportOptions(base_url=base_url)) as transport:
+        async with AsyncHttpTransport(
+            HttpTransportOptions(
+                base_url=base_url,
+                default_headers=client_identity_headers(client_identity),
+            )
+        ) as transport:
             res = await transport.request(
                 "POST",
                 "/v1/agents/recover",
@@ -1119,8 +1185,14 @@ class AsyncAgentChatClient:
         code: str,
         *,
         base_url: str = DEFAULT_BASE_URL,
+        client_identity: AgentChatClientIdentity | None = None,
     ) -> tuple[str, str, AsyncAgentChatClient]:
-        async with AsyncHttpTransport(HttpTransportOptions(base_url=base_url)) as transport:
+        async with AsyncHttpTransport(
+            HttpTransportOptions(
+                base_url=base_url,
+                default_headers=client_identity_headers(client_identity),
+            )
+        ) as transport:
             res = await transport.request(
                 "POST",
                 "/v1/agents/recover/verify",
@@ -1131,7 +1203,11 @@ class AsyncAgentChatClient:
         return (
             str(data["handle"]),
             str(data["api_key"]),
-            AsyncAgentChatClient(api_key=str(data["api_key"]), base_url=base_url),
+            AsyncAgentChatClient(
+                api_key=str(data["api_key"]),
+                base_url=base_url,
+                client_identity=client_identity,
+            ),
         )
 
     # ─── Request helpers ──────────────────────────────────────────────────────

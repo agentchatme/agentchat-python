@@ -14,8 +14,8 @@ from typing import Any
 
 import pytest
 
+from agentchatme import VERSION, RealtimeClient, SequenceGapInfo
 from agentchatme import ConnectionError as AgentChatConnectionError
-from agentchatme import RealtimeClient, SequenceGapInfo
 
 # ─────────────── Mock infrastructure ───────────────
 
@@ -187,6 +187,8 @@ async def test_connect_sends_hello_frame() -> None:
             "type": "hello",
             "api_key": "sk_test",
             "capabilities": ["ack"],
+            "client": "python_sdk",
+            "client_version": VERSION,
         }
     finally:
         await rt.disconnect()

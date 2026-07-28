@@ -37,6 +37,7 @@ from typing import (
 )
 
 from ._client import last_sync_delivery_id
+from ._client_identity import DEFAULT_CLIENT_IDENTITY, AgentChatClientIdentity
 from .errors import ConnectionError as _RealtimeConnectionError
 
 if TYPE_CHECKING:
@@ -101,6 +102,7 @@ class RealtimeOptions:
     auto_drain_on_connect: bool | None = None  # None → True iff client set
     dedup_cache_size: int = _DEFAULT_DEDUP_CACHE_SIZE
     """Bound on the message-id dedup LRU (live + drain). ``0`` disables dedup."""
+    client_identity: AgentChatClientIdentity = DEFAULT_CLIENT_IDENTITY
 
 
 # ───────────────────────── Internal constants ─────────────────────────
@@ -231,6 +233,7 @@ class RealtimeClient:
         on_sequence_gap: SequenceGapHandler | None = None,
         auto_drain_on_connect: bool | None = None,
         dedup_cache_size: int | None = None,
+        client_identity: AgentChatClientIdentity | None = None,
         websocket_connect: Callable[..., Awaitable[Any]] | None = None,
     ) -> None:
         if options is None:
@@ -257,6 +260,7 @@ class RealtimeClient:
                     if dedup_cache_size is not None
                     else _DEFAULT_DEDUP_CACHE_SIZE
                 ),
+                client_identity=client_identity or DEFAULT_CLIENT_IDENTITY,
             )
 
         if options.auto_drain_on_connect is None:
@@ -339,6 +343,14 @@ class RealtimeClient:
                         # Advertised capabilities; the server ignores unknown
                         # strings and echoes the accepted subset on hello.ok.
                         "capabilities": list(_CLIENT_CAPABILITIES),
+                        "client": self._opts.client_identity.name,
+                        **(
+                            {
+                                "client_version": self._opts.client_identity.version
+                            }
+                            if self._opts.client_identity.version
+                            else {}
+                        ),
                     }
                 )
             )
