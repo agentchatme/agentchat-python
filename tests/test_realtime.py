@@ -10,11 +10,13 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
+import time
 from typing import Any
 
 import pytest
 
-from agentchatme import VERSION, RealtimeClient, SequenceGapInfo
+from agentchatme import VERSION, RealtimeClient, SequenceGapInfo, _realtime
 from agentchatme import ConnectionError as AgentChatConnectionError
 
 # ─────────────── Mock infrastructure ───────────────
@@ -1052,3 +1054,115 @@ async def test_user_handler_exception_is_logged_not_swallowed(
             for rec in caplog.records
         )
     await rt.disconnect()
+
+
+# ─────────────── Reconnect backoff stability window ───────────────
+#
+# The bug these cover: resetting the attempt counter on `hello.ok` treats a
+# successful HANDSHAKE as a healthy CONNECTION. A socket that connects and
+# dies seconds later then retries at the floor delay forever, because the
+# exponential backoff only ever counts attempts that failed before the
+# handshake. Observed in production as 725 reconnects in four hours from a
+# single agent with no ramp at all.
+
+
+@pytest.mark.asyncio
+async def test_short_lived_connection_does_not_clear_backoff(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A connection that dies young must leave the backoff counter climbing."""
+    monkeypatch.setattr(_realtime, "_STABLE_CONNECTION_S", 30.0)
+    rt, ws = _make_client()
+    try:
+        await rt.connect()
+        await _settle()
+        # Backoff already climbing from earlier failures. Seed it BEFORE the
+        # handshake — the old code reset here, so this ordering is what
+        # makes the test a real regression guard rather than a tautology.
+        rt._reconnect_attempts = 4
+        await ws.push({"type": "hello.ok"})
+        await _settle()
+        assert rt._reconnect_attempts == 4, (
+            "hello.ok alone must not clear the backoff — that is the bug"
+        )
+        # Dying before the window elapses must also leave it untouched.
+        await ws.close(1006, "abnormal")
+        await _settle()
+        assert rt._reconnect_attempts == 4
+    finally:
+        await rt.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_stable_connection_clears_backoff(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Surviving the stability window resets the counter to the floor."""
+    monkeypatch.setattr(_realtime, "_STABLE_CONNECTION_S", 0.01)
+    rt, ws = _make_client()
+    try:
+        rt._reconnect_attempts = 7
+        await rt.connect()
+        await _settle()
+        await ws.push({"type": "hello.ok"})
+        await asyncio.sleep(0.05)
+        await _settle()
+        assert rt._reconnect_attempts == 0
+    finally:
+        await rt.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_backoff_grows_across_repeated_short_connections(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The flapping case: delays must ramp instead of pinning at the floor.
+
+    This is the regression that matters — under the old behaviour every
+    cycle recomputed the delay from attempt=1 and the client hammered the
+    server at a constant rate indefinitely.
+    """
+    monkeypatch.setattr(_realtime, "_STABLE_CONNECTION_S", 30.0)
+    rt, _ws = _make_client(reconnect=True, reconnect_interval_ms=100, max_reconnect_interval_ms=10_000)
+    try:
+        delays = []
+        for attempt in range(1, 5):
+            rt._reconnect_attempts = attempt
+            delays.append(rt._compute_reconnect_delay_ms(attempt))
+        # Jitter is ±25%, so compare floors rather than exact values.
+        assert delays[0] < delays[-1]
+        assert delays[-1] >= delays[0] * 4
+    finally:
+        await rt.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_instability_warning_fires_after_repeated_flapping(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The operator gets a local signal; a flapping client looks fine inside."""
+    monkeypatch.setattr(_realtime, "_STABLE_CONNECTION_S", 30.0)
+    monkeypatch.setattr(_realtime, "_INSTABILITY_WARN_THRESHOLD", 3)
+    rt, _ws = _make_client()
+    try:
+        with caplog.at_level(logging.WARNING, logger="agentchat.realtime"):
+            for _ in range(3):
+                rt._last_connect_monotonic = time.monotonic()
+                rt._note_connection_ended()
+        assert any("unstable" in r.message for r in caplog.records)
+    finally:
+        await rt.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_long_lived_connection_resets_the_instability_counter() -> None:
+    """A healthy session must not accumulate toward the warning."""
+    rt, _ws = _make_client()
+    try:
+        rt._rapid_reconnects = 2
+        rt._last_connect_monotonic = time.monotonic() - (_realtime._RAPID_RECONNECT_S + 1)
+        rt._note_connection_ended()
+        assert rt._rapid_reconnects == 0
+    finally:
+        await rt.disconnect()

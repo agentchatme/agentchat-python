@@ -87,6 +87,41 @@ SequenceGapHandler = Callable[[SequenceGapInfo], Union[Awaitable[None], None]]
 _DEFAULT_DEDUP_CACHE_SIZE = 2048
 
 
+def _keepalive_kwargs(connect_fn: Any) -> dict[str, float]:
+    """Pin the client keepalive instead of inheriting library defaults.
+
+    ``websockets`` defaults to ping every 20s / pong deadline 20s, which
+    has served fine — but inheriting it silently means a library upgrade
+    could change our wire behaviour without a line of our code changing,
+    and nobody reading this file could tell what the contract is. The
+    server pings independently at 45s with a 30s pong deadline; the two
+    regimes are deliberately separate, each detecting death on its own
+    side.
+
+    Skipped entirely for injected/test connect functions, which are plain
+    stubs that don't accept these kwargs.
+    """
+    if connect_fn is not _resolved_ws_connect():
+        return {}
+    return {"ping_interval": 20.0, "ping_timeout": 20.0}
+
+
+def _resolved_ws_connect() -> Any:
+    """The real ``websockets`` connect callable, or ``None`` if absent."""
+    try:
+        from websockets.asyncio.client import connect as _ws_connect
+
+        return _ws_connect
+    except ImportError:
+        pass
+    try:
+        from websockets import connect as _ws_connect_legacy
+
+        return _ws_connect_legacy
+    except ImportError:
+        return None
+
+
 @dataclass
 class RealtimeOptions:
     """Configuration for :class:`RealtimeClient`."""
@@ -110,6 +145,35 @@ class RealtimeOptions:
 # Client-side ceiling on the HELLO ack wait. Must stay below the server
 # HELLO_TIMEOUT_MS (5s) so our reconnect kicks in first.
 _HELLO_ACK_TIMEOUT_S = 4.0
+
+# How long a connection must SURVIVE before we call it healthy and clear
+# the reconnect backoff.
+#
+# This exists because "the handshake succeeded" is not the same claim as
+# "this connection works". Resetting the attempt counter on ``hello.ok``
+# alone means a socket that connects and dies seconds later always retries
+# at the floor delay — the exponential backoff below can then never engage,
+# because it only ever counts attempts that failed BEFORE the handshake.
+# A client in that state reconnects forever at ~2/second-of-session with no
+# ramp at all: observed in production as 725 connections in four hours from
+# one agent, delivering zero messages, while six sibling agents on the same
+# host held single connections the whole time.
+#
+# 30s is comfortably longer than any handshake-adjacent failure (HELLO ack
+# is 4s, the server's own heartbeat cycle is 45s) and short enough that a
+# genuinely healthy client clears its counter well before a second blip.
+_STABLE_CONNECTION_S = 30.0
+
+# Reconnects within this window are "rapid" for the purposes of the
+# instability warning below. Slightly above the backoff floor so a single
+# ordinary reconnect never trips it.
+_RAPID_RECONNECT_S = 60.0
+
+# Consecutive rapid reconnects before we tell the operator something is
+# wrong. The failure this catches is invisible from inside the agent — the
+# SDK reconnects successfully every time, so nothing looks broken locally
+# while the connection is unusable in practice.
+_INSTABILITY_WARN_THRESHOLD = 5
 
 # Time we let a seq gap sit before issuing an explicit gap-fill. Two
 # seconds is well below agent-loop perceptual floors and well above the
@@ -273,8 +337,14 @@ class RealtimeClient:
         self._recv_task: asyncio.Task[None] | None = None
         self._reconnect_task: asyncio.Task[None] | None = None
         self._hello_ack_task: asyncio.Task[None] | None = None
+        self._stability_task: asyncio.Task[None] | None = None
         self._bg_tasks: set[asyncio.Task[Any]] = set()
         self._reconnect_attempts = 0
+        # Consecutive connections that failed to reach _STABLE_CONNECTION_S.
+        # Drives the operator-facing instability warning only; the backoff
+        # itself is governed by _reconnect_attempts.
+        self._rapid_reconnects = 0
+        self._last_connect_monotonic: float | None = None
         self._authenticated = False
         self._disposed = False
         self._order_states: dict[str, _OrderState] = {}
@@ -323,7 +393,7 @@ class RealtimeClient:
 
         url = f"{self._opts.base_url}/v1/ws"
         try:
-            self._ws = await connect_fn(url)
+            self._ws = await connect_fn(url, **_keepalive_kwargs(connect_fn))
         except Exception as err:
             error = _RealtimeConnectionError(f"WebSocket connection failed: {err}")
             await self._emit_error(error)
@@ -382,6 +452,68 @@ class RealtimeClient:
                 "Install it with `pip install websockets>=12`."
             ) from err
 
+    def _start_stability_timer(self) -> None:
+        """Clear the reconnect backoff once this connection proves itself.
+
+        Scheduled on ``hello.ok``, cancelled on close. If it fires, the
+        socket has been up for _STABLE_CONNECTION_S and the next failure
+        deserves to start its backoff from the floor again. If it's
+        cancelled, the connection died young and the counter carries
+        forward, so the delay keeps growing toward the cap.
+        """
+        self._cancel_stability_timer()
+        self._last_connect_monotonic = time.monotonic()
+
+        async def _mark_stable() -> None:
+            try:
+                await asyncio.sleep(_STABLE_CONNECTION_S)
+            except asyncio.CancelledError:
+                return
+            if self._disposed or not self._authenticated:
+                return
+            self._reconnect_attempts = 0
+            self._rapid_reconnects = 0
+            self._stability_task = None
+
+        try:
+            self._stability_task = asyncio.create_task(_mark_stable())
+        except RuntimeError:  # pragma: no cover - no running loop
+            # No loop to schedule on: fall back to the old semantics rather
+            # than leaving the counter pinned forever.
+            self._reconnect_attempts = 0
+
+    def _cancel_stability_timer(self) -> None:
+        if self._stability_task is not None:
+            self._stability_task.cancel()
+            self._stability_task = None
+
+    def _note_connection_ended(self) -> None:
+        """Track short-lived connections and warn once they form a pattern.
+
+        A flapping client looks healthy from the inside — every reconnect
+        succeeds — so without this the operator has no local signal at all
+        that the connection is unusable.
+        """
+        started = self._last_connect_monotonic
+        self._last_connect_monotonic = None
+        if started is None:
+            return
+        if time.monotonic() - started >= _RAPID_RECONNECT_S:
+            self._rapid_reconnects = 0
+            return
+
+        self._rapid_reconnects += 1
+        if self._rapid_reconnects == _INSTABILITY_WARN_THRESHOLD:
+            _log.warning(
+                "AgentChat realtime connection is unstable: %d reconnects in "
+                "under %.0fs each. Backing off (next retry in up to %.0fs). "
+                "This usually means the network path or a local supervisor "
+                "is dropping the socket, not an AgentChat outage.",
+                self._rapid_reconnects,
+                _RAPID_RECONNECT_S,
+                self._opts.max_reconnect_interval_ms / 1000.0,
+            )
+
     async def _hello_ack_watchdog(self) -> None:
         try:
             await asyncio.sleep(_HELLO_ACK_TIMEOUT_S)
@@ -415,7 +547,12 @@ class RealtimeClient:
                 if not self._authenticated:
                     if message.get("type") == "hello.ok":
                         self._authenticated = True
-                        self._reconnect_attempts = 0
+                        # NOT reset here. A successful handshake proves the
+                        # credential, not the connection — see
+                        # _STABLE_CONNECTION_S. The counter clears from the
+                        # stability timer below, only if we're still up in
+                        # 30 seconds.
+                        self._start_stability_timer()
                         # Delivery-ack capability negotiation: enable only
                         # if the server echoed `ack`. A hello.ok without a
                         # capabilities list is a legacy server → stay in
@@ -460,6 +597,11 @@ class RealtimeClient:
             if self._hello_ack_task is not None:
                 self._hello_ack_task.cancel()
                 self._hello_ack_task = None
+            # Cancel BEFORE clearing _authenticated: a connection that dies
+            # young must not clear the backoff counter, which is the whole
+            # point of the stability window.
+            self._cancel_stability_timer()
+            self._note_connection_ended()
             self._authenticated = False
             self._ack_mode = False
 
@@ -692,6 +834,7 @@ class RealtimeClient:
         if self._hello_ack_task is not None:
             self._hello_ack_task.cancel()
             self._hello_ack_task = None
+        self._cancel_stability_timer()
 
         await self._drain_all_pending_for_shutdown()
 
