@@ -12,7 +12,6 @@ WebSocket connect that closes immediately. We never:
   * send a message
   * mutate any contact / mute / block
   * upload an avatar / attachment
-  * register a webhook
   * change presence
 
 If the SDK ever needs to publish a "creates a row" smoke check, do it

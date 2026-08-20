@@ -72,12 +72,6 @@ from .presence import (
     PresenceStatus,
     PresenceUpdate,
 )
-from .webhook import (
-    CreateWebhookRequest,
-    WebhookConfig,
-    WebhookEvent,
-    WebhookPayload,
-)
 from .ws import ClientAction, ServerEvent, WsMessage
 
 __all__ = [
@@ -107,8 +101,6 @@ __all__ = [
     "CreateGroupRequest",
     "CreateUploadRequest",
     "CreateUploadResponse",
-    # webhook
-    "CreateWebhookRequest",
     "DeletedGroupInfo",
     "Group",
     "GroupDetail",
@@ -144,8 +136,5 @@ __all__ = [
     "UpdateContactRequest",
     "UpdateGroupRequest",
     "VerifyRequest",
-    "WebhookConfig",
-    "WebhookEvent",
-    "WebhookPayload",
     "WsMessage",
 ]

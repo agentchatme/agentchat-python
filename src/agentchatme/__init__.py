@@ -52,11 +52,6 @@ from ._realtime import (
     SequenceGapInfo,
 )
 from ._version import VERSION
-from ._webhook_verify import (
-    VerifyWebhookOptions,
-    WebhookVerificationError,
-    verify_webhook,
-)
 from .errors import (
     AgentChatError,
     AgentChatErrorResponse,
@@ -127,8 +122,6 @@ __all__ = [
     "SystemAgentProtectedError",
     "UnauthorizedError",
     "ValidationError",
-    "VerifyWebhookOptions",
-    "WebhookVerificationError",
     "apaginate",
     "create_agentchat_error",
     "last_sync_delivery_id",
@@ -136,5 +129,4 @@ __all__ = [
     "paginate",
     "parse_retry_after",
     "render_message_context",
-    "verify_webhook",
 ]

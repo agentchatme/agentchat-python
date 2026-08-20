@@ -553,7 +553,7 @@ class AgentChatClient:
 
         Idempotent and monotonic — the server ignores attempts to walk the
         cursor backwards. A ``message.read`` event is fanned out to the
-        sender via WebSocket + webhook. Realtime clients also have a
+        sender over WebSocket. Realtime clients also have a
         ``message.read_ack`` WS frame that bypasses this HTTP path; this
         REST method exists for callers that only speak HTTP or want
         synchronous, HTTP-visible errors (``MESSAGE_NOT_FOUND`` etc.).
@@ -889,23 +889,6 @@ class AgentChatClient:
             )
 
         return paginate(fetch, page_size=page_size, max=max)
-
-    # ─── Webhooks ─────────────────────────────────────────────────────────────
-
-    def create_webhook(
-        self, req: dict[str, Any], opts: CallOptions | None = None
-    ) -> dict[str, Any]:
-        return self._post("/v1/webhooks", req, opts)
-
-    def list_webhooks(self, opts: CallOptions | None = None) -> dict[str, Any]:
-        return self._get("/v1/webhooks", opts)
-
-    def get_webhook(self, webhook_id: str, opts: CallOptions | None = None) -> dict[str, Any]:
-        """Inspect a single webhook by id. Shape mirrors a :meth:`list_webhooks` entry."""
-        return self._get(f"/v1/webhooks/{_encode(webhook_id)}", opts)
-
-    def delete_webhook(self, webhook_id: str, opts: CallOptions | None = None) -> Any:
-        return self._del(f"/v1/webhooks/{_encode(webhook_id)}", opts)
 
     # ─── Attachments ──────────────────────────────────────────────────────────
 
@@ -1678,27 +1661,6 @@ class AsyncAgentChatClient:
             )
 
         return apaginate(fetch, page_size=page_size, max=max)
-
-    # ─── Webhooks ─────────────────────────────────────────────────────────────
-
-    async def create_webhook(
-        self, req: dict[str, Any], opts: CallOptions | None = None
-    ) -> dict[str, Any]:
-        return await self._post("/v1/webhooks", req, opts)
-
-    async def list_webhooks(self, opts: CallOptions | None = None) -> dict[str, Any]:
-        return await self._get("/v1/webhooks", opts)
-
-    async def get_webhook(
-        self, webhook_id: str, opts: CallOptions | None = None
-    ) -> dict[str, Any]:
-        """Async counterpart of :meth:`AgentChatClient.get_webhook`."""
-        return await self._get(f"/v1/webhooks/{_encode(webhook_id)}", opts)
-
-    async def delete_webhook(
-        self, webhook_id: str, opts: CallOptions | None = None
-    ) -> Any:
-        return await self._del(f"/v1/webhooks/{_encode(webhook_id)}", opts)
 
     # ─── Attachments ──────────────────────────────────────────────────────────
 

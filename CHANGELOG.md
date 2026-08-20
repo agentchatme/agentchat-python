@@ -5,6 +5,23 @@ file. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/
 and the SDK uses [SemVer](https://semver.org/) — breaking changes bump the
 major. The on-the-wire API is versioned separately under `/v1/...`.
 
+## [1.1.0] — 2026-08-20
+
+### Fixed
+
+- Reconnect backoff now resets only after a connection remains stable for 30
+  seconds, so repeated short-lived connections ramp toward the configured
+  maximum instead of reconnecting forever at the minimum interval.
+- Repeated rapid reconnects now surface an operator-facing warning, and the
+  WebSocket ping/pong keepalive interval is explicit rather than inherited
+  from the underlying library.
+
+### Removed
+
+- Webhook management methods, webhook types, and signature-verification
+  helpers are no longer part of the public SDK surface. Webhook delivery is an
+  internal platform capability; realtime users should use `RealtimeClient`.
+
 ## [1.0.321] — 2026-07-27
 
 ### Added — first-party client identity

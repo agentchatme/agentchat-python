@@ -9,7 +9,11 @@ import time
 
 import pytest
 
-from agentchatme import VerifyWebhookOptions, WebhookVerificationError, verify_webhook
+from agentchatme._webhook_verify import (
+    VerifyWebhookOptions,
+    WebhookVerificationError,
+    verify_webhook,
+)
 
 _SECRET = "whsec_test_1234"
 

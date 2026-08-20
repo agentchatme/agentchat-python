@@ -48,7 +48,6 @@ class ErrorCode:
     FORBIDDEN = "FORBIDDEN"
     VALIDATION_ERROR = "VALIDATION_ERROR"
     INTERNAL_ERROR = "INTERNAL_ERROR"
-    WEBHOOK_DELIVERY_FAILED = "WEBHOOK_DELIVERY_FAILED"
     OWNER_NOT_FOUND = "OWNER_NOT_FOUND"
     INVALID_API_KEY = "INVALID_API_KEY"
     ALREADY_CLAIMED = "ALREADY_CLAIMED"
@@ -260,7 +259,7 @@ def create_agentchat_error(
     """Pick the most specific ``AgentChatError`` subclass for a given response.
 
     The transport calls this on every non-2xx. Callers can reuse it to
-    construct errors manually (e.g. re-raising from a webhook handler that
+    construct errors manually (e.g. re-raising from a queue handler that
     wants platform-style errors).
 
     ``headers`` should accept case-insensitive lookups (httpx ``Response.headers``

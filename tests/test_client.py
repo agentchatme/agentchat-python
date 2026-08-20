@@ -288,30 +288,6 @@ def test_remove_group_avatar_deletes() -> None:
     assert route.called
 
 
-def test_get_webhook_hits_correct_url() -> None:
-    with respx.mock(base_url="https://api.test") as mock:
-        route = mock.get("/v1/webhooks/wh_1").mock(
-            return_value=httpx.Response(
-                200,
-                json={
-                    "id": "wh_1",
-                    "url": "https://example.com/hook",
-                    "events": ["message.new"],
-                    "active": True,
-                    "created_at": "2026-01-01T00:00:00Z",
-                },
-            )
-        )
-        client = AgentChatClient(api_key="sk_test", base_url="https://api.test")
-        try:
-            wh = client.get_webhook("wh_1")
-        finally:
-            client.close()
-    assert route.called
-    assert wh["id"] == "wh_1"
-    assert wh["events"] == ["message.new"]
-
-
 def test_get_attachment_download_url_captures_location_without_following() -> None:
     """The 302 must NOT be followed — Bearer would leak to the storage URL."""
     storage_url = "https://storage.test/signed/key123?sig=abc"
