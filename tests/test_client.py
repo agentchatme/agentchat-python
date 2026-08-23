@@ -20,6 +20,9 @@ from agentchatme import (
     AgentChatClient,
     AgentChatError,
     AsyncAgentChatClient,
+    EmailExhaustedError,
+    EmailLimitReachedError,
+    HandleRequiredError,
     RecipientBackloggedError,
     SystemAgentProtectedError,
 )
@@ -365,7 +368,176 @@ def test_system_agent_protected_error_via_block() -> None:
     assert exc_info.value.status == 409
 
 
+# ─────────────── Registration: email policy ───────────────
+
+
+def test_register_email_limit_reached_is_typed() -> None:
+    """409 EMAIL_LIMIT_REACHED from /v1/register → EmailLimitReachedError with the cap."""
+    with respx.mock(base_url="https://api.test") as mock:
+        mock.post("/v1/register").mock(
+            return_value=httpx.Response(
+                409,
+                json={
+                    "code": "EMAIL_LIMIT_REACHED",
+                    "message": "This email already backs 10 active agents.",
+                    "details": {"limit": 10},
+                },
+            )
+        )
+        with pytest.raises(EmailLimitReachedError) as exc_info:
+            AgentChatClient.register(
+                email="you@example.com", handle="my-agent", base_url="https://api.test"
+            )
+    assert exc_info.value.status == 409
+    assert exc_info.value.limit == 10
+
+
+def test_register_email_exhausted_is_typed() -> None:
+    with respx.mock(base_url="https://api.test") as mock:
+        mock.post("/v1/register").mock(
+            return_value=httpx.Response(
+                409,
+                json={
+                    "code": "EMAIL_EXHAUSTED",
+                    "message": "This email has reached the maximum of 30 account registrations.",
+                    "details": {"limit": 30},
+                },
+            )
+        )
+        with pytest.raises(EmailExhaustedError) as exc_info:
+            AgentChatClient.register(
+                email="you@example.com", handle="my-agent", base_url="https://api.test"
+            )
+    assert exc_info.value.limit == 30
+
+
+# ─────────────── Recovery: handle + email ───────────────
+
+
+def _capture_post(mock: respx.MockRouter, path: str, response: dict[str, Any]) -> dict[str, Any]:
+    """Route ``POST path`` to a 200 ``response`` and return the captured JSON body."""
+    captured: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.update(json.loads(request.content.decode()))
+        return httpx.Response(200, json=response)
+
+    mock.post(path).mock(side_effect=handler)
+    return captured
+
+
+def test_recover_sends_handle_with_email() -> None:
+    with respx.mock(base_url="https://api.test") as mock:
+        body = _capture_post(
+            mock, "/v1/agents/recover", {"pending_id": "pnd_1", "message": "If it exists…"}
+        )
+        result = AgentChatClient.recover(
+            "you@example.com", handle="my-agent", base_url="https://api.test"
+        )
+    assert body == {"email": "you@example.com", "handle": "my-agent"}
+    assert result == {"pending_id": "pnd_1", "message": "If it exists…"}
+
+
+def test_recover_omits_handle_key_when_not_given() -> None:
+    """Legacy email-only call: the key must be absent, not ``null`` — the
+    server schema is optional, not nullable."""
+    with respx.mock(base_url="https://api.test") as mock:
+        body = _capture_post(
+            mock, "/v1/agents/recover", {"pending_id": "pnd_1", "message": "If it exists…"}
+        )
+        result = AgentChatClient.recover("you@example.com", base_url="https://api.test")
+    assert body == {"email": "you@example.com"}
+    assert "handle" not in body
+    assert result["pending_id"] == "pnd_1"
+
+
+def test_recover_handle_is_keyword_only() -> None:
+    # Locks the signature: a positional second argument must not silently
+    # become the handle (or anything else).
+    with pytest.raises(TypeError):
+        AgentChatClient.recover("you@example.com", "my-agent")  # type: ignore[misc]
+    with pytest.raises(TypeError):
+        AsyncAgentChatClient.recover("you@example.com", "my-agent")  # type: ignore[misc]
+
+
+def test_recover_verify_handle_required_is_typed() -> None:
+    """409 HANDLE_REQUIRED → HandleRequiredError listing the live sibling handles."""
+    with respx.mock(base_url="https://api.test") as mock:
+        mock.post("/v1/agents/recover/verify").mock(
+            return_value=httpx.Response(
+                409,
+                json={
+                    "code": "HANDLE_REQUIRED",
+                    "message": "This email backs more than one agent.",
+                    "details": {"handles": ["alpha-bot", "beta-bot"]},
+                },
+            )
+        )
+        with pytest.raises(HandleRequiredError) as exc_info:
+            AgentChatClient.recover_verify("pnd_1", "123456", base_url="https://api.test")
+    assert exc_info.value.status == 409
+    assert exc_info.value.handles == ["alpha-bot", "beta-bot"]
+
+
+def test_recover_verify_success_returns_handle_key_client() -> None:
+    with respx.mock(base_url="https://api.test") as mock:
+        mock.post("/v1/agents/recover/verify").mock(
+            return_value=httpx.Response(
+                200, json={"handle": "my-agent", "api_key": "ac_new", "message": "ok"}
+            )
+        )
+        handle, api_key, client = AgentChatClient.recover_verify(
+            "pnd_1", "123456", base_url="https://api.test"
+        )
+        client.close()
+    assert (handle, api_key) == ("my-agent", "ac_new")
+    assert client.base_url == "https://api.test"
+
+
 # ─────────────── Async counterpart ───────────────
+
+
+@pytest.mark.asyncio
+async def test_async_recover_sends_handle_with_email() -> None:
+    with respx.mock(base_url="https://api.test") as mock:
+        body = _capture_post(
+            mock, "/v1/agents/recover", {"pending_id": "pnd_1", "message": "If it exists…"}
+        )
+        result = await AsyncAgentChatClient.recover(
+            "you@example.com", handle="my-agent", base_url="https://api.test"
+        )
+    assert body == {"email": "you@example.com", "handle": "my-agent"}
+    assert result["pending_id"] == "pnd_1"
+
+
+@pytest.mark.asyncio
+async def test_async_recover_omits_handle_key_when_not_given() -> None:
+    with respx.mock(base_url="https://api.test") as mock:
+        body = _capture_post(
+            mock, "/v1/agents/recover", {"pending_id": "pnd_1", "message": "If it exists…"}
+        )
+        await AsyncAgentChatClient.recover("you@example.com", base_url="https://api.test")
+    assert body == {"email": "you@example.com"}
+
+
+@pytest.mark.asyncio
+async def test_async_recover_verify_handle_required_is_typed() -> None:
+    with respx.mock(base_url="https://api.test") as mock:
+        mock.post("/v1/agents/recover/verify").mock(
+            return_value=httpx.Response(
+                409,
+                json={
+                    "code": "HANDLE_REQUIRED",
+                    "message": "This email backs more than one agent.",
+                    "details": {"handles": ["alpha-bot", "beta-bot"]},
+                },
+            )
+        )
+        with pytest.raises(HandleRequiredError) as exc_info:
+            await AsyncAgentChatClient.recover_verify(
+                "pnd_1", "123456", base_url="https://api.test"
+            )
+    assert exc_info.value.handles == ["alpha-bot", "beta-bot"]
 
 
 @pytest.mark.asyncio

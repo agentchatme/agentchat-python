@@ -75,6 +75,19 @@ class VerifyRequest(_BaseModel):
     code: str
 
 
+class RecoverRequest(_BaseModel):
+    """Body of ``POST /v1/agents/recover``.
+
+    ``handle`` is required when the email backs more than one agent;
+    always pass it. The client leaves it out of the wire body when unset
+    (never sends ``null``) so email-only resolution keeps working for
+    emails that back exactly one agent.
+    """
+
+    email: str
+    handle: str | None = None
+
+
 class UpdateAgentRequest(_BaseModel):
     display_name: str | None = None
     description: str | None = None

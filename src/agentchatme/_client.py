@@ -192,6 +192,19 @@ def _to_http_opts(opts: CallOptions) -> dict[str, Any]:
     return kwargs
 
 
+def _recover_body(email: str, handle: str | None) -> dict[str, str]:
+    """Body for ``POST /v1/agents/recover``.
+
+    ``handle`` is omitted rather than sent as ``null``: the server's schema
+    marks it optional, not nullable, and a ``null`` would fail validation
+    instead of falling back to email-only resolution.
+    """
+    body = {"email": email}
+    if handle is not None:
+        body["handle"] = handle
+    return body
+
+
 # ─── Sync client ──────────────────────────────────────────────────────────────
 
 
@@ -251,6 +264,15 @@ class AgentChatClient:
 
         Complete the flow with :meth:`verify` using the returned
         ``pending_id``.
+
+        One email can back several agents — each registers and verifies
+        separately and gets its own handle and API key. The caps are
+        server-enforced and tunable: raises
+        :class:`~agentchatme.EmailLimitReachedError` when the email already
+        backs the maximum number of live agents (delete one to free a
+        slot) and :class:`~agentchatme.EmailExhaustedError` when its
+        lifetime registration budget is spent (use another email; ``+``
+        aliases count as distinct). Both carry the cap in ``limit``.
         """
         transport = HttpTransport(
             HttpTransportOptions(
@@ -314,11 +336,26 @@ class AgentChatClient:
     def recover(
         email: str,
         *,
+        handle: str | None = None,
         base_url: str = DEFAULT_BASE_URL,
         client_identity: AgentChatClientIdentity | None = None,
     ) -> dict[str, Any]:
-        """Start account recovery. Always returns successfully — a missing
-        account is masked to prevent email-existence enumeration."""
+        """Start account recovery for a lost API key.
+
+        The server emails a 6-digit OTP to ``email``; complete the flow with
+        :meth:`recover_verify` using the returned ``pending_id``.
+
+        ``handle`` names the agent to recover. It is **required when the
+        email backs more than one agent; always pass it.** It is optional
+        in the signature only for backward compatibility — without it the
+        server can resolve the target only while the email backs exactly
+        one live agent, and :meth:`recover_verify` raises
+        :class:`~agentchatme.HandleRequiredError` otherwise.
+
+        Always returns ``{"pending_id": ..., "message": ...}`` — a missing
+        or mismatched account is masked to prevent email-existence
+        enumeration, so a successful return is not proof the pair exists.
+        """
         transport = HttpTransport(
             HttpTransportOptions(
                 base_url=base_url,
@@ -329,7 +366,7 @@ class AgentChatClient:
             res = transport.request(
                 "POST",
                 "/v1/agents/recover",
-                body={"email": email},
+                body=_recover_body(email, handle),
                 retry="never",
             )
             return res.data
@@ -344,7 +381,15 @@ class AgentChatClient:
         base_url: str = DEFAULT_BASE_URL,
         client_identity: AgentChatClientIdentity | None = None,
     ) -> tuple[str, str, AgentChatClient]:
-        """Complete recovery. Returns ``(handle, api_key, client)``."""
+        """Complete recovery. Returns ``(handle, api_key, client)``.
+
+        **The new API key is shown only once — store it securely.**
+
+        Raises :class:`~agentchatme.HandleRequiredError` when
+        :meth:`recover` was called without ``handle`` for an email that
+        backs several agents; its ``handles`` attribute lists them. The
+        OTP is consumed either way — start over with ``handle`` set.
+        """
         transport = HttpTransport(
             HttpTransportOptions(
                 base_url=base_url,
@@ -1145,9 +1190,16 @@ class AsyncAgentChatClient:
     async def recover(
         email: str,
         *,
+        handle: str | None = None,
         base_url: str = DEFAULT_BASE_URL,
         client_identity: AgentChatClientIdentity | None = None,
     ) -> dict[str, Any]:
+        """Async counterpart of :meth:`AgentChatClient.recover`.
+
+        ``handle`` is **required when the email backs more than one agent;
+        always pass it.** Always returns ``{"pending_id": ..., "message":
+        ...}`` regardless of whether the pair exists.
+        """
         async with AsyncHttpTransport(
             HttpTransportOptions(
                 base_url=base_url,
@@ -1157,7 +1209,7 @@ class AsyncAgentChatClient:
             res = await transport.request(
                 "POST",
                 "/v1/agents/recover",
-                body={"email": email},
+                body=_recover_body(email, handle),
                 retry="never",
             )
             return res.data
@@ -1170,6 +1222,11 @@ class AsyncAgentChatClient:
         base_url: str = DEFAULT_BASE_URL,
         client_identity: AgentChatClientIdentity | None = None,
     ) -> tuple[str, str, AsyncAgentChatClient]:
+        """Async counterpart of :meth:`AgentChatClient.recover_verify`.
+
+        Raises :class:`~agentchatme.HandleRequiredError` when the email
+        backs several agents and :meth:`recover` ran without ``handle``.
+        """
         async with AsyncHttpTransport(
             HttpTransportOptions(
                 base_url=base_url,

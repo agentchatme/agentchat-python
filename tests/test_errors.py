@@ -6,12 +6,18 @@ plus the subclass hierarchy check.
 
 from __future__ import annotations
 
+import pytest
+
 from agentchatme.errors import (
     AgentChatError,
     AwaitingReplyError,
     BlockedError,
+    EmailExhaustedError,
+    EmailLimitReachedError,
+    ErrorCode,
     ForbiddenError,
     GroupDeletedError,
+    HandleRequiredError,
     NotFoundError,
     RateLimitedError,
     RecipientBackloggedError,
@@ -155,6 +161,86 @@ def test_awaiting_reply_extracts_details() -> None:
     assert isinstance(err, AwaitingReplyError)
     assert err.recipient_handle == "alice"
     assert err.waiting_since == "2026-04-01T12:00:00Z"
+
+
+def test_email_limit_reached_extracts_limit() -> None:
+    err = create_agentchat_error(
+        {
+            "code": "EMAIL_LIMIT_REACHED",
+            "message": "This email already backs 10 active agents.",
+            "details": {"limit": 10},
+        },
+        409,
+    )
+    assert isinstance(err, EmailLimitReachedError)
+    assert err.code == ErrorCode.EMAIL_LIMIT_REACHED
+    assert err.status == 409
+    assert err.limit == 10
+
+
+def test_legacy_email_taken_maps_to_email_limit_reached() -> None:
+    # Pre-policy servers reject the second live agent on an email with
+    # EMAIL_TAKEN and no details. Same class, ``limit`` falls back to None
+    # so callers quote the server message instead of a number.
+    err = create_agentchat_error({"code": "EMAIL_TAKEN", "message": "taken"}, 409)
+    assert isinstance(err, EmailLimitReachedError)
+    assert err.code == "EMAIL_TAKEN"
+    assert err.limit is None
+    assert str(err) == "taken"
+
+
+def test_email_exhausted_extracts_limit() -> None:
+    err = create_agentchat_error(
+        {
+            "code": "EMAIL_EXHAUSTED",
+            "message": "This email has reached the maximum of 30 account registrations.",
+            "details": {"limit": 30},
+        },
+        409,
+    )
+    assert isinstance(err, EmailExhaustedError)
+    assert not isinstance(err, EmailLimitReachedError)
+    assert err.limit == 30
+
+
+@pytest.mark.parametrize("bad_limit", ["10", 10.5, True, None])
+def test_email_policy_limit_rejects_malformed_values(bad_limit: object) -> None:
+    for code, cls in (
+        ("EMAIL_LIMIT_REACHED", EmailLimitReachedError),
+        ("EMAIL_EXHAUSTED", EmailExhaustedError),
+    ):
+        err = create_agentchat_error(
+            {"code": code, "message": "x", "details": {"limit": bad_limit}}, 409
+        )
+        assert isinstance(err, cls)
+        assert err.limit is None, (code, bad_limit)
+
+
+def test_handle_required_extracts_handles() -> None:
+    err = create_agentchat_error(
+        {
+            "code": "HANDLE_REQUIRED",
+            "message": "This email backs more than one agent.",
+            "details": {"handles": ["alpha-bot", "beta-bot", 42, None]},
+        },
+        409,
+    )
+    assert isinstance(err, HandleRequiredError)
+    assert err.code == ErrorCode.HANDLE_REQUIRED
+    assert err.status == 409
+    # Order is the server's (created_at ASC); non-string entries dropped.
+    assert err.handles == ["alpha-bot", "beta-bot"]
+
+
+def test_handle_required_without_details_has_empty_handles() -> None:
+    err = create_agentchat_error({"code": "HANDLE_REQUIRED", "message": "x"}, 409)
+    assert isinstance(err, HandleRequiredError)
+    assert err.handles == []
+    err = create_agentchat_error(
+        {"code": "HANDLE_REQUIRED", "message": "x", "details": {"handles": "alpha-bot"}}, 409
+    )
+    assert isinstance(err, HandleRequiredError)
+    assert err.handles == []
 
 
 def test_internal_error_maps() -> None:

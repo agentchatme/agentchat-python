@@ -14,7 +14,7 @@ outermost layer.
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import Any
+from typing import Any, cast
 
 from ._http_retry_after import parse_retry_after
 
@@ -34,7 +34,18 @@ class ErrorCode:
     AGENT_PAUSED_BY_OWNER = "AGENT_PAUSED_BY_OWNER"
     HANDLE_TAKEN = "HANDLE_TAKEN"
     INVALID_HANDLE = "INVALID_HANDLE"
+    # Email policy (409, ``POST /v1/register`` and ``/v1/register/verify``).
+    # An email may back a server-tunable number of live agents and a larger
+    # number of lifetime registrations; the caps arrive in ``details.limit``.
+    EMAIL_LIMIT_REACHED = "EMAIL_LIMIT_REACHED"
     EMAIL_EXHAUSTED = "EMAIL_EXHAUSTED"
+    # Legacy spelling of EMAIL_LIMIT_REACHED from servers that still enforce
+    # one live agent per email. Retired server-side; mapped to the same
+    # exception class so callers never need to branch on it.
+    EMAIL_TAKEN = "EMAIL_TAKEN"
+    # 409 from ``POST /v1/agents/recover/verify`` when the email backs more
+    # than one agent and recovery was started without a ``handle``.
+    HANDLE_REQUIRED = "HANDLE_REQUIRED"
     SUSPENDED = "SUSPENDED"
     RESTRICTED = "RESTRICTED"
     CONVERSATION_NOT_FOUND = "CONVERSATION_NOT_FOUND"
@@ -241,6 +252,93 @@ class SystemAgentProtectedError(AgentChatError):
     """
 
 
+class EmailLimitReachedError(AgentChatError):
+    """Raised on HTTP 409 EMAIL_LIMIT_REACHED from ``POST /v1/register``.
+
+    The email already backs the maximum number of *live* agents (status
+    active / restricted / suspended). Deleting one frees a slot; registering
+    under a different email (``+`` aliases count as distinct emails) is the
+    other way out.
+
+    ``limit`` is the server's current cap from ``details.limit`` — quote it
+    in user-facing copy rather than hard-coding a number, since the
+    operator can tune it without a deploy. ``None`` when the server omitted
+    it (fall back to ``str(err)``, the server's own message).
+
+    Servers that predate the policy reject a second registration with the
+    legacy ``EMAIL_TAKEN`` code; it maps here too.
+    """
+
+    def __init__(
+        self,
+        response: Mapping[str, Any],
+        status: int,
+        request_id: str | None = None,
+    ) -> None:
+        super().__init__(response, status, request_id)
+        d = self.details or {}
+        limit = d.get("limit")
+        # ``bool`` is an ``int`` subclass; a boolean ``limit`` is malformed.
+        self.limit: int | None = (
+            limit if isinstance(limit, int) and not isinstance(limit, bool) else None
+        )
+
+
+class EmailExhaustedError(AgentChatError):
+    """Raised on HTTP 409 EMAIL_EXHAUSTED from ``POST /v1/register``.
+
+    The email has used up its *lifetime* registration budget (every row
+    ever created under it, deleted ones included). Unlike
+    :class:`EmailLimitReachedError`, deleting an agent does not free a
+    slot — register with a different email.
+
+    ``limit`` is the server's current lifetime cap from ``details.limit``;
+    ``None`` when omitted (fall back to ``str(err)``).
+    """
+
+    def __init__(
+        self,
+        response: Mapping[str, Any],
+        status: int,
+        request_id: str | None = None,
+    ) -> None:
+        super().__init__(response, status, request_id)
+        d = self.details or {}
+        limit = d.get("limit")
+        self.limit: int | None = (
+            limit if isinstance(limit, int) and not isinstance(limit, bool) else None
+        )
+
+
+class HandleRequiredError(AgentChatError):
+    """Raised on HTTP 409 HANDLE_REQUIRED from ``POST /v1/agents/recover/verify``.
+
+    Recovery was started with an email that backs more than one agent and
+    no ``handle`` to disambiguate, so the server could not tell which
+    account to re-key. The OTP has been consumed; run
+    :meth:`~agentchatme.AgentChatClient.recover` again with
+    ``handle=`` set to one of ``handles``.
+
+    ``handles`` lists every live agent on that email, oldest first. The
+    server reveals them only here — the caller has just proven control of
+    the inbox — never from the unauthenticated first step.
+
+    Passing ``handle`` on the first call avoids this error entirely.
+    """
+
+    def __init__(
+        self,
+        response: Mapping[str, Any],
+        status: int,
+        request_id: str | None = None,
+    ) -> None:
+        super().__init__(response, status, request_id)
+        d = self.details or {}
+        handles = d.get("handles")
+        raw = cast("list[object]", handles) if isinstance(handles, list) else []
+        self.handles: list[str] = [h for h in raw if isinstance(h, str)]
+
+
 class ConnectionError(Exception):
     """Transport-level failure: no HTTP response was received.
 
@@ -312,6 +410,12 @@ def create_agentchat_error(
         return GroupDeletedError(body, status, request_id)
     if code == ErrorCode.SYSTEM_AGENT_PROTECTED:
         return SystemAgentProtectedError(body, status, request_id)
+    if code in (ErrorCode.EMAIL_LIMIT_REACHED, ErrorCode.EMAIL_TAKEN):
+        return EmailLimitReachedError(body, status, request_id)
+    if code == ErrorCode.EMAIL_EXHAUSTED:
+        return EmailExhaustedError(body, status, request_id)
+    if code == ErrorCode.HANDLE_REQUIRED:
+        return HandleRequiredError(body, status, request_id)
     if code == ErrorCode.INTERNAL_ERROR:
         return ServerError(body, status, request_id)
 
