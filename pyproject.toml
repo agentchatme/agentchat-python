@@ -76,6 +76,10 @@ include = [
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
+# Explicit, so newer pytest-asyncio releases (which warn when it is unset,
+# and `filterwarnings = error` below turns that warning into a failed run)
+# keep today's behaviour: one event loop per test function.
+asyncio_default_fixture_loop_scope = "function"
 addopts = "-ra --strict-markers"
 markers = [
     # Tests that hit the deployed AgentChat API. Skipped unless
