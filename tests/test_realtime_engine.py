@@ -268,6 +268,53 @@ async def test_ack_on_receipt_acks_gap_fill_rows_when_fetched(
         await rt.disconnect()
 
 
+@pytest.mark.asyncio
+async def test_ack_on_receipt_flushes_acked_parked_frames_when_the_socket_closes() -> None:
+    # The parked frame was acked at receipt, so the server will never
+    # re-offer it: on a socket drop it must reach the handlers, in seq
+    # order, instead of vanishing with the ordering state.
+    gaps: list[Any] = []
+    rt, ws = await connected(
+        capabilities=["ack"], ack_on_receipt=True, on_sequence_gap=lambda info: gaps.append(info)
+    )
+    dispatched: list[int] = []
+    rt.on("message.new", lambda m: dispatched.append(m["payload"]["seq"]))
+    try:
+        await ws.push(message_new("c", 1))
+        await ws.push(message_new("c", 4))
+        await ws.push(message_new("c", 3))
+        await _settle()
+        assert dispatched == [1]
+        assert _ack_frames(ws) == ["msg_1", "msg_4", "msg_3"]
+        await ws.close(code=1006, reason="dropped")
+        await _settle()
+        assert dispatched == [1, 3, 4]
+        assert [g.reason for g in gaps] == ["connection_closed"]
+        assert gaps[0].recovered is False and gaps[0].buffered_seq == 3
+    finally:
+        await rt.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_default_mode_leaves_unacked_parked_frames_to_the_next_drain() -> None:
+    gaps: list[Any] = []
+    rt, ws = await connected(capabilities=["ack"], on_sequence_gap=lambda info: gaps.append(info))
+    dispatched: list[int] = []
+    rt.on("message.new", lambda m: dispatched.append(m["payload"]["seq"]))
+    try:
+        await ws.push(message_new("c", 1))
+        await ws.push(message_new("c", 3))
+        await _settle()
+        await ws.close(code=1006, reason="dropped")
+        await _settle()
+        # Not acked, so not flushed: the server re-offers seq 3 in order.
+        assert dispatched == [1]
+        assert _ack_frames(ws) == ["msg_1"]
+        assert gaps == []
+    finally:
+        await rt.disconnect()
+
+
 # ─────────────── a guest in a host process ───────────────
 
 

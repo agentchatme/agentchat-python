@@ -74,6 +74,10 @@ GapReason = Literal[
     "gap_fill_failed",
     "gap_fill_unavailable",
     "buffer_overflow",
+    # ack_on_receipt only: the socket closed while frames sat in the gap
+    # buffer. They were already acknowledged, so they were handed to the
+    # handlers in seq order instead of being dropped (see the option).
+    "connection_closed",
 ]
 
 
@@ -159,7 +163,16 @@ class RealtimeOptions:
     rows; the REST offline drain keeps its settle-then-ack cursor. Default
     ``False``: ack after every handler settled, for app clients whose
     handler IS the processing. Only applies when the server negotiated
-    ack-mode."""
+    ack-mode.
+
+    Trade-off: an acked frame is never re-offered by the server, so a frame
+    that is parked on a seq gap when the socket drops is handed to the
+    handlers at close time, in seq order but possibly ahead of the seqs it
+    was waiting for (which arrive after the reconnect). Ack-on-receipt
+    trades strict ordering across a connection drop for no loss; the
+    default mode keeps ordering because unacked frames come back in order
+    on the next drain. Such a flush fires ``on_sequence_gap`` with
+    ``reason="connection_closed"``."""
 
 
 # ───────────────────────── Internal constants ─────────────────────────
@@ -667,6 +680,15 @@ class RealtimeClient:
                 }
             )
 
+            # Ack-on-receipt: every frame parked on a seq gap was acknowledged
+            # at parse, so the server has it `delivered` and will never
+            # re-offer it. Dropping the buffer here would lose it for good —
+            # the exact loss the ack protocol exists to prevent. Hand the
+            # parked frames to the handlers now, in seq order, before the
+            # state goes. Default mode skips this: its parked frames are
+            # unacked and come back in order on the next drain.
+            if self._opts.ack_on_receipt:
+                await self._flush_parked_frames("connection_closed")
             self._reset_order_states()
             if not self._disposed:
                 if (
@@ -944,7 +966,7 @@ class RealtimeClient:
         timer and handler this instance owns.
 
         Buffered out-of-order envelopes are flushed to handlers first (see
-        :meth:`_drain_all_pending_for_shutdown`), then the socket closes,
+        :meth:`_flush_parked_frames`), then the socket closes,
         then every background task (reconnect, HELLO watchdog, stability
         timer, gap timers, drain) is cancelled **and awaited**, so nothing
         of this instance survives in the loop. After this, :meth:`connect`
@@ -968,7 +990,7 @@ class RealtimeClient:
         owned.extend(self._bg_tasks)
         self._bg_tasks.clear()
 
-        await self._drain_all_pending_for_shutdown()
+        await self._flush_parked_frames("gap_fill_unavailable")
 
         ws = self._ws
         self._ws = None
@@ -1390,7 +1412,15 @@ class RealtimeClient:
                 state.gap_task.cancel()
         self._order_states.clear()
 
-    async def _drain_all_pending_for_shutdown(self) -> None:
+    async def _flush_parked_frames(self, reason: GapReason) -> None:
+        """Hand every parked frame to the handlers in seq order per
+        conversation, cancel the gap timers and clear the ordering state.
+
+        Used when frames must not be dropped: on :meth:`disconnect` (the
+        caller is leaving) and, under ``ack_on_receipt``, on every socket
+        close (the frames are already acked). No gap-fill: an in-flight
+        HTTP request would race the close.
+        """
         for conversation_id, state in list(self._order_states.items()):
             if state.gap_task is not None:
                 state.gap_task.cancel()
@@ -1421,7 +1451,7 @@ class RealtimeClient:
                         else 0
                     ),
                     recovered=False,
-                    reason="gap_fill_unavailable",
+                    reason=reason,
                 )
                 await _invoke(self._opts.on_sequence_gap, info)
         self._order_states.clear()
