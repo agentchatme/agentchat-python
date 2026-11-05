@@ -174,7 +174,7 @@ async def test_server_rejection_during_handshake_blocks(code: int, reason: str) 
         assert not rt.is_connected
         assert len(handed) == 1  # no fast reconnect
         assert [e["code"] for e in blocked] == [code]
-        assert blocked[0]["reason"] == (reason or "no reason given")
+        assert blocked[0]["reason"] == reason  # as the server sent it, "" included
         assert any("auth rejection" in str(e) for e in errors)
         # The slow retry is armed, 10-15 min out.
         assert len(sleeper.delays) == 1
@@ -342,13 +342,14 @@ async def test_sixty_one_failures_keep_reconnecting_at_the_cap_with_one_error_li
             await _until(lambda: attempts >= 75, timeout=5.0)
         assert rt.state == "backoff"
         assert rt._reconnect_task is not None and not rt._reconnect_task.done()
-        # Attempts 1..60 sit under the configured 30 s cap (+25 % jitter);
-        # from 61 on the cap is five minutes, never more, never a stop.
+        # Attempts 1..60 sit under the configured 30 s cap; from 61 on the
+        # cap is five minutes. Jitter only goes below a step, so both caps
+        # are true ceilings. Never a stop.
         early = sleeper.delays[:60]
         late = sleeper.delays[60:]
         assert late, "the client must still be scheduling attempts past 60"
-        assert all(d <= 30.0 * 1.25 for d in early)
-        assert all(300.0 * 0.75 <= d <= 300.0 * 1.25 for d in late)
+        assert all(d <= 30.0 for d in early)
+        assert all(300.0 * 0.75 <= d <= 300.0 for d in late)
         errors = [r for r in caplog.records if r.levelno == logging.ERROR]
         assert len(errors) == 1
         assert "still reconnecting after 60" in errors[0].getMessage()
@@ -461,14 +462,16 @@ async def test_inbound_frames_keep_the_liveness_watchdog_quiet(
 ) -> None:
     monkeypatch.setattr(_realtime, "_LIVENESS_PROBE_TIMEOUT_S", 0.02)
     sock = PingingWebSocket(pong=False)
-    rt, _handed = _client_with_sockets([sock], liveness_timeout_ms=50)
+    # A 200 ms window with a push every 20 ms: wide enough for Windows timer
+    # granularity (15.6 ms) to never let the window lapse between pushes.
+    rt, _handed = _client_with_sockets([sock], liveness_timeout_ms=200)
     rt.on("message.new", lambda m: None)
     try:
         await rt.connect()
         await _settle()
         await sock.push({"type": "hello.ok"})
-        for seq in range(1, 11):
-            await asyncio.sleep(0.015)
+        for seq in range(1, 16):
+            await asyncio.sleep(0.02)
             await sock.push(message_new("c", seq))
         assert sock.pings == 0  # never silent long enough to probe
         assert not sock.closed
@@ -684,6 +687,247 @@ async def test_disconnect_during_a_connected_session_releases_the_idle_watchdog(
     assert rt._liveness_task is not None and not rt._liveness_task.done()
     await rt.disconnect()
     assert other_tasks() - baseline == set()
+
+
+@pytest.mark.asyncio
+async def test_on_disconnect_names_the_client_as_initiator_for_disconnect() -> None:
+    sock = MockWebSocket()
+    rt, _handed = _client_with_sockets([sock])
+    closes: list[dict[str, Any]] = []
+    rt.on_disconnect(lambda info: closes.append(info))
+    await rt.connect()
+    await _settle()
+    await sock.push({"type": "hello.ok"})
+    await _settle()
+    await rt.disconnect()
+    assert sock.closed and sock.close_code == 1000 and sock.close_reason == "client disconnect"
+    assert closes == [
+        {"code": 1000, "reason": "client disconnect", "was_clean": True, "initiator": "client"}
+    ]
+
+
+# ─────────────── Review fixes: handlers that act during a close ───────────────
+
+
+@pytest.mark.asyncio
+async def test_connect_from_on_disconnect_reopens_with_reconnect_off() -> None:
+    """A caller running its own reconnects (reconnect=False) does it from
+    on_disconnect; the closed socket is gone by then, so connect() opens."""
+    first, second = MockWebSocket(), MockWebSocket()
+    rt, handed = _client_with_sockets([first, second], reconnect=False)
+    reopened = asyncio.Event()
+
+    async def reopen(_info: dict[str, Any]) -> None:
+        await rt.connect()
+        reopened.set()
+
+    rt.on_disconnect(reopen)
+    try:
+        await rt.connect()
+        await _settle()
+        await first.push({"type": "hello.ok"})
+        await _settle()
+        await first.close(code=1006, reason="blip")
+        await asyncio.wait_for(reopened.wait(), timeout=2.0)
+        await _settle()
+        assert handed == [first, second]
+        assert rt.state == "connecting"  # not parked in idle by the old close
+        assert rt._reconnect_task is None
+        await second.push({"type": "hello.ok"})
+        await _settle()
+        assert rt.state == "ready"
+    finally:
+        await rt.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_connect_from_on_disconnect_with_reconnect_on_arms_no_second_timer() -> None:
+    first, second = MockWebSocket(), MockWebSocket()
+    rt, handed = _client_with_sockets([first, second])
+    rt.on_disconnect(lambda _info: rt.connect())
+    try:
+        await rt.connect()
+        await _settle()
+        await first.push({"type": "hello.ok"})
+        await _settle()
+        await first.close(code=1006, reason="blip")
+        await asyncio.sleep(0.1)
+        assert handed == [first, second]
+        assert rt._reconnect_task is None
+        assert rt.state == "connecting"
+    finally:
+        await rt.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_disconnect_from_a_state_handler_on_backoff_arms_no_timer() -> None:
+    baseline = other_tasks()
+    sock = MockWebSocket()
+    rt, handed = _client_with_sockets([sock])
+    sleeper = ControlledSleep(hold=True)
+    rt._sleep = sleeper
+
+    async def stop_on_backoff(evt: dict[str, Any]) -> None:
+        if evt["state"] == "backoff":
+            await rt.disconnect()
+
+    rt.on("state", stop_on_backoff)
+    await rt.connect()
+    await _settle()
+    await sock.push({"type": "hello.ok"})
+    await _settle()
+    await sock.close(code=1006, reason="blip")
+    await asyncio.sleep(0.05)
+    assert rt.state == "stopped"
+    assert rt._reconnect_task is None
+    assert sleeper.delays == []
+    assert len(handed) == 1
+    assert other_tasks() - baseline == set()
+
+
+@pytest.mark.asyncio
+async def test_on_error_fires_once_per_blocked_run_while_blocked_fires_per_rejection() -> None:
+    socks = [MockWebSocket(), MockWebSocket(), MockWebSocket(), MockWebSocket()]
+    rt, handed = _client_with_sockets(socks)
+    sleeper = ControlledSleep(hold=True)
+    rt._sleep = sleeper
+    errors: list[BaseException] = []
+    blocked: list[dict[str, Any]] = []
+    rt.on_error(lambda e: errors.append(e))
+    rt.on("blocked", lambda evt: blocked.append(evt))
+    try:
+        await rt.connect()
+        for i in range(3):
+            await _until(lambda i=i: len(handed) >= i + 1)
+            await _settle()
+            await socks[i].close(code=1008, reason="Invalid token")
+            await _settle()
+            assert rt.state == "blocked"
+            sleeper.release()
+        await _until(lambda: len(handed) >= 4)
+        assert len(blocked) == 3
+        assert len([e for e in errors if "auth rejection" in str(e)]) == 1
+        # A hello.ok ends the run; the next rejection is a new run.
+        await socks[3].push({"type": "hello.ok"})
+        await _settle()
+        assert rt.state == "ready"
+        await socks[3].close(code=1008, reason="Invalid token")  # after hello.ok: eviction
+        await _settle()
+        assert rt.state == "backoff"
+    finally:
+        await rt.disconnect()
+
+
+@pytest.mark.parametrize("value", [0, -1])
+def test_non_positive_handshake_timeout_falls_back_to_the_default(value: int) -> None:
+    from agentchatme import RealtimeOptions
+
+    rt = RealtimeClient(api_key="k", handshake_timeout_ms=value)
+    assert rt._opts.handshake_timeout_ms == _realtime._DEFAULT_HANDSHAKE_TIMEOUT_MS
+    via_options = RealtimeClient(RealtimeOptions(api_key="k", handshake_timeout_ms=value))
+    assert via_options._opts.handshake_timeout_ms == _realtime._DEFAULT_HANDSHAKE_TIMEOUT_MS
+
+
+# ─────────────── Review fixes: a raising on_error never parks the client ───────────────
+
+
+def _raising(_err: BaseException) -> None:
+    raise RuntimeError("observer bug")
+
+
+@pytest.mark.asyncio
+async def test_raising_on_error_at_the_handshake_deadline_still_closes_and_reconnects() -> None:
+    first, second = MockWebSocket(), MockWebSocket()
+    rt, handed = _client_with_sockets([first, second], handshake_timeout_ms=20)
+    rt.on_error(_raising)
+    try:
+        await rt.connect()
+        await _until(lambda: len(handed) >= 2)
+        assert first.closed and first.close_reason == "client handshake timeout"
+    finally:
+        await rt.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_raising_on_error_at_the_liveness_deadline_still_closes_and_reconnects(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(_realtime, "_LIVENESS_PROBE_TIMEOUT_S", 0.02)
+    silent, next_sock = PingingWebSocket(pong=False), PingingWebSocket(pong=True)
+    rt, handed = _client_with_sockets([silent, next_sock], liveness_timeout_ms=20)
+    rt.on_error(_raising)
+    try:
+        await rt.connect()
+        await _settle()
+        await silent.push({"type": "hello.ok"})
+        await _until(lambda: len(handed) >= 2)
+        assert silent.closed and silent.close_reason == "client liveness timeout"
+    finally:
+        await rt.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_raising_on_error_through_the_long_outage_notice_keeps_reconnecting(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    attempts = 0
+
+    async def failing_connect(_url: str, **_kw: Any) -> MockWebSocket:
+        nonlocal attempts
+        attempts += 1
+        raise OSError("refused")
+
+    rt = RealtimeClient(
+        api_key="k", reconnect=True, reconnect_interval_ms=1, max_reconnect_interval_ms=2,
+        websocket_connect=failing_connect,
+    )
+    rt._sleep = ControlledSleep()
+    rt.on_error(_raising)
+    try:
+        with caplog.at_level(logging.ERROR, logger="agentchat.realtime"):
+            with pytest.raises(AgentChatConnectionError):
+                await rt.connect()
+            await _until(lambda: attempts >= 65, timeout=5.0)
+        assert rt.state == "backoff"
+        assert sum("still reconnecting after 60" in r.getMessage() for r in caplog.records) == 1
+    finally:
+        await rt.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_raising_on_error_when_entering_blocked_still_arms_the_slow_retry() -> None:
+    sock = MockWebSocket()
+    rt, _handed = _client_with_sockets([sock])
+    sleeper = ControlledSleep(hold=True)
+    rt._sleep = sleeper
+    rt.on_error(_raising)
+    try:
+        await rt.connect()
+        await _settle()
+        await sock.close(code=1008, reason="Invalid token")
+        await _settle()
+        assert rt.state == "blocked"
+        assert rt._reconnect_task is not None and not rt._reconnect_task.done()
+        assert len(sleeper.delays) == 1 and 600.0 <= sleeper.delays[0] <= 900.0
+    finally:
+        await rt.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_raising_on_error_at_hello_send_failure_still_closes_and_reconnects() -> None:
+    class _DeafSocket(MockWebSocket):
+        async def send(self, data: str) -> None:
+            raise OSError("broken pipe")
+
+    deaf, good = _DeafSocket(), MockWebSocket()
+    rt, handed = _client_with_sockets([deaf, good])
+    rt.on_error(_raising)
+    try:
+        await rt.connect()
+        await _until(lambda: len(handed) >= 2)
+        assert deaf.closed and deaf.close_reason == "client HELLO send failed"
+    finally:
+        await rt.disconnect()
 
 
 @pytest.mark.asyncio

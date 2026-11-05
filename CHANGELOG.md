@@ -37,17 +37,26 @@ slowly. No wire change; no version bump here.
 
 ### Changed
 
-- **No reconnect cap.** Backoff is jittered exponential up to
+- **No reconnect cap.** Backoff is exponential, each step jittered up to
+  25 % below it (previously ±25 %, which let delays exceed the cap), up to
   `max_reconnect_interval_ms` for the first 60 consecutive failures, then
   capped at no less than five minutes, forever; the 61st failure logs one
   line at `ERROR` on `agentchat.realtime` and retrying continues.
 - **An auth rejection blocks instead of ending the client.** The client
-  enters `state == "blocked"` with `blocked_reason` set, fires `on_error`
-  and `on("blocked")`, and retries a fresh HELLO every 10–15 minutes
-  (jittered) until a `hello.ok` clears it. The first rejection in a run
-  logs at `ERROR`, later ones at `DEBUG`. A transport failure during the
-  slow retry takes the normal backoff and keeps `blocked_reason` until a
-  `hello.ok`. An explicit `connect()` while blocked retries at once.
+  enters `state == "blocked"` with `blocked_reason` set and retries a fresh
+  HELLO every 10–15 minutes (12.5 min ± 20 %) until a `hello.ok` clears
+  it. `on("blocked")` fires for every rejection; `on_error` and the `ERROR`
+  log line fire once per blocked run, later rejections of the same run log
+  at `DEBUG`. A transport failure during the slow retry takes the normal
+  backoff and keeps `blocked_reason` until a `hello.ok`. An explicit
+  `connect()` while blocked retries at once.
+- `connect()` may be called from inside `on_disconnect`, `on_error` or
+  `on("state")` (the closed socket is already gone by then); with
+  `reconnect=False` that is how a caller runs its own reconnects. A
+  handler that reconnects or stops the client during a close is honoured:
+  no second socket, no timer left behind.
+- A non-positive `handshake_timeout_ms` means the default (as in the
+  TypeScript SDK) instead of an open/close loop.
 - **Liveness watchdogs.** The handshake deadline (socket open → `hello.ok`)
   is `handshake_timeout_ms`, default 15 s (was 4 s; the server's own 5 s
   `1008` is transient now). A ready socket that shows no inbound frame for
@@ -57,7 +66,9 @@ slowly. No wire change; no version bump here.
   (the `websockets` connection) and no watchdog otherwise; `0` disables it.
 - `connect()` is a no-op while an attempt is in flight or a socket is live,
   and cancels a pending backoff or blocked-retry timer to try now.
-- `on_disconnect` info carries `initiator: "client" | "server"`.
+- `on_disconnect` info carries `initiator: "client" | "server"`;
+  `disconnect()` closes with `1000 'client disconnect'` and reports
+  `"client"` like the watchdogs do.
 
 ### Added
 
@@ -69,7 +80,8 @@ slowly. No wire change; no version bump here.
 - Client-raised events through `on()`: `on("state", handler)` —
   `{"type": "state", "state", "previous"}` on every transition;
   `on("blocked", handler)` — `{"type": "blocked", "code", "reason", "retry_in_ms"}`
-  once per rejection; `on("stopped", handler)` — `{"type": "stopped"}` when
+  once per rejection, `reason` being the server's close reason as sent
+  (`""` when none); `on("stopped", handler)` — `{"type": "stopped"}` when
   `disconnect()` ran, the last event an instance raises. A server frame
   typed like one of these is dropped, never dispatched.
 

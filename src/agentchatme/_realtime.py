@@ -2,7 +2,7 @@
 
 Mirrors the TypeScript ``RealtimeClient`` behavior:
 
-- HELLO handshake with 4 s ack timeout (authenticates over wire, never URL)
+- HELLO handshake with a 15 s deadline (authenticates over wire, never URL)
 - Capability-negotiated delivery acks (``ack``): at-least-once delivery
   with per-message confirmation after handler dispatch, or on receipt
   with ``ack_on_receipt=True`` (delivered = this machine received it)
@@ -160,7 +160,13 @@ _DEFAULT_HANDSHAKE_TIMEOUT_MS = 15_000
 # close → normal backoff). The ``websockets`` library answers the server's
 # pings and runs its own keepalive (every 20 s, see _keepalive_kwargs)
 # without exposing either, so inbound frames plus an explicit probe are what
-# we can count. 100 s is more than two server heartbeat cycles (45 s).
+# we can count. 100 s is more than two server heartbeat cycles (the server
+# pings every 45 s with a 30 s pong deadline, starting after hello.ok). With
+# the real ``websockets`` connection its keepalive trips first on a dead
+# path (20 s + 20 s) and surfaces as a close code 1011/1006 that takes the
+# ordinary backoff; this watchdog is the backstop for a socket that keeps
+# answering pings at the transport yet delivers nothing, and for injected
+# transports without a keepalive.
 _DEFAULT_LIVENESS_TIMEOUT_MS = 100_000
 
 
@@ -282,9 +288,10 @@ _LOCAL_EVENTS = frozenset({"state", "blocked", "stopped"})
 # one agent, delivering zero messages, while six sibling agents on the same
 # host held single connections the whole time.
 #
-# 30s is comfortably longer than any handshake-adjacent failure (HELLO ack
-# is 4s, the server's own heartbeat cycle is 45s) and short enough that a
-# genuinely healthy client clears its counter well before a second blip.
+# 30s is comfortably longer than any handshake-adjacent failure (the
+# handshake deadline is 15s, the server's own heartbeat cycle is 45s) and
+# short enough that a genuinely healthy client clears its counter well
+# before a second blip.
 _STABLE_CONNECTION_S = 30.0
 
 # Reconnects within this window are "rapid" for the purposes of the
@@ -328,8 +335,9 @@ _CLIENT_CAPABILITIES = ("ack",)
 _LONG_OUTAGE_AFTER_ATTEMPTS = 60
 _LONG_OUTAGE_MAX_INTERVAL_MS = 5 * 60_000
 
-# Backoff jitter: symmetric ±25 %, so a fleet that drops at the same instant
-# re-enters the connect queue spread across ms * [0.75, 1.25].
+# Backoff jitter: up to 25 % BELOW each step, so a fleet that drops at the
+# same instant re-enters the connect queue spread across ms * [0.75, 1.0]
+# and the caps (30 s, then 5 min) are true ceilings.
 _BACKOFF_JITTER = 0.25
 
 # After the server rejects the key, retry a fresh HELLO at this cadence
@@ -340,7 +348,9 @@ _AUTH_RETRY_INTERVAL_MS = 750_000
 _AUTH_RETRY_JITTER = 0.2
 
 # Close codes that mean "the server rejected this session" when the SERVER
-# sends them during the handshake. 4401/4403 are unambiguous. 1008 (policy
+# sends them during the handshake. 4401/4403 are unambiguous (the server
+# today sends only 1008; the application codes are honoured if they ever
+# appear). 1008 (policy
 # violation) is not: the AgentChat server closes a rejected HELLO with
 # 1008 'Invalid token', but also uses 1008 for a handshake that was merely
 # too slow ('HELLO frame required', from its own 5 s timer) — which a slow
@@ -368,8 +378,16 @@ def _is_auth_rejection_close(code: int, reason: str) -> bool:
 
 
 def _jittered_ms(ms: int, ratio: float) -> int:
-    """``ms`` scaled by a uniform factor in ``[1 - ratio, 1 + ratio]``."""
+    """``ms`` scaled by a uniform factor in ``[1 - ratio, 1 + ratio]``: a
+    range around ``ms`` (the blocked retry's 10-15 min), not a cap."""
     factor = 1.0 - ratio + random.random() * 2.0 * ratio
+    return max(0, int(ms * factor))
+
+
+def _jittered_below_ms(ms: int, ratio: float) -> int:
+    """``ms`` scaled by a uniform factor in ``[1 - ratio, 1]``: ``ms`` stays
+    a true ceiling (the reconnect backoff and its caps)."""
+    factor = 1.0 - random.random() * ratio
     return max(0, int(ms * factor))
 
 
@@ -526,6 +544,10 @@ class RealtimeClient:
         options = replace(options)
         if options.auto_drain_on_connect is None:
             options.auto_drain_on_connect = options.client is not None
+        if options.handshake_timeout_ms <= 0:
+            # A zero deadline would open and close sockets in a loop; a
+            # non-positive value means the default, as in the TypeScript SDK.
+            options.handshake_timeout_ms = _DEFAULT_HANDSHAKE_TIMEOUT_MS
         if options.max_reconnect_attempts is not None:
             warnings.warn(
                 "RealtimeClient ignores max_reconnect_attempts: the client never"
@@ -618,15 +640,24 @@ class RealtimeClient:
         A no-op while an attempt is in flight or a socket is live. A pending
         backoff or blocked-retry timer is cancelled and the attempt made now,
         so a caller that has just rotated its key does not wait out the slow
-        retry.
+        retry. Callable from inside ``on_disconnect``, ``on_error`` and
+        ``on("state")``: the closed socket is already gone by then, so a
+        caller running its own reconnects (``reconnect=False``) may reopen
+        from there.
         """
         if self._disposed:
             raise _RealtimeConnectionError(
                 "RealtimeClient has been disposed; create a new instance to reconnect."
             )
-        if self._connecting or (
-            self._recv_task is not None and not self._recv_task.done()
-        ):
+        recv_task = self._recv_task
+        recv_alive = (
+            recv_task is not None
+            and not recv_task.done()
+            # The recv loop's own close handling (handlers run inside its
+            # ``finally``) is not a live socket.
+            and recv_task is not asyncio.current_task()
+        )
+        if self._connecting or self._ws is not None or recv_alive:
             _log.debug("connect() ignored: an attempt or a live socket exists")
             return
         pending = self._reconnect_task
@@ -1226,6 +1257,10 @@ class RealtimeClient:
         on its own (rule 1)."""
         if self._disposed:
             return
+        if self._connecting or self._ws is not None:
+            # A handler (on_disconnect, on_error) already called connect()
+            # for this close; the new attempt owns what happens next.
+            return
         if not self._opts.reconnect:
             # The caller runs reconnects itself; a blocked verdict stays
             # visible so its logic can see it.
@@ -1252,13 +1287,17 @@ class RealtimeClient:
         delay_s = self._compute_reconnect_delay_ms(attempt) / 1000.0
         _log.debug("realtime reconnect %d scheduled in %.1fs", attempt, delay_s)
         await self._set_state("backoff")
+        if self._disposed or self._connecting or self._ws is not None:
+            # A state handler stopped the client, or reconnected it itself.
+            return
         self._reconnect_task = asyncio.create_task(self._reconnect_after(delay_s))
 
     async def _enter_blocked(self, code: int, reason: str) -> None:
         """The server rejected the key during the handshake.
 
-        Records the verdict, tells the operator once (then debug), fires
-        ``on_error`` and ``on("blocked")``, and arms the slow retry. A
+        Records the verdict, tells the operator and ``on_error`` once per
+        blocked run (later rejections of the same run log at debug), fires
+        ``on("blocked")`` for every rejection, and arms the slow retry. A
         ``hello.ok`` clears it; :meth:`disconnect` ends it.
         """
         detail = reason or "no reason given"
@@ -1266,7 +1305,9 @@ class RealtimeClient:
         retry_ms: int | None = None
         if self._opts.reconnect:
             retry_ms = self._compute_auth_retry_delay_ms()
-        log = _log.debug if self._blocked_announced else _log.error
+        first_of_run = not self._blocked_announced
+        self._blocked_announced = True
+        log = _log.error if first_of_run else _log.debug
         log(
             "AgentChat realtime: the server rejected this API key (close %d %s);"
             " blocked, retrying a fresh HELLO %s until it is accepted again."
@@ -1275,23 +1316,24 @@ class RealtimeClient:
             detail,
             f"in ~{retry_ms // 60_000} min" if retry_ms is not None else "when connect() is called",
         )
-        self._blocked_announced = True
         await self._set_state("blocked")
-        await self._emit_error(
-            _RealtimeConnectionError(
-                f"WebSocket closed with auth rejection {code} ({detail}); blocked —"
-                + (
-                    f" retrying a fresh HELLO in ~{retry_ms // 60_000} min"
-                    if retry_ms is not None
-                    else " reconnect is off, call connect() to retry"
+        if first_of_run:
+            await self._emit_error(
+                _RealtimeConnectionError(
+                    f"WebSocket closed with auth rejection {code} ({detail}); blocked —"
+                    + (
+                        f" retrying a fresh HELLO in ~{retry_ms // 60_000} min"
+                        if retry_ms is not None
+                        else " reconnect is off, call connect() to retry"
+                    )
+                    + " until the key is accepted again; disconnect() stops it."
                 )
-                + " until the key is accepted again; disconnect() stops it."
             )
-        )
+        # The server's reason as sent (empty when it sent none).
         await self._dispatch(
-            {"type": "blocked", "code": code, "reason": detail, "retry_in_ms": retry_ms}
+            {"type": "blocked", "code": code, "reason": reason, "retry_in_ms": retry_ms}
         )
-        if self._disposed or retry_ms is None:
+        if self._disposed or retry_ms is None or self._connecting or self._ws is not None:
             return
         pending = self._reconnect_task
         if pending is not None and pending is not asyncio.current_task() and not pending.done():
@@ -1316,12 +1358,12 @@ class RealtimeClient:
     def _compute_reconnect_delay_ms(self, attempt: int) -> int:
         """Exponential from ``reconnect_interval_ms``, capped at
         ``max_reconnect_interval_ms`` — or at least five minutes once the
-        outage is long — then jittered ±25 %."""
+        outage is long — then jittered up to 25 % below, so the cap holds."""
         exp = self._opts.reconnect_interval_ms * (2 ** min(attempt - 1, 20))
         cap = self._opts.max_reconnect_interval_ms
         if attempt > _LONG_OUTAGE_AFTER_ATTEMPTS:
             cap = max(cap, _LONG_OUTAGE_MAX_INTERVAL_MS)
-        return _jittered_ms(min(exp, cap), _BACKOFF_JITTER)
+        return _jittered_below_ms(min(exp, cap), _BACKOFF_JITTER)
 
     def _compute_auth_retry_delay_ms(self) -> int:
         """The blocked cadence: 12.5 min ±20 % → 10-15 min."""
@@ -1456,8 +1498,8 @@ class RealtimeClient:
         ws = self._ws
         self._ws = None
         if ws is not None:
-            with contextlib.suppress(Exception):
-                await ws.close()
+            # Ours: on_disconnect reports initiator "client".
+            await self._close_socket(ws, 1000, "client disconnect")
 
         recv_task = self._recv_task
         self._recv_task = None
@@ -1478,6 +1520,10 @@ class RealtimeClient:
     # ─── Dispatch ────────────────────────────────────────────────────
 
     async def _emit_error(self, error: BaseException) -> None:
+        # ``_invoke`` isolates each handler: a raising ``on_error`` must never
+        # break the step that follows a notice (arming a watchdog close, the
+        # backoff, the blocked retry) — that would be the one way into a
+        # parked client.
         for h in list(self._error_handlers):
             await _invoke(h, error)
 
