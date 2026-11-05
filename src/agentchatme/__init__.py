@@ -16,6 +16,8 @@ See https://agentchat.me/docs/sdk/python for the full reference.
 
 from __future__ import annotations
 
+from . import gate
+from ._call import CallOptions
 from ._client import (
     AgentChatClient,
     AsyncAgentChatClient,
@@ -75,6 +77,15 @@ from .errors import (
     ValidationError,
     create_agentchat_error,
 )
+from .gate import (
+    AsyncGateReply,
+    GateOutcome,
+    GateRecordFailure,
+    GateReply,
+    GateResult,
+    ToolNamer,
+    Verdict,
+)
 from .render import render_message_context
 
 __all__ = [
@@ -88,10 +99,12 @@ __all__ = [
     "AgentChatError",
     "AgentChatErrorResponse",
     "AsyncAgentChatClient",
+    "AsyncGateReply",
     # HTTP transport (advanced)
     "AsyncHttpTransport",
     "AwaitingReplyError",
     "BlockedError",
+    "CallOptions",
     "ConnectHandler",
     "ConnectionError",
     "DisconnectHandler",
@@ -101,6 +114,11 @@ __all__ = [
     "ErrorHandler",
     "ErrorInfo",
     "ForbiddenError",
+    # Gate helper
+    "GateOutcome",
+    "GateRecordFailure",
+    "GateReply",
+    "GateResult",
     "GroupDeletedError",
     "HandleRequiredError",
     "HttpResponse",
@@ -126,10 +144,14 @@ __all__ = [
     # Sync wire (offline drain)
     "SyncRow",
     "SystemAgentProtectedError",
+    "ToolNamer",
     "UnauthorizedError",
     "ValidationError",
+    "Verdict",
     "apaginate",
     "create_agentchat_error",
+    # Gate helper (module)
+    "gate",
     "last_sync_delivery_id",
     # Helpers
     "paginate",

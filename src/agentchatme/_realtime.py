@@ -4,16 +4,23 @@ Mirrors the TypeScript ``RealtimeClient`` behavior:
 
 - HELLO handshake with 4 s ack timeout (authenticates over wire, never URL)
 - Capability-negotiated delivery acks (``ack``): at-least-once delivery
-  with per-message confirmation after handler dispatch
+  with per-message confirmation after handler dispatch, or on receipt
+  with ``ack_on_receipt=True`` (delivered = this machine received it)
 - Bounded message-id dedup across the live and offline-drain paths
 - Per-conversation seq ordering with out-of-order buffering
 - Gap detection with optional ``AsyncAgentChatClient``-backed recovery
+- ``wake`` frames (a signal with no message text: read the tray)
 - Jittered exponential reconnect (halting on auth-terminal close codes),
   disposed flag, offline ``/sync`` drain speaking the bare-array wire
 
 The client is async-only because Python's WebSocket story is asyncio-native.
 Pair it with an :class:`~agentchat.AsyncAgentChatClient` for gap recovery and
 auto-drain on reconnect.
+
+Guest mode: the client keeps no process-wide state. Several instances run
+side by side in one loop, and :meth:`RealtimeClient.disconnect` releases
+every task, timer and socket the instance owns, so a host process (an agent
+runtime embedding the SDK) can start and stop it cleanly.
 """
 
 from __future__ import annotations
@@ -27,7 +34,7 @@ import random
 import time
 from collections import OrderedDict
 from collections.abc import Awaitable, Coroutine
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -36,9 +43,12 @@ from typing import (
     Union,
 )
 
+from pydantic import ValidationError
+
 from ._client import last_sync_delivery_id
 from ._client_identity import DEFAULT_CLIENT_IDENTITY, AgentChatClientIdentity
 from .errors import ConnectionError as _RealtimeConnectionError
+from .types.ws import WakePayload
 
 if TYPE_CHECKING:
     from ._client import AsyncAgentChatClient, SyncRow
@@ -48,6 +58,7 @@ if TYPE_CHECKING:
 
 MessageHandler = Callable[[dict[str, Any]], Union[Awaitable[None], None]]
 """Handler signature for WS frames. Receives the decoded JSON dict."""
+
 
 ErrorHandler = Callable[[BaseException], Union[Awaitable[None], None]]
 """Handler fired on every socket-level or protocol error."""
@@ -63,6 +74,10 @@ GapReason = Literal[
     "gap_fill_failed",
     "gap_fill_unavailable",
     "buffer_overflow",
+    # ack_on_receipt only: the socket closed while frames sat in the gap
+    # buffer. They were already acknowledged, so they were handed to the
+    # handlers in seq order instead of being dropped (see the option).
+    "connection_closed",
 ]
 
 
@@ -138,6 +153,26 @@ class RealtimeOptions:
     dedup_cache_size: int = _DEFAULT_DEDUP_CACHE_SIZE
     """Bound on the message-id dedup LRU (live + drain). ``0`` disables dedup."""
     client_identity: AgentChatClientIdentity = DEFAULT_CLIENT_IDENTITY
+    ack_on_receipt: bool = False
+    """Acknowledge each ``message.new`` the moment its frame is parsed,
+    before any handler runs. This is the integration setting: "delivered"
+    then means the agent's machine received the message, and whether the
+    agent has looked is tracked separately as read state (a verdict or
+    ``client.conversations.mark_read``), so an early ack never empties the
+    tray. Covers live frames, the server's reconnect backlog and gap-fill
+    rows; the REST offline drain keeps its settle-then-ack cursor. Default
+    ``False``: ack after every handler settled, for app clients whose
+    handler IS the processing. Only applies when the server negotiated
+    ack-mode.
+
+    Trade-off: an acked frame is never re-offered by the server, so a frame
+    that is parked on a seq gap when the socket drops is handed to the
+    handlers at close time, in seq order but possibly ahead of the seqs it
+    was waiting for (which arrive after the reconnect). Ack-on-receipt
+    trades strict ordering across a connection drop for no loss; the
+    default mode keeps ordering because unacked frames come back in order
+    on the next drain. Such a flush fires ``on_sequence_gap`` with
+    ``reason="connection_closed"``."""
 
 
 # ───────────────────────── Internal constants ─────────────────────────
@@ -202,6 +237,10 @@ _CLIENT_CAPABILITIES = ("ack",)
 # policy-violation code used for auth rejects; 4401/4403 are the
 # application-level unauthorized/forbidden codes.
 _AUTH_TERMINAL_CLOSE_CODES = frozenset({1008, 4401, 4403})
+
+
+_Routed = Literal["delivered", "duplicate", "buffered"]
+"""Where :meth:`RealtimeClient._process_ordered_message` sent an envelope."""
 
 
 @dataclass
@@ -298,6 +337,7 @@ class RealtimeClient:
         auto_drain_on_connect: bool | None = None,
         dedup_cache_size: int | None = None,
         client_identity: AgentChatClientIdentity | None = None,
+        ack_on_receipt: bool | None = None,
         websocket_connect: Callable[..., Awaitable[Any]] | None = None,
     ) -> None:
         if options is None:
@@ -325,8 +365,13 @@ class RealtimeClient:
                     else _DEFAULT_DEDUP_CACHE_SIZE
                 ),
                 client_identity=client_identity or DEFAULT_CLIENT_IDENTITY,
+                ack_on_receipt=bool(ack_on_receipt),
             )
 
+        # A private copy: the client writes to its options (the auto-drain
+        # default here, `reconnect=False` on disconnect) and must never write
+        # to the caller's object — several instances may be built from one.
+        options = replace(options)
         if options.auto_drain_on_connect is None:
             options.auto_drain_on_connect = options.client is not None
 
@@ -359,6 +404,15 @@ class RealtimeClient:
         # reconnects deliberately: redelivery across connections is exactly
         # the duplicate source it exists to absorb.
         self._dedup = _BoundedLruSet(options.dedup_cache_size)
+        # One REST drain at a time: the server-side ack pointer only moves
+        # forward, so a second concurrent drain adds nothing but races.
+        self._drain_in_flight = False
+        # Per-row dispatch settlement for the page the drain is working on,
+        # keyed by the envelope's identity: ``None`` until the envelope is
+        # handed to handlers, then ``True`` (every handler settled cleanly,
+        # or a dedup hit) or ``False`` (a handler raised). The drain reads it
+        # before moving the ack cursor — see :meth:`drain_offline_envelopes`.
+        self._drain_settlements: dict[int, bool | None] = {}
 
         self._handlers: dict[str, set[MessageHandler]] = {}
         self._error_handlers: set[ErrorHandler] = set()
@@ -570,10 +624,29 @@ class RealtimeClient:
                             self._spawn(self.drain_offline_envelopes())
                     continue
 
-                if message.get("type") == "message.new":
-                    # Live socket frames are ack-eligible; drain/gap-fill
-                    # injections are not (they commit via the REST cursor).
-                    await self._process_ordered_message(message, ws_ack=True)
+                frame_type = message.get("type")
+                if frame_type == "message.new":
+                    if self._opts.ack_on_receipt:
+                        # Delivered = this machine received it. Ack now, then
+                        # route through ordering/dedup with the ack already
+                        # spent so dispatch never acks a second time.
+                        message_id = _extract_message_id(message)
+                        if message_id is not None:
+                            await self._send_delivery_ack(message_id)
+                        await self._process_ordered_message(
+                            message, ws_ack=False, ack_spent=True
+                        )
+                    else:
+                        # Live socket frames are ack-eligible after dispatch;
+                        # drain/gap-fill injections are not (they commit via
+                        # the REST cursor).
+                        await self._process_ordered_message(message, ws_ack=True)
+                    continue
+
+                if frame_type == "wake":
+                    # A signal with no message text: read the tray. Nothing
+                    # to ack — no message travelled.
+                    await self._dispatch_wake(message)
                     continue
 
                 await self._dispatch(message)
@@ -613,6 +686,15 @@ class RealtimeClient:
                 }
             )
 
+            # Ack-on-receipt: every frame parked on a seq gap was acknowledged
+            # at parse, so the server has it `delivered` and will never
+            # re-offer it. Dropping the buffer here would lose it for good —
+            # the exact loss the ack protocol exists to prevent. Hand the
+            # parked frames to the handlers now, in seq order, before the
+            # state goes. Default mode skips this: its parked frames are
+            # unacked and come back in order on the next drain.
+            if self._opts.ack_on_receipt:
+                await self._flush_parked_frames("connection_closed")
             self._reset_order_states()
             if not self._disposed:
                 if (
@@ -648,26 +730,46 @@ class RealtimeClient:
 
         Per page: rows are routed through the same ``message.new``
         ordering pipeline as live frames, **then** the batch is committed
-        via ``POST /v1/messages/sync/ack`` with the positional cursor —
-        the last non-empty ``delivery_id`` of the processed prefix.
-        Dispatch-first/ack-second means a crash mid-page re-delivers
-        instead of losing rows (the message-id dedup cache absorbs the
-        replays).
+        via ``POST /v1/messages/sync/ack`` with a positional cursor — the
+        last non-empty ``delivery_id`` of the rows that were actually handed
+        to the application. The cursor commits everything at-or-before it,
+        so it may only cover rows whose fate is known, in page order:
 
-        Rows are validated minimally before dispatch. On the first invalid
-        row only the clean prefix before it is processed and acked; the
-        drain never acks or pages past a row it could not parse — that
-        would mark a message delivered that was never surfaced.
+        - A row every handler settled cleanly (or a dedup hit: the earlier
+          dispatch is the proof) is covered.
+        - A row whose handler raised is not, nor is anything after it: the
+          server re-offers them; the dedup cache absorbs the replays of its
+          acked predecessors.
+        - A row parked in the out-of-order buffer (waiting on a seq gap) is
+          not covered until it is dispatched: the cursor **freezes** at the
+          last settled row for the rest of the drain. Without this, a
+          disconnect that clears the ordering buffers would drop an
+          already-acked message, and an acked message is never re-offered.
+          Reading continues so the in-session gap-fill still resolves; the
+          frozen tail comes back on the next drain and dedups.
+        - A row the ordering layer dropped as a below-anchor duplicate is
+          covered only when this session dispatched it (dedup cache hit);
+          otherwise nothing ever showed it to the application.
+        - A row that fails minimal validation stops the drain: the clean
+          prefix before it is processed; the cursor never crosses it.
 
-        Safe to call multiple times within a connection cycle — the
-        server's ack pointer only advances.
+        Concurrent calls are coalesced. Safe to call again at any time —
+        the server's ack pointer only advances.
         """
         client = self._opts.client
-        if client is None:
+        if client is None or self._drain_in_flight:
             return
+        self._drain_in_flight = True
+        try:
+            await self._run_drain(client)
+        finally:
+            self._drain_in_flight = False
+            self._drain_settlements = {}
 
+    async def _run_drain(self, client: AsyncAgentChatClient) -> None:
         after: str | None = None
-        while True:
+        acks_frozen = False
+        while not self._disposed:
             try:
                 rows = await client.sync(limit=_SYNC_PAGE_SIZE, after=after)
             except Exception as err:
@@ -676,6 +778,11 @@ class RealtimeClient:
                 )
                 return
 
+            # disconnect() may have run during the request: the handler map
+            # is cleared, so dispatching (and then acking) would mark
+            # messages delivered that no handler ever saw.
+            if self._disposed:
+                return
             if not isinstance(rows, list) or not rows:
                 return
 
@@ -690,23 +797,42 @@ class RealtimeClient:
                     break
                 prefix.append(row)
 
-            for row in prefix:
-                await self._process_ordered_message(
-                    {"type": "message.new", "payload": row}, ws_ack=False
-                )
+            envelopes: list[dict[str, Any]] = [
+                {"type": "message.new", "payload": row} for row in prefix
+            ]
+            self._drain_settlements = {id(envelope): None for envelope in envelopes}
+            routed: list[_Routed] = []
+            for envelope in envelopes:
+                if self._disposed:
+                    break
+                routed.append(await self._process_ordered_message(envelope, ws_ack=False))
 
-            # Positional cursor: batch order is authoritative; ids are
-            # opaque. Rows with a null delivery_id are covered by the next
-            # non-null cursor at-or-after them in a later page.
-            cursor = last_sync_delivery_id(prefix)
-            if cursor is not None:
-                try:
-                    await client.sync_ack(cursor)
-                except Exception as err:
-                    await self._emit_error(
-                        _RealtimeConnectionError(f"sync ack failed: {err}")
-                    )
-                    return
+            if not acks_frozen and not self._disposed:
+                cursor: str | None = None
+                for row, envelope, outcome in zip(prefix, envelopes, routed):
+                    if not self._drain_row_ackable(envelope, outcome):
+                        acks_frozen = True
+                        _log.debug(
+                            "sync drain: ack cursor frozen before %s (%s, not handed to the app yet)",
+                            row.get("id"),
+                            outcome,
+                        )
+                        break
+                    # Positional cursor: batch order is authoritative; ids
+                    # are opaque. A null delivery_id is covered by the next
+                    # non-null one at-or-after it.
+                    delivery_id = row.get("delivery_id")
+                    if isinstance(delivery_id, str) and delivery_id:
+                        cursor = delivery_id
+                if cursor is not None:
+                    try:
+                        await client.sync_ack(cursor)
+                    except Exception as err:
+                        await self._emit_error(
+                            _RealtimeConnectionError(f"sync ack failed: {err}")
+                        )
+                        return
+            self._drain_settlements = {}
 
             if invalid_index is not None:
                 await self._emit_error(
@@ -718,14 +844,15 @@ class RealtimeClient:
                 )
                 return
 
-            if len(rows) < _SYNC_PAGE_SIZE:
+            if self._disposed or len(rows) < _SYNC_PAGE_SIZE:
                 return
 
-            if cursor is None or cursor == after:
-                # A full page that cannot advance the cursor (e.g. every
-                # delivery_id was null) would re-read the same rows
-                # forever. Stop and surface it; the next drain retries
-                # from the server's committed pointer.
+            # Page forward with the read cursor (non-committing). A full
+            # page that cannot advance it (e.g. every delivery_id was null)
+            # would re-read the same rows forever: stop and surface it; the
+            # next drain retries from the server's committed pointer.
+            next_after = last_sync_delivery_id(prefix)
+            if next_after is None or next_after == after:
                 await self._emit_error(
                     _RealtimeConnectionError(
                         "sync drain: full page without an advancing"
@@ -733,8 +860,23 @@ class RealtimeClient:
                     )
                 )
                 return
+            after = next_after
 
-            after = cursor
+    def _drain_row_ackable(self, envelope: dict[str, Any], outcome: _Routed) -> bool:
+        """May the sync/ack cursor cover this drain row? See :meth:`drain_offline_envelopes`."""
+        settled = self._drain_settlements.get(id(envelope))
+        if settled is not None:
+            # Handed to handlers during this page (possibly after a stint in
+            # the buffer): covered iff every handler settled cleanly.
+            return settled
+        if outcome == "duplicate":
+            # Below this connection's seq anchor, so the ordering layer
+            # dropped it. Covered only if this session dispatched it.
+            message_id = _extract_message_id(envelope)
+            return message_id is not None and self._dedup.hit(message_id)
+        # Still parked on a seq gap, or cleared from the buffer by a reset
+        # without dispatch. No handler saw it: the cursor stops here.
+        return False
 
     # ─── Reconnect ───────────────────────────────────────────────────
 
@@ -778,7 +920,12 @@ class RealtimeClient:
     # ─── Handler registration ────────────────────────────────────────
 
     def on(self, event: str, handler: MessageHandler) -> Callable[[], None]:
-        """Register a handler for a server event. Returns an unsubscribe fn."""
+        """Register a handler for a server event. Returns an unsubscribe fn.
+
+        ``on("wake", handler)`` receives a validated ``wake`` frame
+        (``payload`` parses as :class:`~agentchatme.types.WakePayload`):
+        a content-free "check AgentChat" signal that is never acknowledged.
+        """
         handlers = self._handlers.setdefault(event, set())
         handlers.add(handler)
 
@@ -806,6 +953,7 @@ class RealtimeClient:
         self._disconnect_handlers.add(handler)
         return lambda: self._disconnect_handlers.discard(handler)
 
+
     async def send(self, message: dict[str, Any]) -> None:
         """Send a client-initiated frame (e.g. ``typing.start``)."""
         if self._ws is None or not self._authenticated:
@@ -820,23 +968,35 @@ class RealtimeClient:
         return bool(self._authenticated and self._ws is not None)
 
     async def disconnect(self) -> None:
-        """Close the socket, disable reconnect, and release all handlers.
+        """Close the socket, disable reconnect, and release every task,
+        timer and handler this instance owns.
 
-        After this, :meth:`connect` raises — create a fresh
-        :class:`RealtimeClient` if you need to reopen.
+        Buffered out-of-order envelopes are flushed to handlers first (see
+        :meth:`_flush_parked_frames`), then the socket closes,
+        then every background task (reconnect, HELLO watchdog, stability
+        timer, gap timers, drain) is cancelled **and awaited**, so nothing
+        of this instance survives in the loop. After this, :meth:`connect`
+        raises — create a fresh :class:`RealtimeClient` to reopen.
         """
         self._disposed = True
         self._opts.reconnect = False
 
-        if self._reconnect_task is not None:
-            self._reconnect_task.cancel()
-            self._reconnect_task = None
-        if self._hello_ack_task is not None:
-            self._hello_ack_task.cancel()
-            self._hello_ack_task = None
-        self._cancel_stability_timer()
+        current = asyncio.current_task()
+        owned: list[asyncio.Task[Any]] = []
+        for task in (self._reconnect_task, self._hello_ack_task, self._stability_task):
+            if task is not None:
+                owned.append(task)
+        self._reconnect_task = None
+        self._hello_ack_task = None
+        self._stability_task = None
+        for state in self._order_states.values():
+            if state.gap_task is not None:
+                owned.append(state.gap_task)
+                state.gap_task = None
+        owned.extend(self._bg_tasks)
+        self._bg_tasks.clear()
 
-        await self._drain_all_pending_for_shutdown()
+        await self._flush_parked_frames("gap_fill_unavailable")
 
         ws = self._ws
         self._ws = None
@@ -844,16 +1004,16 @@ class RealtimeClient:
             with contextlib.suppress(Exception):
                 await ws.close()
 
-        if self._recv_task is not None:
+        recv_task = self._recv_task
+        self._recv_task = None
+        if recv_task is not None and recv_task is not current:
             with contextlib.suppress(asyncio.CancelledError, asyncio.TimeoutError, Exception):
-                await asyncio.wait_for(self._recv_task, timeout=1.0)
-            self._recv_task = None
+                await asyncio.wait_for(recv_task, timeout=1.0)
 
-        for task in list(self._bg_tasks):
-            task.cancel()
-        self._bg_tasks.clear()
+        await _release_tasks(owned, current)
 
         self._authenticated = False
+        self._ack_mode = False
         self._handlers.clear()
         self._error_handlers.clear()
         self._connect_handlers.clear()
@@ -872,6 +1032,25 @@ class RealtimeClient:
     async def _emit_disconnect(self, info: dict[str, Any]) -> None:
         for h in list(self._disconnect_handlers):
             await _invoke(h, info)
+
+    async def _dispatch_wake(self, message: dict[str, Any]) -> None:
+        """Validate a ``wake`` frame's payload, then dispatch it to ``on("wake")``.
+
+        A frame the server sent malformed is surfaced through ``on_error``
+        rather than handed to handlers as something it is not.
+        """
+        try:
+            WakePayload.model_validate(message.get("payload"), strict=True)
+        except ValidationError as err:
+            problems = "; ".join(
+                f"{'.'.join(str(part) for part in e['loc']) or 'payload'}: {e['msg']}"
+                for e in err.errors()
+            )
+            await self._emit_error(
+                _RealtimeConnectionError(f"wake frame failed validation: {problems}")
+            )
+            return
+        await self._dispatch(message)
 
     async def _dispatch(self, message: dict[str, Any]) -> bool:
         """Fan a frame out to its registered handlers.
@@ -898,7 +1077,7 @@ class RealtimeClient:
 
     async def _deliver_message_new(
         self, message: dict[str, Any], *, ws_ack: bool
-    ) -> None:
+    ) -> bool:
         """Single delivery choke point for ``message.new`` envelopes.
 
         Every path that hands an envelope to handlers — live in-order,
@@ -914,21 +1093,33 @@ class RealtimeClient:
           handler (async ones awaited) completed without raising. A
           handler exception ⇒ no ack ⇒ the envelope stays ``stored``
           server-side and re-arrives via drain/redelivery.
+
+        Returns ``True`` when the envelope is safe to acknowledge (clean
+        dispatch or dedup hit), ``False`` when a handler raised. The REST
+        drain reads the same answer through :attr:`_drain_settlements`
+        before it moves the sync/ack cursor.
         """
         message_id = _extract_message_id(message)
 
         if message_id is not None and self._dedup.hit(message_id):
             if ws_ack:
                 await self._send_delivery_ack(message_id)
-            return
+            return self._settle_drain_row(message, True)
 
         dispatched_cleanly = await self._dispatch(message)
-        if not dispatched_cleanly or message_id is None:
-            return
+        if not dispatched_cleanly:
+            return self._settle_drain_row(message, False)
+        if message_id is not None:
+            self._dedup.add(message_id)
+            if ws_ack:
+                await self._send_delivery_ack(message_id)
+        return self._settle_drain_row(message, True)
 
-        self._dedup.add(message_id)
-        if ws_ack:
-            await self._send_delivery_ack(message_id)
+    def _settle_drain_row(self, message: dict[str, Any], ok: bool) -> bool:
+        key = id(message)
+        if key in self._drain_settlements:
+            self._drain_settlements[key] = ok
+        return ok
 
     async def _send_delivery_ack(self, message_id: str) -> None:
         """Send a delivery-ack frame if this connection negotiated ack-mode.
@@ -950,10 +1141,13 @@ class RealtimeClient:
                 "delivery ack send failed for %s", message_id, exc_info=True
             )
 
-    def _spawn(self, coro: Coroutine[Any, Any, Any]) -> None:
+    def _spawn(self, coro: Coroutine[Any, Any, Any]) -> asyncio.Task[Any]:
+        """Start an owned background task. ``disconnect()`` cancels and awaits
+        every task still in ``_bg_tasks``; a finished task removes itself."""
         task: asyncio.Task[Any] = asyncio.create_task(coro)
         self._bg_tasks.add(task)
         task.add_done_callback(self._bg_tasks.discard)
+        return task
 
     # ─── Per-conversation seq ordering ───────────────────────────────
     #
@@ -963,27 +1157,37 @@ class RealtimeClient:
     # advance the cursor past the hole).
 
     async def _process_ordered_message(
-        self, message: dict[str, Any], *, ws_ack: bool = False
-    ) -> None:
+        self, message: dict[str, Any], *, ws_ack: bool = False, ack_spent: bool = False
+    ) -> _Routed:
         """Route one ``message.new`` envelope through seq ordering.
 
         ``ws_ack`` tags the envelope's origin (live socket vs drain/gap
         injection) and follows it through the buffer — see
-        :class:`_PendingEnvelope`.
+        :class:`_PendingEnvelope`. ``ack_spent`` says the frame was already
+        acknowledged at parse (``ack_on_receipt``): the server has it
+        `delivered` and will never re-offer it, so it may only be dropped
+        when this session has dispatched it before.
+
+        Returns where the envelope went: ``"delivered"`` (handed to
+        :meth:`_deliver_message_new` now), ``"duplicate"`` (below this
+        connection's seq anchor, dropped), or ``"buffered"`` (parked on a
+        seq gap; dispatched later by the gap machinery or the shutdown
+        flush). The REST drain uses this to decide what its ack cursor may
+        cover.
         """
         payload = message.get("payload")
         if not isinstance(payload, dict):
             await self._deliver_message_new(message, ws_ack=ws_ack)
-            return
+            return "delivered"
         conversation_id = payload.get("conversation_id")
         if not isinstance(conversation_id, str):
             await self._deliver_message_new(message, ws_ack=ws_ack)
-            return
+            return "delivered"
 
         seq = _extract_seq(message)
         if seq is None:
             await self._deliver_message_new(message, ws_ack=ws_ack)
-            return
+            return "delivered"
 
         state = self._order_states.get(conversation_id)
         if state is None:
@@ -994,10 +1198,23 @@ class RealtimeClient:
         if state.next_expected_seq is None:
             state.next_expected_seq = seq + 1
             await self._deliver_message_new(message, ws_ack=ws_ack)
-            return
+            return "delivered"
 
         if seq < state.next_expected_seq:
-            return  # duplicate — drain↔live race or server double-publish
+            # Below this connection's anchor: a drain↔live race or a server
+            # double-publish. The server registers the socket before it
+            # starts the reconnect drain, so a fresh live frame (seq 5) can
+            # anchor a conversation before the drain pushes older stored
+            # rows (seq 3, 4). Unacked, those come back in order later and
+            # are safe to drop here; acked at parse, dropping them would lose
+            # them — deliver on a dedup miss, out of order but not lost.
+            if not ack_spent:
+                return "duplicate"
+            message_id = _extract_message_id(message)
+            if message_id is not None and self._dedup.hit(message_id):
+                return "duplicate"
+            await self._deliver_message_new(message, ws_ack=False)
+            return "delivered"
 
         if seq == state.next_expected_seq:
             await self._deliver_message_new(message, ws_ack=ws_ack)
@@ -1005,7 +1222,7 @@ class RealtimeClient:
             await self._drain_consecutive(conversation_id, state)
             self._maybe_clear_gap_timer(state)
             self._cleanup_if_idle(conversation_id, state)
-            return
+            return "delivered"
 
         # seq > next_expected_seq — out of order. Buffer + arm gap timer.
         state.buffer[seq] = _PendingEnvelope(message=message, ws_ack=ws_ack)
@@ -1018,12 +1235,17 @@ class RealtimeClient:
                 reason="buffer_overflow",
                 buffered_seq=_min_buffered_seq(state),
             )
-            return
+            return "buffered"
 
         if state.gap_task is None:
             state.gap_started_at = time.monotonic()
             state.gap_started_expected_seq = state.next_expected_seq
-            state.gap_task = asyncio.create_task(self._gap_timer(conversation_id))
+            # Owned through _bg_tasks as well: the handler clears
+            # `state.gap_task` once the timer has fired, but the same task
+            # then runs the gap-fill fetch, and disconnect() must still be
+            # able to cancel and await it mid-fetch.
+            state.gap_task = self._spawn(self._gap_timer(conversation_id))
+        return "buffered"
 
     async def _gap_timer(self, conversation_id: str) -> None:
         try:
@@ -1100,11 +1322,18 @@ class RealtimeClient:
                 continue
             if row_seq in state.buffer:
                 continue
-            # Gap-fill rows came from REST history, not the live socket —
-            # not WS-ack-eligible; their delivery envelopes (if any) are
-            # settled by the next sync drain + dedup.
+            # Gap-fill rows ride the live ack path: in the default mode they
+            # are acked after dispatch like any live frame; with
+            # ack_on_receipt the fetch IS this machine's receipt, so ack now
+            # and spend it. Either way the server's envelope (if any) is
+            # settled here instead of waiting for a later drain.
+            envelope: dict[str, Any] = {"type": "message.new", "payload": row}
+            if self._opts.ack_on_receipt:
+                fetched_id = _extract_message_id(envelope)
+                if fetched_id is not None:
+                    await self._send_delivery_ack(fetched_id)
             state.buffer[row_seq] = _PendingEnvelope(
-                message={"type": "message.new", "payload": row}, ws_ack=False
+                message=envelope, ws_ack=not self._opts.ack_on_receipt
             )
 
         drained = await self._drain_consecutive(conversation_id, state)
@@ -1215,7 +1444,15 @@ class RealtimeClient:
                 state.gap_task.cancel()
         self._order_states.clear()
 
-    async def _drain_all_pending_for_shutdown(self) -> None:
+    async def _flush_parked_frames(self, reason: GapReason) -> None:
+        """Hand every parked frame to the handlers in seq order per
+        conversation, cancel the gap timers and clear the ordering state.
+
+        Used when frames must not be dropped: on :meth:`disconnect` (the
+        caller is leaving) and, under ``ack_on_receipt``, on every socket
+        close (the frames are already acked). No gap-fill: an in-flight
+        HTTP request would race the close.
+        """
         for conversation_id, state in list(self._order_states.items()):
             if state.gap_task is not None:
                 state.gap_task.cancel()
@@ -1246,7 +1483,7 @@ class RealtimeClient:
                         else 0
                     ),
                     recovered=False,
-                    reason="gap_fill_unavailable",
+                    reason=reason,
                 )
                 await _invoke(self._opts.on_sequence_gap, info)
         self._order_states.clear()
@@ -1284,6 +1521,21 @@ async def _invoke0(handler: Any) -> None:
             await result
     except Exception:
         _log.warning("realtime handler raised", exc_info=True)
+
+
+async def _release_tasks(
+    tasks: list[asyncio.Task[Any]], current: asyncio.Task[Any] | None
+) -> None:
+    """Cancel ``tasks`` and wait for them to finish, so a closed client
+    leaves nothing behind in the loop. The calling task is skipped: a
+    handler may close the client from inside one of these tasks."""
+    pending = [task for task in tasks if task is not current and not task.done()]
+    for task in pending:
+        task.cancel()
+    if not pending:
+        return
+    with contextlib.suppress(asyncio.CancelledError, asyncio.TimeoutError, Exception):
+        await asyncio.wait_for(asyncio.gather(*pending, return_exceptions=True), timeout=1.0)
 
 
 def _extract_seq(message: dict[str, Any]) -> int | None:
