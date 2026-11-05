@@ -1166,3 +1166,182 @@ async def test_long_lived_connection_resets_the_instability_counter() -> None:
         assert rt._rapid_reconnects == 0
     finally:
         await rt.disconnect()
+
+
+# ─────────────── Drain ack cursor: only what the app was handed ───────────────
+#
+# The sync/ack cursor commits everything at-or-before it. It may therefore
+# only cover rows whose dispatch is known to have settled; anything parked,
+# failed or never shown must stop it. Before this fix the drain acked the
+# whole page after injecting it into the ordering layer, so a row parked on
+# a seq gap (or dropped as a below-anchor duplicate) was marked delivered
+# while no handler had seen it — and a disconnect during the 2 s gap window
+# cleared the buffer, losing the message for good.
+
+
+@pytest.mark.asyncio
+async def test_drain_never_acks_a_row_parked_on_a_seq_gap() -> None:
+    # seq 2 is absent from the page (delivered on a prior connection), so
+    # seq 3 parks behind the gap timer. The cursor must stop at seq 1.
+    page = [
+        _sync_row("m_1", delivery_id="del_1", seq=1),
+        _sync_row("m_3", delivery_id="del_3", seq=3),
+    ]
+    mock_api = MockAsyncClient(sync_pages=[page])
+    rt, ws = _make_client(client=mock_api, auto_drain_on_connect=False)
+    seen: list[int] = []
+    rt.on("message.new", lambda m: seen.append(m["payload"]["seq"]))
+    await rt.connect()
+    await _settle()
+    await ws.push({"type": "hello.ok"})
+    await _settle()
+    await rt.drain_offline_envelopes()
+
+    assert seen == [1]
+    assert mock_api.sync_ack_calls == ["del_1"]
+
+    # Teardown cancels the gap timer and flushes the buffer to handlers.
+    await rt.disconnect()
+    assert seen == [1, 3]
+
+
+@pytest.mark.asyncio
+async def test_drain_freezes_the_cursor_at_a_failed_handler() -> None:
+    page = [
+        _sync_row("m_1", delivery_id="del_1", seq=1),
+        _sync_row("m_2", delivery_id="del_2", seq=2),
+        _sync_row("m_3", delivery_id="del_3", seq=3),
+    ]
+    mock_api = MockAsyncClient(sync_pages=[page])
+    rt, ws = _make_client(client=mock_api, auto_drain_on_connect=False)
+    attempts: list[int] = []
+
+    def flaky(m: dict[str, Any]) -> None:
+        attempts.append(m["payload"]["seq"])
+        if m["payload"]["seq"] == 2:
+            raise RuntimeError("handler exploded on seq 2")
+
+    rt.on("message.new", flaky)
+    try:
+        await rt.connect()
+        await _settle()
+        await ws.push({"type": "hello.ok"})
+        await _settle()
+        await rt.drain_offline_envelopes()
+        # Every row was offered to the handler, but the cursor stops before
+        # the failure: rows 2 and 3 stay `stored` for redelivery.
+        assert attempts == [1, 2, 3]
+        assert mock_api.sync_ack_calls == ["del_1"]
+    finally:
+        await rt.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_drain_acks_a_below_anchor_duplicate_only_if_this_session_dispatched_it() -> None:
+    # Live frames anchor the conversation at seq 3 before the drain runs.
+    # The drain re-offers seq 1 and 2: both were dispatched live (dedup
+    # cache), so the cursor may cover them.
+    page = [
+        _sync_row("m_1", delivery_id="del_1", seq=1),
+        _sync_row("m_2", delivery_id="del_2", seq=2),
+    ]
+    mock_api = MockAsyncClient(sync_pages=[page])
+    rt, ws = _make_client(client=mock_api, auto_drain_on_connect=False)
+    handled: list[str] = []
+    rt.on("message.new", lambda m: handled.append(m["payload"]["id"]))
+    try:
+        await rt.connect()
+        await _settle()
+        await ws.push({"type": "hello.ok"})
+        await _settle()
+        await ws.push({"type": "message.new", "payload": {"id": "m_1", "conversation_id": "c1", "seq": 1}})
+        await ws.push({"type": "message.new", "payload": {"id": "m_2", "conversation_id": "c1", "seq": 2}})
+        await _settle()
+        await rt.drain_offline_envelopes()
+        assert handled == ["m_1", "m_2"]
+        assert mock_api.sync_ack_calls == ["del_2"]
+    finally:
+        await rt.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_drain_never_acks_a_below_anchor_row_nobody_dispatched() -> None:
+    # A fresh live message (seq 5) anchors the conversation before the drain
+    # delivers the older stored rows 3 and 4. The ordering layer drops them
+    # as duplicates, but no handler ever saw them: the cursor must not move.
+    page = [
+        _sync_row("m_3", delivery_id="del_3", seq=3),
+        _sync_row("m_4", delivery_id="del_4", seq=4),
+    ]
+    mock_api = MockAsyncClient(sync_pages=[page])
+    rt, ws = _make_client(client=mock_api, auto_drain_on_connect=False)
+    handled: list[str] = []
+    rt.on("message.new", lambda m: handled.append(m["payload"]["id"]))
+    try:
+        await rt.connect()
+        await _settle()
+        await ws.push({"type": "hello.ok"})
+        await _settle()
+        await ws.push({"type": "message.new", "payload": {"id": "m_5", "conversation_id": "c1", "seq": 5}})
+        await _settle()
+        await rt.drain_offline_envelopes()
+        assert handled == ["m_5"]
+        assert mock_api.sync_ack_calls == []
+    finally:
+        await rt.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_drain_dispatches_and_acks_nothing_after_disconnect() -> None:
+    gate = asyncio.Event()
+
+    class _SlowClient(MockAsyncClient):
+        async def sync(self, **kwargs: Any) -> list[dict[str, Any]]:
+            await gate.wait()
+            return await super().sync(**kwargs)
+
+    mock_api = _SlowClient(sync_pages=[[_sync_row("m_1", delivery_id="del_1", seq=1)]])
+    rt, ws = _make_client(client=mock_api, auto_drain_on_connect=False)
+    handled: list[str] = []
+    rt.on("message.new", lambda m: handled.append(m["payload"]["id"]))
+    await rt.connect()
+    await _settle()
+    await ws.push({"type": "hello.ok"})
+    await _settle()
+    drain = asyncio.create_task(rt.drain_offline_envelopes())
+    await _settle()
+    await rt.disconnect()  # handlers are gone; the page must not be acked
+    gate.set()
+    await asyncio.wait_for(drain, timeout=1.0)
+    assert handled == []
+    assert mock_api.sync_ack_calls == []
+
+
+@pytest.mark.asyncio
+async def test_drain_coalesces_concurrent_calls() -> None:
+    gate = asyncio.Event()
+
+    class _SlowClient(MockAsyncClient):
+        async def sync(self, **kwargs: Any) -> list[dict[str, Any]]:
+            await gate.wait()
+            return await super().sync(**kwargs)
+
+    mock_api = _SlowClient(sync_pages=[[_sync_row("m_1", delivery_id="del_1", seq=1)]])
+    rt, ws = _make_client(client=mock_api, auto_drain_on_connect=False)
+    handled: list[str] = []
+    rt.on("message.new", lambda m: handled.append(m["payload"]["id"]))
+    try:
+        await rt.connect()
+        await _settle()
+        await ws.push({"type": "hello.ok"})
+        await _settle()
+        first = asyncio.create_task(rt.drain_offline_envelopes())
+        second = asyncio.create_task(rt.drain_offline_envelopes())
+        await _settle()
+        gate.set()
+        await asyncio.gather(first, second)
+        assert len(mock_api.sync_calls) == 1
+        assert handled == ["m_1"]
+        assert mock_api.sync_ack_calls == ["del_1"]
+    finally:
+        await rt.disconnect()
