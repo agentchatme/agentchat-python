@@ -94,11 +94,12 @@ TypeScript SDK release of the same name; the two share `conformance/v1/`.
   `ClientAction`; new types `WakeFrame`, `WakePayload`, `WakeReason`, `AckFrame`.
 - `RealtimeClient` option `ack_on_receipt` — ack a `message.new` as soon as
   its frame is parsed, before handlers (the integration setting; covers live
-  frames, reconnect backlog and gap-fill rows). Frames parked on a seq gap
-  when the socket drops are flushed to handlers (they are acked, so the
-  server never re-offers them); `on_sequence_gap` reports such a flush as
-  `reason="connection_closed"`. Default unchanged: ack after every handler
-  settled.
+  frames, reconnect backlog and gap-fill rows). An acked frame is never
+  re-offered, so none is dropped unseen: one that arrives below the seq
+  anchor is delivered out of order, and frames parked on a seq gap when the
+  socket drops are flushed to handlers; `on_sequence_gap` reports such a
+  flush as `reason="connection_closed"`. Default unchanged: ack after every
+  handler settled.
 - `RealtimeClient.disconnect()` now cancels **and awaits** every task the
   instance owned (reconnect, HELLO watchdog, stability window, gap timers,
   drain), so a host process that stops the client leaves nothing in the loop.
@@ -122,6 +123,11 @@ TypeScript SDK release of the same name; the two share `conformance/v1/`.
 - The client no longer keeps a shared default `CallOptions` instance at
   module level; each call gets its own. With that, the SDK holds no
   process-wide mutable state when it runs as a guest inside a host process.
+- `RealtimeClient` copies the `RealtimeOptions` it is given and never
+  writes to the caller's object, so several instances can be built from one.
+- Gap-fill rows (fetched over REST to close a seq gap) are now acked after
+  dispatch like live frames, as the TypeScript SDK does; before, they were
+  left for a later drain to settle.
 
 ## [1.1.0] — 2026-08-20
 

@@ -34,7 +34,7 @@ import random
 import time
 from collections import OrderedDict
 from collections.abc import Awaitable, Coroutine
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -368,6 +368,10 @@ class RealtimeClient:
                 ack_on_receipt=bool(ack_on_receipt),
             )
 
+        # A private copy: the client writes to its options (the auto-drain
+        # default here, `reconnect=False` on disconnect) and must never write
+        # to the caller's object — several instances may be built from one.
+        options = replace(options)
         if options.auto_drain_on_connect is None:
             options.auto_drain_on_connect = options.client is not None
 
@@ -629,7 +633,9 @@ class RealtimeClient:
                         message_id = _extract_message_id(message)
                         if message_id is not None:
                             await self._send_delivery_ack(message_id)
-                        await self._process_ordered_message(message, ws_ack=False)
+                        await self._process_ordered_message(
+                            message, ws_ack=False, ack_spent=True
+                        )
                     else:
                         # Live socket frames are ack-eligible after dispatch;
                         # drain/gap-fill injections are not (they commit via
@@ -1135,10 +1141,13 @@ class RealtimeClient:
                 "delivery ack send failed for %s", message_id, exc_info=True
             )
 
-    def _spawn(self, coro: Coroutine[Any, Any, Any]) -> None:
+    def _spawn(self, coro: Coroutine[Any, Any, Any]) -> asyncio.Task[Any]:
+        """Start an owned background task. ``disconnect()`` cancels and awaits
+        every task still in ``_bg_tasks``; a finished task removes itself."""
         task: asyncio.Task[Any] = asyncio.create_task(coro)
         self._bg_tasks.add(task)
         task.add_done_callback(self._bg_tasks.discard)
+        return task
 
     # ─── Per-conversation seq ordering ───────────────────────────────
     #
@@ -1148,13 +1157,16 @@ class RealtimeClient:
     # advance the cursor past the hole).
 
     async def _process_ordered_message(
-        self, message: dict[str, Any], *, ws_ack: bool = False
+        self, message: dict[str, Any], *, ws_ack: bool = False, ack_spent: bool = False
     ) -> _Routed:
         """Route one ``message.new`` envelope through seq ordering.
 
         ``ws_ack`` tags the envelope's origin (live socket vs drain/gap
         injection) and follows it through the buffer — see
-        :class:`_PendingEnvelope`.
+        :class:`_PendingEnvelope`. ``ack_spent`` says the frame was already
+        acknowledged at parse (``ack_on_receipt``): the server has it
+        `delivered` and will never re-offer it, so it may only be dropped
+        when this session has dispatched it before.
 
         Returns where the envelope went: ``"delivered"`` (handed to
         :meth:`_deliver_message_new` now), ``"duplicate"`` (below this
@@ -1189,7 +1201,20 @@ class RealtimeClient:
             return "delivered"
 
         if seq < state.next_expected_seq:
-            return "duplicate"  # drain↔live race or server double-publish
+            # Below this connection's anchor: a drain↔live race or a server
+            # double-publish. The server registers the socket before it
+            # starts the reconnect drain, so a fresh live frame (seq 5) can
+            # anchor a conversation before the drain pushes older stored
+            # rows (seq 3, 4). Unacked, those come back in order later and
+            # are safe to drop here; acked at parse, dropping them would lose
+            # them — deliver on a dedup miss, out of order but not lost.
+            if not ack_spent:
+                return "duplicate"
+            message_id = _extract_message_id(message)
+            if message_id is not None and self._dedup.hit(message_id):
+                return "duplicate"
+            await self._deliver_message_new(message, ws_ack=False)
+            return "delivered"
 
         if seq == state.next_expected_seq:
             await self._deliver_message_new(message, ws_ack=ws_ack)
@@ -1215,7 +1240,11 @@ class RealtimeClient:
         if state.gap_task is None:
             state.gap_started_at = time.monotonic()
             state.gap_started_expected_seq = state.next_expected_seq
-            state.gap_task = asyncio.create_task(self._gap_timer(conversation_id))
+            # Owned through _bg_tasks as well: the handler clears
+            # `state.gap_task` once the timer has fired, but the same task
+            # then runs the gap-fill fetch, and disconnect() must still be
+            # able to cancel and await it mid-fetch.
+            state.gap_task = self._spawn(self._gap_timer(conversation_id))
         return "buffered"
 
     async def _gap_timer(self, conversation_id: str) -> None:
@@ -1293,16 +1322,19 @@ class RealtimeClient:
                 continue
             if row_seq in state.buffer:
                 continue
-            # Gap-fill rows came from REST history, not the live socket —
-            # not WS-ack-eligible after dispatch; their delivery envelopes
-            # (if any) are settled by the next sync drain + dedup. With
-            # ack_on_receipt the fetch IS this machine's receipt: ack now.
+            # Gap-fill rows ride the live ack path: in the default mode they
+            # are acked after dispatch like any live frame; with
+            # ack_on_receipt the fetch IS this machine's receipt, so ack now
+            # and spend it. Either way the server's envelope (if any) is
+            # settled here instead of waiting for a later drain.
             envelope: dict[str, Any] = {"type": "message.new", "payload": row}
             if self._opts.ack_on_receipt:
                 fetched_id = _extract_message_id(envelope)
                 if fetched_id is not None:
                     await self._send_delivery_ack(fetched_id)
-            state.buffer[row_seq] = _PendingEnvelope(message=envelope, ws_ack=False)
+            state.buffer[row_seq] = _PendingEnvelope(
+                message=envelope, ws_ack=not self._opts.ack_on_receipt
+            )
 
         drained = await self._drain_consecutive(conversation_id, state)
         if drained:

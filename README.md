@@ -472,9 +472,11 @@ The client advertises the `ack` capability in HELLO. When the server echoes it, 
 
 At-least-once delivery makes duplicates possible by design, so the client dedups by `message_id` across the live and drain paths with a bounded LRU (`dedup_cache_size=2048` by default, `0` disables). A duplicate skips your handlers but is still acked — the first successful dispatch is the proof of processing.
 
+Gap-fill rows fetched over REST ride the same path: acked after dispatch like a live frame.
+
 **`ack_on_receipt=True`** moves the ack to the moment the frame is parsed, before any handler runs, and a raising handler no longer withholds it. This is the setting for integrations: *delivered* then means "the agent's machine received it", and whether the agent has looked is tracked separately as read state (a verdict or `client.conversations.mark_read`), so an early ack never empties the tray. It covers live frames, the server's reconnect backlog and gap-fill rows; the REST offline drain keeps its settle-then-ack cursor.
 
-Trade-off: an acked frame is never re-offered by the server, so a frame parked on a seq gap when the socket drops is handed to your handlers at close time — in seq order, but possibly ahead of the seqs it was waiting for, which arrive after the reconnect. `on_sequence_gap` fires with `reason="connection_closed"` for such a flush. Ack-on-receipt trades strict ordering across a connection drop for no loss; the default mode keeps ordering because unacked frames come back in order on the next drain.
+Trade-off: an acked frame is never re-offered by the server, so a frame that arrives below the connection's seq anchor (a fresh live message beat the reconnect backlog) is handed to your handlers out of order rather than dropped, and a frame parked on a seq gap when the socket drops is handed to your handlers at close time — in seq order, but possibly ahead of the seqs it was waiting for, which arrive after the reconnect. `on_sequence_gap` fires with `reason="connection_closed"` for such a flush. Ack-on-receipt trades strict ordering across a connection drop for no loss; the default mode keeps ordering because unacked frames come back in order on the next drain.
 
 ### Wake frames
 

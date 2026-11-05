@@ -315,6 +315,53 @@ async def test_default_mode_leaves_unacked_parked_frames_to_the_next_drain() -> 
         await rt.disconnect()
 
 
+@pytest.mark.asyncio
+async def test_ack_on_receipt_delivers_a_below_anchor_frame_it_already_acked() -> None:
+    # The server registers the socket before it starts the reconnect drain,
+    # so pub/sub can deliver a fresh seq 5 first; the drain then pushes the
+    # stored seq 3 and 4. Acked at parse, they must reach the handlers
+    # (out of order, not lost); a redelivery of one is acked again only.
+    rt, ws = await connected(capabilities=["ack"], ack_on_receipt=True)
+    dispatched: list[int] = []
+    rt.on("message.new", lambda m: dispatched.append(m["payload"]["seq"]))
+    try:
+        await ws.push(message_new("c", 5))
+        await ws.push(message_new("c", 3))
+        await ws.push(message_new("c", 4))
+        await _settle()
+        assert dispatched == [5, 3, 4]
+        assert _ack_frames(ws) == ["msg_5", "msg_3", "msg_4"]
+
+        await ws.push(message_new("c", 3))  # server double-publish
+        await _settle()
+        assert dispatched == [5, 3, 4]
+        assert _ack_frames(ws) == ["msg_5", "msg_3", "msg_4", "msg_3"]
+    finally:
+        await rt.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_default_mode_acks_gap_fill_rows_after_dispatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("agentchatme._realtime._GAP_FILL_WINDOW_S", 0.05)
+    filled = {"id": "msg_2", "conversation_id": "c", "seq": 2}
+    api = MockAsyncClient(get_messages_result=[filled])
+    rt, ws = await connected(capabilities=["ack"], client=api, auto_drain_on_connect=False)
+    dispatched: list[int] = []
+    rt.on("message.new", lambda m: dispatched.append(m["payload"]["seq"]))
+    try:
+        await ws.push(message_new("c", 1))
+        await ws.push(message_new("c", 3))
+        await asyncio.sleep(0.12)
+        await _settle()
+        assert dispatched == [1, 2, 3]
+        # The fetched row rides the live ack path: acked once dispatched.
+        assert _ack_frames(ws) == ["msg_1", "msg_2", "msg_3"]
+    finally:
+        await rt.disconnect()
+
+
 # ─────────────── a guest in a host process ───────────────
 
 
@@ -422,6 +469,75 @@ async def test_disconnect_releases_the_hello_ack_timer_mid_handshake() -> None:
     assert rt._hello_ack_task is not None and not rt._hello_ack_task.done()
     await rt.disconnect()
     assert other_tasks() - baseline == set()
+
+
+@pytest.mark.asyncio
+async def test_disconnect_releases_an_in_flight_gap_fill_task(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("agentchatme._realtime._GAP_FILL_WINDOW_S", 0.01)
+    baseline = other_tasks()
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    class _SlowFill(MockAsyncClient):
+        async def get_messages(self, conversation_id: str, **kwargs: Any) -> list[dict[str, Any]]:
+            started.set()
+            await release.wait()
+            return await super().get_messages(conversation_id, **kwargs)
+
+    api = _SlowFill(get_messages_result=[{"id": "msg_2", "conversation_id": "c", "seq": 2}])
+    rt, ws = await connected(capabilities=["ack"], client=api, auto_drain_on_connect=False)
+    rt.on("message.new", lambda m: None)
+    await ws.push(message_new("c", 1))
+    await ws.push(message_new("c", 3))
+    await asyncio.wait_for(started.wait(), timeout=2.0)  # the fetch is in flight
+
+    await rt.disconnect()
+    assert other_tasks() - baseline == set()
+    release.set()
+    await _settle()
+    assert other_tasks() - baseline == set()
+
+
+@pytest.mark.asyncio
+async def test_two_instances_from_one_options_object_do_not_interfere() -> None:
+    from agentchatme import RealtimeOptions
+
+    sockets: dict[str, MockWebSocket] = {}
+    connects: list[str] = []
+    shared = RealtimeOptions(
+        api_key="k", reconnect=True, reconnect_interval_ms=10, max_reconnect_interval_ms=20
+    )
+
+    def connector(label: str) -> Any:
+        async def fake_connect(_url: str, **_kw: Any) -> MockWebSocket:
+            connects.append(label)
+            sockets[label] = MockWebSocket()
+            return sockets[label]
+
+        return fake_connect
+
+    a = RealtimeClient(shared, websocket_connect=connector("a"))
+    b = RealtimeClient(shared, websocket_connect=connector("b"))
+    await a.connect()
+    await b.connect()
+    await _settle()
+    await sockets["a"].push({"type": "hello.ok"})
+    await sockets["b"].push({"type": "hello.ok"})
+    await _settle()
+
+    await a.disconnect()
+    # The caller's object is untouched, and so is b.
+    assert shared.reconnect is True
+    assert shared.auto_drain_on_connect is None
+    assert b._opts.reconnect is True
+
+    # b still reconnects after a server-side drop; a stays closed.
+    await sockets["b"].close(code=1006, reason="blip")
+    await asyncio.sleep(0.1)
+    assert connects == ["a", "b", "b"]
+    await b.disconnect()
 
 
 @pytest.mark.asyncio
