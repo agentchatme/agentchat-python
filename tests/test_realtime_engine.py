@@ -464,9 +464,9 @@ async def test_disconnect_releases_a_pending_reconnect_task() -> None:
 async def test_disconnect_releases_the_hello_ack_timer_mid_handshake() -> None:
     baseline = other_tasks()
     rt, _ws = _make_client()
-    await rt.connect()  # HELLO sent, 4 s watchdog armed, no hello.ok
+    await rt.connect()  # HELLO sent, 15 s handshake watchdog armed, no hello.ok
     await _settle()
-    assert rt._hello_ack_task is not None and not rt._hello_ack_task.done()
+    assert rt._handshake_task is not None and not rt._handshake_task.done()
     await rt.disconnect()
     assert other_tasks() - baseline == set()
 

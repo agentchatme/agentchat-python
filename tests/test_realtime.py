@@ -880,7 +880,11 @@ async def test_dedup_cache_size_is_configurable_and_bounded() -> None:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("code", [1008, 4401, 4403])
-async def test_terminal_close_code_stops_reconnect(code: int) -> None:
+async def test_auth_close_after_hello_ok_is_an_eviction_not_a_rejection(code: int) -> None:
+    """Key rotated / account suspended / signed out close a LIVE socket with
+    these codes. The next HELLO is the evidence, so the client takes the
+    normal reconnect and is not blocked (the close-code rules proper are in
+    test_realtime_resilience.py)."""
     connects: list[MockWebSocket] = []
 
     async def fake_connect(_url: str, **_kw: Any) -> MockWebSocket:
@@ -903,12 +907,13 @@ async def test_terminal_close_code_stops_reconnect(code: int) -> None:
         ws = connects[0]
         await ws.push({"type": "hello.ok"})
         await _settle()
-        # Server rejects the session.
-        await ws.close(code=code)
+        # Server evicts the authenticated session.
+        await ws.close(code=code, reason="Key rotated")
         await asyncio.sleep(0.1)
-        # No reconnect happened, and the terminal condition was surfaced.
-        assert len(connects) == 1
-        assert any(f"auth-terminal code {code}" in str(e) for e in errors)
+        assert len(connects) >= 2
+        assert rt.state in ("connecting", "backoff")
+        assert rt.blocked_reason is None
+        assert not any("auth rejection" in str(e) for e in errors)
     finally:
         await rt.disconnect()
 
@@ -945,10 +950,9 @@ async def test_non_terminal_close_still_reconnects() -> None:
 async def test_hello_timeout_self_close_is_not_terminal(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    # The watchdog closes with 1008 when the server never sends hello.ok.
-    # That self-close must NOT trip the auth-terminal stop — a slow
-    # handshake is transient, unlike a server-sent 1008.
-    monkeypatch.setattr("agentchatme._realtime._HELLO_ACK_TIMEOUT_S", 0.03)
+    # The watchdog closes the socket when the server never sends hello.ok.
+    # A close we initiated is never evidence about the server: normal
+    # backoff, never blocked.
     connects: list[MockWebSocket] = []
 
     async def fake_connect(_url: str, **_kw: Any) -> MockWebSocket:
@@ -961,6 +965,7 @@ async def test_hello_timeout_self_close_is_not_terminal(
         reconnect=True,
         reconnect_interval_ms=10,
         max_reconnect_interval_ms=20,
+        handshake_timeout_ms=30,
         websocket_connect=fake_connect,
     )
     errors: list[BaseException] = []
@@ -968,9 +973,12 @@ async def test_hello_timeout_self_close_is_not_terminal(
     try:
         await rt.connect()
         await asyncio.sleep(0.15)
-        assert len(connects) >= 2  # kept reconnecting after the 1008 self-close
-        assert any("HELLO ack timeout" in str(e) for e in errors)
-        assert not any("auth-terminal" in str(e) for e in errors)
+        assert len(connects) >= 2  # kept reconnecting after our own close
+        assert connects[0].close_code == _realtime._CLIENT_CLOSE_CODE
+        assert connects[0].close_reason == "client handshake timeout"
+        assert any("handshake timeout" in str(e) for e in errors)
+        assert not any("auth rejection" in str(e) for e in errors)
+        assert rt.state != "blocked"
     finally:
         await rt.disconnect()
 

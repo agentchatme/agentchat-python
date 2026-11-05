@@ -50,6 +50,7 @@ from ._realtime import (
     MessageHandler,
     RealtimeClient,
     RealtimeOptions,
+    RealtimeState,
     SequenceGapHandler,
     SequenceGapInfo,
 )
@@ -130,6 +131,7 @@ __all__ = [
     # Realtime
     "RealtimeClient",
     "RealtimeOptions",
+    "RealtimeState",
     "RecipientBackloggedError",
     "RequestHooks",
     "RequestInfo",

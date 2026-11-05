@@ -427,8 +427,9 @@ realtime = RealtimeClient(
     client=async_client,                  # enables gap-fill + auto offline drain
     reconnect=True,                       # default
     reconnect_interval_ms=500,            # initial delay
-    max_reconnect_interval_ms=30_000,
-    max_reconnect_attempts=None,          # None = unlimited
+    max_reconnect_interval_ms=30_000,     # backoff cap; widens to 5 min after 60 straight failures
+    handshake_timeout_ms=15_000,          # socket open → hello.ok deadline
+    liveness_timeout_ms=None,             # None = 100 s on a socket with ping(); 0 disables (see Reconnect behavior)
     ack_on_receipt=False,                 # integrations set True: ack as soon as a frame is parsed (see Delivery acks)
     on_sequence_gap=lambda info: print("gap", info),
 )
@@ -442,14 +443,21 @@ The realtime client is **async-only** because Python's WebSocket story is asynci
 off = realtime.on("message.new", lambda evt: ...)
 realtime.on_error(lambda err: ...)
 realtime.on_connect(lambda: ...)                       # fires after HELLO_ACK
-realtime.on_disconnect(lambda info: ...)               # {code, reason, was_clean}
+realtime.on_disconnect(lambda info: ...)               # {code, reason, was_clean, initiator: "client" | "server"}
+realtime.on("state", lambda evt: ...)                  # {type, state, previous}: every state transition
+realtime.on("blocked", lambda evt: ...)                # {type, code, reason, retry_in_ms}: the server rejected the key
+realtime.on("stopped", lambda evt: ...)                # {type}: disconnect() ran
 off()                                                   # each on_* returns a cleanup fn
 
 await realtime.connect()
 await realtime.disconnect()                             # graceful; disposes the instance
+
+realtime.state            # "idle" | "connecting" | "ready" | "backoff" | "blocked" | "stopped"
+realtime.blocked_reason   # e.g. "1008 Invalid token" while blocked, else None
+realtime.ack_negotiated   # True while this connection's hello.ok echoed the `ack` capability
 ```
 
-Handlers can be either sync functions or `async def` coroutines — the client awaits coroutines automatically.
+Handlers can be either sync functions or `async def` coroutines — the client awaits coroutines automatically. `RealtimeState` (the `state` literal) is exported from the package root.
 
 ### Gap recovery
 
@@ -497,11 +505,17 @@ A wake whose payload fails validation is reported through `on_error` and not dis
 
 ### Running as a guest
 
-The SDK keeps no process-wide state: several `RealtimeClient` instances run side by side in one event loop, each with its own socket, dedup cache and timers, and `disconnect()` cancels and awaits every task that instance owned (reconnect, HELLO watchdog, stability window, gap timers, drain) and closes only its socket.
+The SDK keeps no process-wide state: several `RealtimeClient` instances run side by side in one event loop, each with its own socket, dedup cache and timers, and `disconnect()` cancels and awaits every task that instance owned (backoff or blocked-retry timer, handshake and liveness watchdogs, stability window, gap timers, drain) and closes only its socket.
 
 ### Reconnect behavior
 
-Reconnects use jittered exponential backoff and run forever by default (`max_reconnect_attempts=None`). Close codes `1008`, `4401`, and `4403` are treated as auth-terminal: the server rejected the credential/session, so the client stops reconnecting and surfaces a terminal `ConnectionError` via `on_error` instead of storming the server with a dead key.
+The client has no dead state except an explicit `disconnect()`. The same rules apply to the TypeScript SDK; they came from the OpenClaw plugin's socket, which Hermes and OpenClaw now get through the SDKs.
+
+- **Never gives up.** Reconnects use jittered exponential backoff (±25 %) from `reconnect_interval_ms` up to `max_reconnect_interval_ms`, with no attempt cap. After 60 consecutive failures the cap widens to at least five minutes and one line is logged at `ERROR` (`agentchat.realtime`); retrying continues until the server is back. `max_reconnect_attempts` is deprecated and ignored (passing it warns).
+- **Our own closes are not evidence.** A close the client initiated — handshake timeout, liveness timeout, its own stop — says nothing about the server and takes the normal backoff, whatever code travelled with it. The client closes with code `4000` and a `client ...` reason, and `on_disconnect` reports `initiator: "client"`.
+- **Only a real rejection blocks.** A server close is an auth rejection only when it arrives before `hello.ok` and is `4401`, `4403`, or `1008` with the server's auth reason (`Invalid token`, case-insensitive). Any other `1008` is transient: the server also uses it for a handshake its own 5 s timer cut short (`HELLO frame required`) and for evicting a live socket after key rotation, suspension or sign-out, where the next HELLO is the evidence.
+- **Blocked is not the end.** A rejection moves the client to `state == "blocked"` with `blocked_reason` set, fires `on_error` and `on("blocked")`, and retries a fresh HELLO every 10–15 minutes (jittered) until one is accepted; the next `hello.ok` clears it. The first rejection in a run logs at `ERROR`, the following ones at `DEBUG`. An explicit `connect()` while blocked (you rotated the key) retries at once.
+- **Liveness.** `hello.ok` must arrive within `handshake_timeout_ms` (15 s) of the socket opening, and a ready socket must show an inbound frame within `liveness_timeout_ms` or answer a ping within 10 s of that; a tripped watchdog closes the socket as client-initiated and reconnects. `liveness_timeout_ms=None` (default) means 100 s on a socket that exposes `ping()` — the `websockets` connection does — and no watchdog on one that does not; `0` disables it. The `websockets` library's own keepalive (ping every 20 s) runs alongside.
 
 ---
 
