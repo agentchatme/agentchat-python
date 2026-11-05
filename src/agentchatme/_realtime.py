@@ -2,7 +2,7 @@
 
 Mirrors the TypeScript ``RealtimeClient`` behavior:
 
-- HELLO handshake with 4 s ack timeout (authenticates over wire, never URL)
+- HELLO handshake with a 15 s deadline (authenticates over wire, never URL)
 - Capability-negotiated delivery acks (``ack``): at-least-once delivery
   with per-message confirmation after handler dispatch, or on receipt
   with ``ack_on_receipt=True`` (delivered = this machine received it)
@@ -10,12 +10,34 @@ Mirrors the TypeScript ``RealtimeClient`` behavior:
 - Per-conversation seq ordering with out-of-order buffering
 - Gap detection with optional ``AsyncAgentChatClient``-backed recovery
 - ``wake`` frames (a signal with no message text: read the tray)
-- Jittered exponential reconnect (halting on auth-terminal close codes),
+- Jittered exponential reconnect that never gives up, a ``blocked`` state
+  with a slow retry after an auth rejection, handshake + liveness watchdogs,
   disposed flag, offline ``/sync`` drain speaking the bare-array wire
 
 The client is async-only because Python's WebSocket story is asyncio-native.
 Pair it with an :class:`~agentchat.AsyncAgentChatClient` for gap recovery and
 auto-drain on reconnect.
+
+Connection rules (shared with the TypeScript SDK; they came from the
+OpenClaw plugin's socket, which Hermes and OpenClaw now get through here):
+
+1. The client has no dead state except an explicit :meth:`disconnect`.
+   There is no reconnect cap: backoff grows exponentially with jitter, and
+   after ``_LONG_OUTAGE_AFTER_ATTEMPTS`` consecutive failures the cap widens
+   to about five minutes and one error line is logged.
+2. A close the client itself initiated (handshake timeout, liveness timeout, its
+   own stop) is never evidence about the server: normal backoff.
+3. A server close is an auth rejection only when it is ``4401``/``4403``, or
+   ``1008`` with the server's auth reason (``Invalid token``), during the
+   handshake. Any other ``1008`` (``HELLO frame required`` from the server's
+   own 5 s timer, an eviction after key rotation or suspension) is transient.
+4. An auth rejection does not end the client: it enters ``blocked`` (exposed
+   as :attr:`RealtimeClient.state` with :attr:`RealtimeClient.blocked_reason`)
+   and retries a fresh HELLO every 10-15 minutes until a ``hello.ok`` clears it.
+5. Liveness: ``hello.ok`` must arrive within ``handshake_timeout_ms`` of the
+   socket opening, and a ready socket must show an inbound frame or answer
+   a ping within ``liveness_timeout_ms``; a tripped watchdog closes the
+   socket as client-initiated (rule 2) and reconnects.
 
 Guest mode: the client keeps no process-wide state. Several instances run
 side by side in one loop, and :meth:`RealtimeClient.disconnect` releases
@@ -32,6 +54,7 @@ import json
 import logging
 import random
 import time
+import warnings
 from collections import OrderedDict
 from collections.abc import Awaitable, Coroutine
 from dataclasses import dataclass, field, replace
@@ -69,6 +92,29 @@ ConnectHandler = Callable[[], Union[Awaitable[None], None]]
 DisconnectHandler = Callable[[dict[str, Any]], Union[Awaitable[None], None]]
 """Handler fired on every close. Receives ``{code, reason, was_clean}``."""
 
+RealtimeState = Literal["idle", "connecting", "ready", "backoff", "blocked", "stopped"]
+"""Where :class:`RealtimeClient` is in its connection lifecycle. Same names
+as the TypeScript SDK.
+
+``idle``
+    No socket and nothing scheduled: before the first
+    :meth:`RealtimeClient.connect`, or after a close with ``reconnect=False``.
+``connecting``
+    The transport is opening, or open with HELLO sent and ``hello.ok``
+    awaited under the handshake watchdog.
+``ready``
+    ``hello.ok`` received; frames flow and the liveness watchdog runs.
+``backoff``
+    The socket closed or failed to open for a transient reason; a jittered
+    exponential backoff timer is pending. There is no attempt cap.
+``blocked``
+    The server rejected the credential during the handshake
+    (:attr:`RealtimeClient.blocked_reason` says how); a fresh HELLO is
+    retried every 10-15 minutes until one is accepted.
+``stopped``
+    :meth:`RealtimeClient.disconnect` ran. The only terminal state.
+"""
+
 GapReason = Literal[
     "gap_filled",
     "gap_fill_failed",
@@ -100,6 +146,28 @@ SequenceGapHandler = Callable[[SequenceGapInfo], Union[Awaitable[None], None]]
 # paths. At-least-once delivery makes duplicates a design feature; 2048 ids
 # comfortably covers a reconnect/drain burst without unbounded growth.
 _DEFAULT_DEDUP_CACHE_SIZE = 2048
+
+# Handshake deadline: socket open → ``hello.ok``. The server runs its own
+# 5 s HELLO timer and closes a slow handshake with 1008 'HELLO frame
+# required'; that close is transient (see _is_auth_rejection_close), so there
+# is no need to beat it. This watchdog covers a server that neither answers
+# nor closes. A trip closes the socket as client-initiated: normal backoff.
+_DEFAULT_HANDSHAKE_TIMEOUT_MS = 15_000
+
+# Liveness deadline for a ready socket: this long without any inbound frame,
+# the client probes with a ping; a pong within _LIVENESS_PROBE_TIMEOUT_S
+# counts as liveness, anything else trips the watchdog (client-initiated
+# close → normal backoff). The ``websockets`` library answers the server's
+# pings and runs its own keepalive (every 20 s, see _keepalive_kwargs)
+# without exposing either, so inbound frames plus an explicit probe are what
+# we can count. 100 s is more than two server heartbeat cycles (the server
+# pings every 45 s with a 30 s pong deadline, starting after hello.ok). With
+# the real ``websockets`` connection its keepalive trips first on a dead
+# path (20 s + 20 s) and surfaces as a close code 1011/1006 that takes the
+# ordinary backoff; this watchdog is the backstop for a socket that keeps
+# answering pings at the transport yet delivers nothing, and for injected
+# transports without a keepalive.
+_DEFAULT_LIVENESS_TIMEOUT_MS = 100_000
 
 
 def _keepalive_kwargs(connect_fn: Any) -> dict[str, float]:
@@ -146,13 +214,30 @@ class RealtimeOptions:
     reconnect: bool = True
     reconnect_interval_ms: int = 500
     max_reconnect_interval_ms: int = 30_000
-    max_reconnect_attempts: int | None = None  # None → no limit
+    """Cap on the backoff between reconnects. After
+    ``_LONG_OUTAGE_AFTER_ATTEMPTS`` consecutive failures the cap widens to at
+    least five minutes; the client keeps retrying either way."""
+    max_reconnect_attempts: int | None = None
+    """Deprecated and ignored: the client never stops reconnecting on its
+    own (only :meth:`RealtimeClient.disconnect` ends it). Passing a value
+    emits a :class:`DeprecationWarning`. Kept so existing calls still
+    construct."""
     client: AsyncAgentChatClient | None = None
     on_sequence_gap: SequenceGapHandler | None = None
     auto_drain_on_connect: bool | None = None  # None → True iff client set
     dedup_cache_size: int = _DEFAULT_DEDUP_CACHE_SIZE
     """Bound on the message-id dedup LRU (live + drain). ``0`` disables dedup."""
     client_identity: AgentChatClientIdentity = DEFAULT_CLIENT_IDENTITY
+    handshake_timeout_ms: int = _DEFAULT_HANDSHAKE_TIMEOUT_MS
+    """Socket open → ``hello.ok`` deadline. A trip is a client-initiated
+    close: normal backoff, never ``blocked``."""
+    liveness_timeout_ms: int | None = None
+    """How long a ready socket may go without an inbound frame before the
+    client probes it with a ping (a pong within 10 s keeps it). ``None``
+    (default) means 100 s on a socket that exposes ``ping()`` — the
+    ``websockets`` connection does — and no watchdog on one that does not,
+    since frames alone cannot tell a quiet conversation from a dead peer.
+    ``0`` disables it. An explicit value arms it on any socket."""
     ack_on_receipt: bool = False
     """Acknowledge each ``message.new`` the moment its frame is parsed,
     before any handler runs. This is the integration setting: "delivered"
@@ -177,9 +262,18 @@ class RealtimeOptions:
 
 # ───────────────────────── Internal constants ─────────────────────────
 
-# Client-side ceiling on the HELLO ack wait. Must stay below the server
-# HELLO_TIMEOUT_MS (5s) so our reconnect kicks in first.
-_HELLO_ACK_TIMEOUT_S = 4.0
+# How long the liveness probe waits for its pong.
+_LIVENESS_PROBE_TIMEOUT_S = 10.0
+
+# The code on every close this client initiates (watchdogs, a HELLO it could
+# not send). Private-use range, so server telemetry can tell our closes from
+# the standard codes; the reason says which watchdog.
+_CLIENT_CLOSE_CODE = 4000
+
+# Events the client raises itself through ``on()``. A server frame that
+# happens to carry one of these types is dropped, never dispatched as if it
+# were ours.
+_LOCAL_EVENTS = frozenset({"state", "blocked", "stopped"})
 
 # How long a connection must SURVIVE before we call it healthy and clear
 # the reconnect backoff.
@@ -194,9 +288,10 @@ _HELLO_ACK_TIMEOUT_S = 4.0
 # one agent, delivering zero messages, while six sibling agents on the same
 # host held single connections the whole time.
 #
-# 30s is comfortably longer than any handshake-adjacent failure (HELLO ack
-# is 4s, the server's own heartbeat cycle is 45s) and short enough that a
-# genuinely healthy client clears its counter well before a second blip.
+# 30s is comfortably longer than any handshake-adjacent failure (the
+# handshake deadline is 15s, the server's own heartbeat cycle is 45s) and
+# short enough that a genuinely healthy client clears its counter well
+# before a second blip.
 _STABLE_CONNECTION_S = 30.0
 
 # Reconnects within this window are "rapid" for the purposes of the
@@ -232,11 +327,78 @@ _SYNC_PAGE_SIZE = 100
 # locally (a ``hello.ok`` without ``capabilities`` means legacy server).
 _CLIENT_CAPABILITIES = ("ack",)
 
-# Close codes after which reconnecting is pointless: the server rejected
-# this credential/session, not this connection. 1008 is the standard
-# policy-violation code used for auth rejects; 4401/4403 are the
-# application-level unauthorized/forbidden codes.
-_AUTH_TERMINAL_CLOSE_CODES = frozenset({1008, 4401, 4403})
+# After this many consecutive failed attempts (about half an hour at the
+# default 30 s cap) the outage is long: one error line is logged for the
+# operator and the backoff cap widens to _LONG_OUTAGE_MAX_INTERVAL_MS.
+# Retrying continues until the server is back — a deploy, a DNS outage or a
+# laptop closed overnight is not a reason to stay dead afterwards.
+_LONG_OUTAGE_AFTER_ATTEMPTS = 60
+_LONG_OUTAGE_MAX_INTERVAL_MS = 5 * 60_000
+
+# Backoff jitter: up to 25 % BELOW each step, so a fleet that drops at the
+# same instant re-enters the connect queue spread across ms * [0.75, 1.0]
+# and the caps (30 s, then 5 min) are true ceilings.
+_BACKOFF_JITTER = 0.25
+
+# After the server rejects the key, retry a fresh HELLO at this cadence
+# (±_AUTH_RETRY_JITTER: 10-15 min). A rejected key is not a dead end: keys
+# get rotated back, suspended accounts get reinstated, and a server-side
+# lookup failure during HELLO presents as a reject too.
+_AUTH_RETRY_INTERVAL_MS = 750_000
+_AUTH_RETRY_JITTER = 0.2
+
+# Close codes that mean "the server rejected this session" when the SERVER
+# sends them during the handshake. 4401/4403 are unambiguous (the server
+# today sends only 1008; the application codes are honoured if they ever
+# appear). 1008 (policy
+# violation) is not: the AgentChat server closes a rejected HELLO with
+# 1008 'Invalid token', but also uses 1008 for a handshake that was merely
+# too slow ('HELLO frame required', from its own 5 s timer) — which a slow
+# key lookup or one slow network leg produces with a perfectly good key —
+# and for evicting a live socket after key rotation, suspension or sign-out.
+# So 1008 counts as a rejection only with the server's auth reason; any
+# other 1008 takes the normal backoff. A close this client initiated itself
+# never counts (see ``_close_initiated_locally``), and these codes after
+# ``hello.ok`` are an eviction: the next HELLO is the evidence, so they take
+# the normal reconnect path too.
+_UNAMBIGUOUS_AUTH_CLOSE_CODES = frozenset({4401, 4403})
+_AMBIGUOUS_AUTH_CLOSE_CODE = 1008
+_SERVER_AUTH_CLOSE_REASONS = ("invalid token",)
+
+
+def _is_auth_rejection_close(code: int, reason: str) -> bool:
+    """True iff a server-originated close with this code and reason, received
+    during the handshake, means the key was rejected. Pure."""
+    if code in _UNAMBIGUOUS_AUTH_CLOSE_CODES:
+        return True
+    if code != _AMBIGUOUS_AUTH_CLOSE_CODE:
+        return False
+    lower = reason.lower()
+    return any(known in lower for known in _SERVER_AUTH_CLOSE_REASONS)
+
+
+def _jittered_ms(ms: int, ratio: float) -> int:
+    """``ms`` scaled by a uniform factor in ``[1 - ratio, 1 + ratio]``: a
+    range around ``ms`` (the blocked retry's 10-15 min), not a cap."""
+    factor = 1.0 - ratio + random.random() * 2.0 * ratio
+    return max(0, int(ms * factor))
+
+
+def _jittered_below_ms(ms: int, ratio: float) -> int:
+    """``ms`` scaled by a uniform factor in ``[1 - ratio, 1]``: ``ms`` stays
+    a true ceiling (the reconnect backoff and its caps)."""
+    factor = 1.0 - random.random() * ratio
+    return max(0, int(ms * factor))
+
+
+async def _default_sleep(delay_s: float) -> None:
+    await asyncio.sleep(delay_s)
+
+
+def _consume_future(future: asyncio.Future[Any]) -> None:
+    """Retrieve a future's outcome so an unawaited failure is not logged."""
+    if not future.cancelled():
+        future.exception()
 
 
 _Routed = Literal["delivered", "duplicate", "buffered"]
@@ -337,6 +499,8 @@ class RealtimeClient:
         auto_drain_on_connect: bool | None = None,
         dedup_cache_size: int | None = None,
         client_identity: AgentChatClientIdentity | None = None,
+        handshake_timeout_ms: int | None = None,
+        liveness_timeout_ms: int | None = None,
         ack_on_receipt: bool | None = None,
         websocket_connect: Callable[..., Awaitable[Any]] | None = None,
     ) -> None:
@@ -365,6 +529,12 @@ class RealtimeClient:
                     else _DEFAULT_DEDUP_CACHE_SIZE
                 ),
                 client_identity=client_identity or DEFAULT_CLIENT_IDENTITY,
+                handshake_timeout_ms=(
+                    handshake_timeout_ms
+                    if handshake_timeout_ms is not None
+                    else _DEFAULT_HANDSHAKE_TIMEOUT_MS
+                ),
+                liveness_timeout_ms=liveness_timeout_ms,
                 ack_on_receipt=bool(ack_on_receipt),
             )
 
@@ -374,32 +544,60 @@ class RealtimeClient:
         options = replace(options)
         if options.auto_drain_on_connect is None:
             options.auto_drain_on_connect = options.client is not None
+        if options.handshake_timeout_ms <= 0:
+            # A zero deadline would open and close sockets in a loop; a
+            # non-positive value means the default, as in the TypeScript SDK.
+            options.handshake_timeout_ms = _DEFAULT_HANDSHAKE_TIMEOUT_MS
+        if options.max_reconnect_attempts is not None:
+            warnings.warn(
+                "RealtimeClient ignores max_reconnect_attempts: the client never"
+                " stops reconnecting on its own; call disconnect() to end it.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
 
         self._opts = options
         self._websocket_connect = websocket_connect
 
         self._ws: Any = None
         self._recv_task: asyncio.Task[None] | None = None
+        # One slot for both timers: the backoff before a reconnect and the
+        # slow retry while blocked. Never both at once.
         self._reconnect_task: asyncio.Task[None] | None = None
-        self._hello_ack_task: asyncio.Task[None] | None = None
+        self._handshake_task: asyncio.Task[None] | None = None
+        self._liveness_task: asyncio.Task[None] | None = None
         self._stability_task: asyncio.Task[None] | None = None
         self._bg_tasks: set[asyncio.Task[Any]] = set()
+        self._state: RealtimeState = "idle"
+        self._connecting = False
         self._reconnect_attempts = 0
         # Consecutive connections that failed to reach _STABLE_CONNECTION_S.
         # Drives the operator-facing instability warning only; the backoff
         # itself is governed by _reconnect_attempts.
         self._rapid_reconnects = 0
         self._last_connect_monotonic: float | None = None
+        self._last_inbound_monotonic = 0.0
         self._authenticated = False
         self._disposed = False
         self._order_states: dict[str, _OrderState] = {}
         # Delivery-ack mode: on only when THIS connection's hello.ok echoed
         # the `ack` capability. Reset on every connect/close.
-        self._ack_mode = False
-        # Set by the HELLO watchdog before it closes the socket, so the
-        # recv loop can tell our own 1008 self-close (transient handshake
-        # timeout → keep reconnecting) from a server-sent auth-terminal one.
-        self._watchdog_closed_socket = False
+        self._ack_negotiated = False
+        # Set by _close_socket before it closes the current socket, read and
+        # cleared by the recv loop's close handling. A close this client
+        # asked for says nothing about the server, whatever code travelled
+        # with it.
+        self._close_initiated_locally = False
+        # The last auth rejection, as "<code> <reason>", until a hello.ok
+        # clears it. Survives a transport failure during the slow retry.
+        self._blocked_reason: str | None = None
+        # One error line per long outage / per run of rejected keys, then
+        # debug.
+        self._long_outage_announced = False
+        self._blocked_announced = False
+        # The wait used by the reconnect and blocked-retry timers. Tests swap
+        # it for a controllable clock; everything else sleeps for real.
+        self._sleep: Callable[[float], Awaitable[None]] = _default_sleep
         # Message-id dedup shared by the live and drain paths. Survives
         # reconnects deliberately: redelivery across connections is exactly
         # the duplicate source it exists to absorb.
@@ -436,30 +634,66 @@ class RealtimeClient:
         Returns once the HELLO has been transmitted — NOT after
         ``hello.ok``. Register :meth:`on_connect` to react to a fully
         authenticated session. Raises :class:`ConnectionError` if the
-        socket fails to open or the ``websockets`` package is missing.
+        socket fails to open or the ``websockets`` package is missing; a
+        failed open also schedules the normal reconnect.
+
+        A no-op while an attempt is in flight or a socket is live. A pending
+        backoff or blocked-retry timer is cancelled and the attempt made now,
+        so a caller that has just rotated its key does not wait out the slow
+        retry. Callable from inside ``on_disconnect``, ``on_error`` and
+        ``on("state")``: the closed socket is already gone by then, so a
+        caller running its own reconnects (``reconnect=False``) may reopen
+        from there.
         """
         if self._disposed:
             raise _RealtimeConnectionError(
                 "RealtimeClient has been disposed; create a new instance to reconnect."
             )
+        recv_task = self._recv_task
+        recv_alive = (
+            recv_task is not None
+            and not recv_task.done()
+            # The recv loop's own close handling (handlers run inside its
+            # ``finally``) is not a live socket.
+            and recv_task is not asyncio.current_task()
+        )
+        if self._connecting or self._ws is not None or recv_alive:
+            _log.debug("connect() ignored: an attempt or a live socket exists")
+            return
+        pending = self._reconnect_task
+        if pending is not None and pending is not asyncio.current_task() and not pending.done():
+            pending.cancel()
+        self._reconnect_task = None
 
         connect_fn = self._resolve_connect_fn()
 
         url = f"{self._opts.base_url}/v1/ws"
+        self._connecting = True
+        await self._set_state("connecting")
         try:
-            self._ws = await connect_fn(url, **_keepalive_kwargs(connect_fn))
+            ws = await connect_fn(url, **_keepalive_kwargs(connect_fn))
         except Exception as err:
+            self._connecting = False
             error = _RealtimeConnectionError(f"WebSocket connection failed: {err}")
             await self._emit_error(error)
-            self._schedule_reconnect()
+            await self._schedule_reconnect()
             raise error from err
+        finally:
+            self._connecting = False
 
+        if self._disposed:
+            # disconnect() ran while the transport was opening.
+            with contextlib.suppress(Exception):
+                await ws.close(code=1000, reason="client stopped")
+            return
+
+        self._ws = ws
         self._authenticated = False
-        self._ack_mode = False
-        self._watchdog_closed_socket = False
+        self._ack_negotiated = False
+        self._close_initiated_locally = False
 
         try:
-            await self._ws.send(
+            await ws.send(
                 json.dumps(
                     {
                         "type": "hello",
@@ -479,12 +713,17 @@ class RealtimeClient:
                 )
             )
         except Exception as err:
+            # A socket we cannot write HELLO to is useless; drop it as our
+            # own close and take the normal backoff rather than sit on it.
             await self._emit_error(
                 _RealtimeConnectionError(f"HELLO send failed: {err}")
             )
+            self._ws = None
+            await self._close_socket(ws, _CLIENT_CLOSE_CODE, "client HELLO send failed")
+            await self._schedule_reconnect()
             return
 
-        self._hello_ack_task = asyncio.create_task(self._hello_ack_watchdog())
+        self._handshake_task = asyncio.create_task(self._handshake_watchdog(ws))
         self._recv_task = asyncio.create_task(self._recv_loop())
 
     def _resolve_connect_fn(self) -> Callable[..., Awaitable[Any]]:
@@ -527,6 +766,7 @@ class RealtimeClient:
                 return
             self._reconnect_attempts = 0
             self._rapid_reconnects = 0
+            self._long_outage_announced = False
             self._stability_task = None
 
         try:
@@ -568,22 +808,124 @@ class RealtimeClient:
                 self._opts.max_reconnect_interval_ms / 1000.0,
             )
 
-    async def _hello_ack_watchdog(self) -> None:
+    # ─── Watchdogs ───────────────────────────────────────────────────
+
+    async def _close_socket(self, ws: Any, code: int, reason: str) -> None:
+        """Close ``ws`` as a client-initiated close.
+
+        The flag is set before the close so the recv loop, which may see
+        the close before this coroutine resumes, never reads our own code
+        as a verdict from the server (rule 2).
+        """
+        self._close_initiated_locally = True
+        with contextlib.suppress(Exception):
+            await ws.close(code=code, reason=reason)
+
+    async def _handshake_watchdog(self, ws: Any) -> None:
+        """Bound socket-open → ``hello.ok``. A trip is our close: backoff."""
+        timeout_ms = self._opts.handshake_timeout_ms
         try:
-            await asyncio.sleep(_HELLO_ACK_TIMEOUT_S)
+            await asyncio.sleep(timeout_ms / 1000.0)
         except asyncio.CancelledError:
             return
-        if self._authenticated or self._disposed:
+        if self._authenticated or self._disposed or self._ws is not ws:
             return
-        await self._emit_error(_RealtimeConnectionError("HELLO ack timeout"))
-        ws = self._ws
-        if ws is not None:
-            # Mark the close as self-inflicted: 1008 is also an
-            # auth-terminal code when the SERVER sends it, but a handshake
-            # timeout is transient and must keep the reconnect loop alive.
-            self._watchdog_closed_socket = True
-            with contextlib.suppress(Exception):
-                await ws.close(code=1008, reason="HELLO ack timeout")
+        await self._emit_error(
+            _RealtimeConnectionError(f"handshake timeout: no hello.ok within {timeout_ms}ms")
+        )
+        # Spawned, not awaited: the recv loop cancels this task as part of
+        # the close, and a cancelled close could leave the socket half shut.
+        self._close_initiated_locally = True
+        self._spawn(self._close_socket(ws, _CLIENT_CLOSE_CODE, "client handshake timeout"))
+
+    def _liveness_timeout_ms(self, ws: Any) -> int:
+        """The liveness deadline for ``ws``; ``0`` means no watchdog."""
+        configured = self._opts.liveness_timeout_ms
+        if configured is not None:
+            return max(0, configured)
+        if callable(getattr(ws, "ping", None)):
+            return _DEFAULT_LIVENESS_TIMEOUT_MS
+        # Nothing to probe with: inbound frames alone cannot separate a quiet
+        # conversation from a dead peer, so do not guess.
+        _log.debug("liveness watchdog not armed: the socket exposes no ping()")
+        return 0
+
+    def _start_liveness_watchdog(self, ws: Any) -> None:
+        self._cancel_liveness_watchdog()
+        timeout_ms = self._liveness_timeout_ms(ws)
+        if timeout_ms <= 0:
+            return
+        self._last_inbound_monotonic = time.monotonic()
+        self._liveness_task = asyncio.create_task(self._liveness_watchdog(ws, timeout_ms))
+
+    def _cancel_liveness_watchdog(self) -> None:
+        if self._liveness_task is not None:
+            self._liveness_task.cancel()
+            self._liveness_task = None
+
+    async def _liveness_watchdog(self, ws: Any, timeout_ms: int) -> None:
+        """Trip when ``timeout_ms`` passes with no inbound frame and the peer
+        does not answer a ping either. A trip is our close: backoff."""
+        timeout_s = timeout_ms / 1000.0
+        try:
+            while not self._disposed and self._ws is ws:
+                remaining = timeout_s - (time.monotonic() - self._last_inbound_monotonic)
+                if remaining > 0:
+                    await asyncio.sleep(remaining)
+                    continue
+                if await self._probe_liveness(ws):
+                    self._last_inbound_monotonic = time.monotonic()
+                    continue
+                if self._disposed or self._ws is not ws:
+                    return
+                await self._emit_error(
+                    _RealtimeConnectionError(
+                        f"liveness timeout: nothing received for {timeout_ms}ms"
+                    )
+                )
+                self._close_initiated_locally = True
+                self._spawn(self._close_socket(ws, _CLIENT_CLOSE_CODE, "client liveness timeout"))
+                return
+        except asyncio.CancelledError:
+            return
+
+    async def _probe_liveness(self, ws: Any) -> bool:
+        """Send a ping; ``True`` iff a pong arrives in ``_LIVENESS_PROBE_TIMEOUT_S``.
+
+        ``websockets`` (both implementations) returns an awaitable that
+        resolves on the matching pong. Its future is never cancelled from
+        here — the library settles it on pong or on close — only left
+        behind with its outcome consumed. A socket without ``ping()`` (an
+        explicit ``liveness_timeout_ms`` armed the watchdog anyway) counts
+        inbound frames alone.
+        """
+        ping = getattr(ws, "ping", None)
+        if not callable(ping):
+            return False
+        try:
+            waiter = await ping()
+        except Exception:
+            return False
+        if not inspect.isawaitable(waiter):
+            # A transport whose ping() gives no pong signal cannot be probed;
+            # treat the successful send as the best evidence available.
+            return True
+        future = asyncio.ensure_future(waiter)
+        done, _ = await asyncio.wait({future}, timeout=_LIVENESS_PROBE_TIMEOUT_S)
+        if future in done:
+            return not future.cancelled() and future.exception() is None
+        future.add_done_callback(_consume_future)
+        return False
+
+    async def _set_state(self, state: RealtimeState) -> None:
+        """Record a transition and raise ``on("state")`` for it."""
+        previous = self._state
+        if state == previous:
+            return
+        _log.debug("realtime state %s -> %s", previous, state)
+        self._state = state
+        if self._handlers.get("state"):
+            await self._dispatch({"type": "state", "state": state, "previous": previous})
 
     async def _recv_loop(self) -> None:
         ws = self._ws
@@ -591,6 +933,7 @@ class RealtimeClient:
             return
         try:
             async for raw in ws:
+                self._last_inbound_monotonic = time.monotonic()
                 try:
                     message = json.loads(raw)
                 except (ValueError, TypeError):
@@ -612,10 +955,21 @@ class RealtimeClient:
                         # capabilities list is a legacy server → stay in
                         # mark-on-send semantics and send no ack frames.
                         caps = message.get("capabilities")
-                        self._ack_mode = isinstance(caps, list) and "ack" in caps
-                        if self._hello_ack_task is not None:
-                            self._hello_ack_task.cancel()
-                            self._hello_ack_task = None
+                        self._ack_negotiated = isinstance(caps, list) and "ack" in caps
+                        if self._handshake_task is not None:
+                            self._handshake_task.cancel()
+                            self._handshake_task = None
+                        # A hello.ok is the proof that the key is accepted:
+                        # whatever rejection came before is over.
+                        if self._blocked_reason is not None:
+                            _log.info(
+                                "AgentChat realtime: key accepted again, blocked cleared (was %s)",
+                                self._blocked_reason,
+                            )
+                        self._blocked_reason = None
+                        self._blocked_announced = False
+                        await self._set_state("ready")
+                        self._start_liveness_watchdog(ws)
                         await self._emit_connect()
                         if (
                             self._opts.auto_drain_on_connect
@@ -649,6 +1003,10 @@ class RealtimeClient:
                     await self._dispatch_wake(message)
                     continue
 
+                if frame_type in _LOCAL_EVENTS:
+                    _log.debug("dropping server frame typed like a local event: %s", frame_type)
+                    continue
+
                 await self._dispatch(message)
         except asyncio.CancelledError:
             raise
@@ -666,23 +1024,36 @@ class RealtimeClient:
                     close_code = code_attr
                 if isinstance(reason_attr, str):
                     close_reason = reason_attr
+            # Read both BEFORE anything below resets them: only a close the
+            # server sent, before hello.ok, can be a rejection.
+            ours = self._close_initiated_locally
+            self._close_initiated_locally = False
+            handshake_done = self._authenticated
 
-            if self._hello_ack_task is not None:
-                self._hello_ack_task.cancel()
-                self._hello_ack_task = None
+            if self._handshake_task is not None:
+                self._handshake_task.cancel()
+                self._handshake_task = None
+            self._cancel_liveness_watchdog()
             # Cancel BEFORE clearing _authenticated: a connection that dies
             # young must not clear the backoff counter, which is the whole
             # point of the stability window.
             self._cancel_stability_timer()
             self._note_connection_ended()
             self._authenticated = False
-            self._ack_mode = False
+            self._ack_negotiated = False
+            if self._ws is ws:
+                self._ws = None
 
             await self._emit_disconnect(
                 {
                     "code": close_code,
                     "reason": close_reason,
                     "was_clean": close_code == 1000,
+                    # Who ended the socket. "client" is this client's own
+                    # watchdog or stop: such a close says nothing about the
+                    # server. "server" arrived on the wire: the server, a
+                    # proxy, or the network.
+                    "initiator": "client" if ours else "server",
                 }
             )
 
@@ -697,26 +1068,27 @@ class RealtimeClient:
                 await self._flush_parked_frames("connection_closed")
             self._reset_order_states()
             if not self._disposed:
+                _log.debug(
+                    "realtime socket closed (code=%s reason=%r ours=%s handshake_done=%s)",
+                    close_code,
+                    close_reason,
+                    ours,
+                    handshake_done,
+                )
                 if (
-                    close_code in _AUTH_TERMINAL_CLOSE_CODES
-                    and not self._watchdog_closed_socket
+                    not ours
+                    and not handshake_done
+                    and _is_auth_rejection_close(close_code, close_reason)
                 ):
-                    # The server rejected the session itself (bad/revoked
-                    # key, forbidden account state) — retrying the same
-                    # credential forever is a reconnect storm, not
-                    # resilience. Surface a terminal error and stop; a
-                    # deliberate `connect()` after fixing the credential
-                    # still works.
-                    await self._emit_error(
-                        _RealtimeConnectionError(
-                            f"WebSocket closed with auth-terminal code {close_code}"
-                            f" ({close_reason or 'no reason given'}); reconnect"
-                            " disabled — fix the API key or account state and"
-                            " reconnect explicitly."
-                        )
-                    )
+                    # The server rejected the key during the handshake. Not
+                    # the end: keys get rotated back and accounts reinstated,
+                    # so retry slowly rather than storm or die (rule 4).
+                    await self._enter_blocked(close_code, close_reason)
                 else:
-                    self._schedule_reconnect()
+                    # Our own close, a transport drop, a slow handshake the
+                    # server timed out, or an eviction after hello.ok: the
+                    # next HELLO is the evidence (rules 2 and 3).
+                    await self._schedule_reconnect()
 
     # ─── Offline drain ───────────────────────────────────────────────
 
@@ -880,22 +1252,97 @@ class RealtimeClient:
 
     # ─── Reconnect ───────────────────────────────────────────────────
 
-    def _schedule_reconnect(self) -> None:
-        if self._disposed or not self._opts.reconnect:
+    async def _schedule_reconnect(self) -> None:
+        """Arm the normal backoff. No attempt cap: the client never gives up
+        on its own (rule 1)."""
+        if self._disposed:
             return
-        max_attempts = self._opts.max_reconnect_attempts
-        if max_attempts is not None and self._reconnect_attempts >= max_attempts:
+        if self._connecting or self._ws is not None:
+            # A handler (on_disconnect, on_error) already called connect()
+            # for this close; the new attempt owns what happens next.
+            return
+        if not self._opts.reconnect:
+            # The caller runs reconnects itself; a blocked verdict stays
+            # visible so its logic can see it.
+            if self._state != "blocked":
+                await self._set_state("idle")
             return
         if self._reconnect_task is not None and not self._reconnect_task.done():
             return
 
         self._reconnect_attempts += 1
-        delay_s = self._compute_reconnect_delay_ms(self._reconnect_attempts) / 1000.0
+        attempt = self._reconnect_attempts
+        if attempt > _LONG_OUTAGE_AFTER_ATTEMPTS and not self._long_outage_announced:
+            # Once per outage, at error level: the operator should know the
+            # server has been unreachable this long. Retrying goes on.
+            self._long_outage_announced = True
+            _log.error(
+                "AgentChat realtime: still reconnecting after %d consecutive"
+                " failures; backing off up to %.0fs between attempts and not"
+                " giving up. The server is unreachable from here, or every"
+                " connection dies before it is stable.",
+                _LONG_OUTAGE_AFTER_ATTEMPTS,
+                max(self._opts.max_reconnect_interval_ms, _LONG_OUTAGE_MAX_INTERVAL_MS) / 1000.0,
+            )
+        delay_s = self._compute_reconnect_delay_ms(attempt) / 1000.0
+        _log.debug("realtime reconnect %d scheduled in %.1fs", attempt, delay_s)
+        await self._set_state("backoff")
+        if self._disposed or self._connecting or self._ws is not None:
+            # A state handler stopped the client, or reconnected it itself.
+            return
         self._reconnect_task = asyncio.create_task(self._reconnect_after(delay_s))
+
+    async def _enter_blocked(self, code: int, reason: str) -> None:
+        """The server rejected the key during the handshake.
+
+        Records the verdict, tells the operator and ``on_error`` once per
+        blocked run (later rejections of the same run log at debug), fires
+        ``on("blocked")`` for every rejection, and arms the slow retry. A
+        ``hello.ok`` clears it; :meth:`disconnect` ends it.
+        """
+        detail = reason or "no reason given"
+        self._blocked_reason = f"{code} {reason}".strip()
+        retry_ms: int | None = None
+        if self._opts.reconnect:
+            retry_ms = self._compute_auth_retry_delay_ms()
+        first_of_run = not self._blocked_announced
+        self._blocked_announced = True
+        log = _log.error if first_of_run else _log.debug
+        log(
+            "AgentChat realtime: the server rejected this API key (close %d %s);"
+            " blocked, retrying a fresh HELLO %s until it is accepted again."
+            " Check the key and the account state; disconnect() stops the retry.",
+            code,
+            detail,
+            f"in ~{retry_ms // 60_000} min" if retry_ms is not None else "when connect() is called",
+        )
+        await self._set_state("blocked")
+        if first_of_run:
+            await self._emit_error(
+                _RealtimeConnectionError(
+                    f"WebSocket closed with auth rejection {code} ({detail}); blocked —"
+                    + (
+                        f" retrying a fresh HELLO in ~{retry_ms // 60_000} min"
+                        if retry_ms is not None
+                        else " reconnect is off, call connect() to retry"
+                    )
+                    + " until the key is accepted again; disconnect() stops it."
+                )
+            )
+        # The server's reason as sent (empty when it sent none).
+        await self._dispatch(
+            {"type": "blocked", "code": code, "reason": reason, "retry_in_ms": retry_ms}
+        )
+        if self._disposed or retry_ms is None or self._connecting or self._ws is not None:
+            return
+        pending = self._reconnect_task
+        if pending is not None and pending is not asyncio.current_task() and not pending.done():
+            pending.cancel()
+        self._reconnect_task = asyncio.create_task(self._reconnect_after(retry_ms / 1000.0))
 
     async def _reconnect_after(self, delay_s: float) -> None:
         try:
-            await asyncio.sleep(delay_s)
+            await self._sleep(delay_s)
         except asyncio.CancelledError:
             return
         self._reconnect_task = None
@@ -904,18 +1351,23 @@ class RealtimeClient:
         try:
             await self.connect()
         except Exception as err:
-            await self._emit_error(
-                err
-                if isinstance(err, _RealtimeConnectionError)
-                else _RealtimeConnectionError(str(err))
-            )
+            # connect() already emitted and rescheduled; a repeat here would
+            # double the error for the same failure.
+            _log.debug("realtime reconnect attempt failed: %s", err)
 
     def _compute_reconnect_delay_ms(self, attempt: int) -> int:
-        exp = self._opts.reconnect_interval_ms * (2 ** min(attempt - 1, 10))
-        capped = min(exp, self._opts.max_reconnect_interval_ms)
-        # ±25% jitter defeats thundering-herd reconnect.
-        jitter = 0.75 + random.random() * 0.5
-        return max(0, int(capped * jitter))
+        """Exponential from ``reconnect_interval_ms``, capped at
+        ``max_reconnect_interval_ms`` — or at least five minutes once the
+        outage is long — then jittered up to 25 % below, so the cap holds."""
+        exp = self._opts.reconnect_interval_ms * (2 ** min(attempt - 1, 20))
+        cap = self._opts.max_reconnect_interval_ms
+        if attempt > _LONG_OUTAGE_AFTER_ATTEMPTS:
+            cap = max(cap, _LONG_OUTAGE_MAX_INTERVAL_MS)
+        return _jittered_below_ms(min(exp, cap), _BACKOFF_JITTER)
+
+    def _compute_auth_retry_delay_ms(self) -> int:
+        """The blocked cadence: 12.5 min ±20 % → 10-15 min."""
+        return _jittered_ms(_AUTH_RETRY_INTERVAL_MS, _AUTH_RETRY_JITTER)
 
     # ─── Handler registration ────────────────────────────────────────
 
@@ -925,6 +1377,22 @@ class RealtimeClient:
         ``on("wake", handler)`` receives a validated ``wake`` frame
         (``payload`` parses as :class:`~agentchatme.types.WakePayload`):
         a content-free "check AgentChat" signal that is never acknowledged.
+
+        Three events are raised by the client itself, in the same shape (a
+        server frame carrying one of these types is dropped, never dispatched):
+
+        ``on("state", handler)``
+            Every transition of :attr:`state`. Receives
+            ``{"type": "state", "state": RealtimeState, "previous": RealtimeState}``.
+        ``on("blocked", handler)``
+            The server rejected the key during the handshake. Receives
+            ``{"type": "blocked", "code": int, "reason": str,
+            "retry_in_ms": int | None}``; ``retry_in_ms`` is the slow retry
+            now armed (``None`` with ``reconnect=False``). Fires once per
+            rejection, so once per 10-15 min while the key stays rejected.
+        ``on("stopped", handler)``
+            :meth:`disconnect` ran; receives ``{"type": "stopped"}``. The
+            last event this instance ever raises.
         """
         handlers = self._handlers.setdefault(event, set())
         handlers.add(handler)
@@ -967,27 +1435,56 @@ class RealtimeClient:
     def is_connected(self) -> bool:
         return bool(self._authenticated and self._ws is not None)
 
+    @property
+    def state(self) -> RealtimeState:
+        """Where the client is in its lifecycle; see :data:`RealtimeState`."""
+        return self._state
+
+    @property
+    def blocked_reason(self) -> str | None:
+        """The last auth rejection as ``"<code> <reason>"`` (for example
+        ``"1008 Invalid token"``), or ``None``. Set when the client enters
+        ``blocked``; it stays set through a transport failure during the
+        slow retry and clears on the next ``hello.ok``."""
+        return self._blocked_reason
+
+    @property
+    def ack_negotiated(self) -> bool:
+        """True while the current connection's ``hello.ok`` echoed the
+        ``ack`` capability: the server keeps envelopes ``stored`` until this
+        client acknowledges them. False between connections and against a
+        legacy server (envelopes marked on push)."""
+        return self._ack_negotiated
+
     async def disconnect(self) -> None:
         """Close the socket, disable reconnect, and release every task,
-        timer and handler this instance owns.
+        timer and handler this instance owns. The only way into ``stopped``.
 
         Buffered out-of-order envelopes are flushed to handlers first (see
-        :meth:`_flush_parked_frames`), then the socket closes,
-        then every background task (reconnect, HELLO watchdog, stability
-        timer, gap timers, drain) is cancelled **and awaited**, so nothing
-        of this instance survives in the loop. After this, :meth:`connect`
-        raises — create a fresh :class:`RealtimeClient` to reopen.
+        :meth:`_flush_parked_frames`), then the socket closes, then every
+        background task (backoff or blocked-retry timer, handshake and idle
+        watchdogs, stability timer, gap timers, drain) is cancelled **and
+        awaited**, so nothing of this instance survives in the loop. Fires
+        ``on("stopped")`` last. After this, :meth:`connect` raises — create
+        a fresh :class:`RealtimeClient` to reopen.
         """
         self._disposed = True
         self._opts.reconnect = False
+        await self._set_state("stopped")
 
         current = asyncio.current_task()
         owned: list[asyncio.Task[Any]] = []
-        for task in (self._reconnect_task, self._hello_ack_task, self._stability_task):
+        for task in (
+            self._reconnect_task,
+            self._handshake_task,
+            self._liveness_task,
+            self._stability_task,
+        ):
             if task is not None:
                 owned.append(task)
         self._reconnect_task = None
-        self._hello_ack_task = None
+        self._handshake_task = None
+        self._liveness_task = None
         self._stability_task = None
         for state in self._order_states.values():
             if state.gap_task is not None:
@@ -1001,8 +1498,8 @@ class RealtimeClient:
         ws = self._ws
         self._ws = None
         if ws is not None:
-            with contextlib.suppress(Exception):
-                await ws.close()
+            # Ours: on_disconnect reports initiator "client".
+            await self._close_socket(ws, 1000, "client disconnect")
 
         recv_task = self._recv_task
         self._recv_task = None
@@ -1013,7 +1510,8 @@ class RealtimeClient:
         await _release_tasks(owned, current)
 
         self._authenticated = False
-        self._ack_mode = False
+        self._ack_negotiated = False
+        await self._dispatch({"type": "stopped"})
         self._handlers.clear()
         self._error_handlers.clear()
         self._connect_handlers.clear()
@@ -1022,6 +1520,10 @@ class RealtimeClient:
     # ─── Dispatch ────────────────────────────────────────────────────
 
     async def _emit_error(self, error: BaseException) -> None:
+        # ``_invoke`` isolates each handler: a raising ``on_error`` must never
+        # break the step that follows a notice (arming a watchdog close, the
+        # backoff, the blocked retry) — that would be the one way into a
+        # parked client.
         for h in list(self._error_handlers):
             await _invoke(h, error)
 
@@ -1129,7 +1631,7 @@ class RealtimeClient:
         drain/redelivery, where the dedup cache turns it into
         skip-dispatch + re-ack. Never raises into the dispatch pipeline.
         """
-        if not self._ack_mode:
+        if not self._ack_negotiated:
             return
         ws = self._ws
         if ws is None:
@@ -1598,6 +2100,7 @@ __all__ = [
     "MessageHandler",
     "RealtimeClient",
     "RealtimeOptions",
+    "RealtimeState",
     "SequenceGapHandler",
     "SequenceGapInfo",
 ]

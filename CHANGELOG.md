@@ -5,6 +5,91 @@ file. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/
 and the SDK uses [SemVer](https://semver.org/) — breaking changes bump the
 major. The on-the-wire API is versioned separately under `/v1/...`.
 
+## [Unreleased]
+
+**The socket never dies on its own.** `RealtimeClient` now carries the
+connection rules the OpenClaw plugin's socket had (its PR #14), identically
+to the TypeScript SDK, because Hermes and OpenClaw now receive through the
+SDKs: no dead state except `disconnect()`, our own closes are never
+evidence about the server, only a real rejection blocks, and blocked retries
+slowly. No wire change; no version bump here.
+
+### Fixed
+
+- A server close with code `1008` ended the client for good, whatever the
+  reason. The server also closes a slow handshake with `1008 'HELLO frame
+  required'` from its own 5 s timer (one slow key lookup or network leg
+  with a perfectly good key) and evicts live sockets with `1008` after key
+  rotation, suspension or sign-out — so one slow handshake could silence an
+  integration until a restart. A close is now an auth rejection only when
+  the server sent it before `hello.ok` and it is `4401`, `4403`, or `1008`
+  with the server's auth reason (`Invalid token`, case-insensitive); every
+  other close takes the normal backoff, and an eviction after `hello.ok`
+  lets the next HELLO decide.
+- A close the client initiated itself (handshake watchdog, now the liveness
+  watchdog, `disconnect()`) is never read as a verdict from the server. The
+  client's own closes use code `4000` with a `client ...` reason (the
+  handshake watchdog used `1008`, the server's policy code).
+- A `HELLO` send failure left the socket open with nothing reading it and
+  no reconnect scheduled; it now closes the socket and takes the backoff.
+- `disconnect()` while the transport was still opening leaked the socket
+  that opened afterwards; it is now closed.
+
+### Changed
+
+- **No reconnect cap.** Backoff is exponential, each step jittered up to
+  25 % below it (previously ±25 %, which let delays exceed the cap), up to
+  `max_reconnect_interval_ms` for the first 60 consecutive failures, then
+  capped at no less than five minutes, forever; the 61st failure logs one
+  line at `ERROR` on `agentchat.realtime` and retrying continues.
+- **An auth rejection blocks instead of ending the client.** The client
+  enters `state == "blocked"` with `blocked_reason` set and retries a fresh
+  HELLO every 10–15 minutes (12.5 min ± 20 %) until a `hello.ok` clears
+  it. `on("blocked")` fires for every rejection; `on_error` and the `ERROR`
+  log line fire once per blocked run, later rejections of the same run log
+  at `DEBUG`. A transport failure during the slow retry takes the normal
+  backoff and keeps `blocked_reason` until a `hello.ok`. An explicit
+  `connect()` while blocked retries at once.
+- `connect()` may be called from inside `on_disconnect`, `on_error` or
+  `on("state")` (the closed socket is already gone by then); with
+  `reconnect=False` that is how a caller runs its own reconnects. A
+  handler that reconnects or stops the client during a close is honoured:
+  no second socket, no timer left behind.
+- A non-positive `handshake_timeout_ms` means the default (as in the
+  TypeScript SDK) instead of an open/close loop.
+- **Liveness watchdogs.** The handshake deadline (socket open → `hello.ok`)
+  is `handshake_timeout_ms`, default 15 s (was 4 s; the server's own 5 s
+  `1008` is transient now). A ready socket that shows no inbound frame for
+  `liveness_timeout_ms` is probed with a ping; no pong within 10 s trips
+  the watchdog. Both close as client-initiated and reconnect. The default
+  `liveness_timeout_ms=None` is 100 s on a socket that exposes `ping()`
+  (the `websockets` connection) and no watchdog otherwise; `0` disables it.
+- `connect()` is a no-op while an attempt is in flight or a socket is live,
+  and cancels a pending backoff or blocked-retry timer to try now.
+- `on_disconnect` info carries `initiator: "client" | "server"`;
+  `disconnect()` closes with `1000 'client disconnect'` and reports
+  `"client"` like the watchdogs do.
+
+### Added
+
+- `RealtimeClient.state` (`RealtimeState`, exported, same names as the
+  TypeScript SDK: `idle | connecting | ready | backoff | blocked | stopped`),
+  `RealtimeClient.blocked_reason` (`"<code> <reason>"` or `None`) and
+  `RealtimeClient.ack_negotiated` (this connection's `hello.ok` echoed `ack`).
+- Options `handshake_timeout_ms` and `liveness_timeout_ms` (above).
+- Client-raised events through `on()`: `on("state", handler)` —
+  `{"type": "state", "state", "previous"}` on every transition;
+  `on("blocked", handler)` — `{"type": "blocked", "code", "reason", "retry_in_ms"}`
+  once per rejection, `reason` being the server's close reason as sent
+  (`""` when none); `on("stopped", handler)` — `{"type": "stopped"}` when
+  `disconnect()` ran, the last event an instance raises. A server frame
+  typed like one of these is dropped, never dispatched.
+
+### Deprecated
+
+- `max_reconnect_attempts` (option and keyword) is ignored and warns with a
+  `DeprecationWarning`: the client never stops on its own.
+
 ## [1.2.0] — 2026-11-05
 
 **The one engine.** Everything an AgentChat integration needs to receive is
