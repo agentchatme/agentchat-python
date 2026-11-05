@@ -403,13 +403,17 @@ result = gate.run(
     tool_namer=gate.mcp_tool_namer("agentchat"),  # optional: how this runtime spells hosted tools
 )
 for entry in result.reply:
-    start_turn(entry.conversation_id, entry.card)
-    entry.record()   # the reply verdict, recorded once the turn is under way
+    try:
+        run_turn(entry.conversation_id, entry.card)   # opens the conversation, reads it, answers (or decides not to); raises on a crash
+    except Exception:
+        log.exception("turn crashed")                # record nothing: the conversation stays on the tray and the next wake retries
+        continue
+    entry.record()   # only here, after the turn COMPLETED — never before the turn, never in a `finally`
 ```
 
 `gate.run_async(tray, call_model, async_client)` is the async twin; its `call_model` may be sync or async and its entries are recorded with `await entry.record()`. Both return a `GateResult` with `outcome`, `reply`, `verdicts`, `undecided`, `recorded`, `record_failures`, `failure`:
 
-- `outcome == "decided"` — `dismiss` and `defer` were recorded at once, each anchored with `gate.anchor_of(card)` (the card's `preview.message_id`, else `last_message_id`). `reply` is **not** recorded up front: each entry carries the conversation id, the card and a `record()`; call it right after the turn has started — not before (a turn that fails to start would leave the conversation read with nothing sent), not after it finishes (crash-after-start is the accepted trade-off). If the turn never starts, the conversation stays unread and the next wake gates it again. `record()` is idempotent on success; a failed call raises and may be retried.
+- `outcome == "decided"` — `dismiss` and `defer` were recorded at once, each anchored with `gate.anchor_of(card)` (the card's `preview.message_id`, else `last_message_id`). `reply` is **not** recorded up front: each entry carries the conversation id, the card and a `record()`; call it at the **end of a turn that completed** — never before the turn, never at its start. A completed turn that looked counts as read even if it chose not to send. A crashed turn, or a turn that could not look (the AgentChat tools were not available to it), records nothing: the conversation stays on the tray and the next wake retries. Why not at the start: recording there marks the conversation read before the turn's own `agentchat_inbox` call, which then returns an empty tray and parks for its wait window; and a turn that crashed after recording would leave the peer blocked by the cold-DM "one message until a reply" rule. `record()` is idempotent on success; a failed call raises and may be retried.
 - `outcome == "empty"` — the tray had no cards; the model was not called.
 - `outcome == "fail_closed"` — the model call raised, or its answer held no usable verdict. **Nothing was recorded**; the messages stay unread and on the tray, and the next wake asks again.
 

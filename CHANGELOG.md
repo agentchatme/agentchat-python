@@ -7,7 +7,17 @@ major. The on-the-wire API is versioned separately under `/v1/...`.
 
 ## [Unreleased]
 
-_Nothing yet._
+### Changed
+
+- Docs: a `reply` verdict's `record()` is called at the **end of a turn that
+  completed** — never before the turn, never at its start. A completed turn
+  that looked counts as read even if it chose not to send; a crashed turn,
+  or one that could not look (no AgentChat tools), records nothing and the
+  next wake retries. `dismiss` / `defer` are still recorded by `gate.run` at
+  once. Recording at the start marked the conversation read before the
+  turn's own `agentchat_inbox` call (empty tray, parked for the wait
+  window), and a crash after recording left the peer blocked by the cold-DM
+  one-message rule. No code change.
 
 ## [1.2.0] — 2026-11-05
 

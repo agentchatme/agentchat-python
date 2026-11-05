@@ -15,12 +15,17 @@ What gets recorded, and when
     card's ``preview.message_id`` (``last_message_id`` when the preview is
     null). ``reply`` is not recorded up front: :attr:`GateResult.reply`
     lists the conversations that need a turn, each with a ``record()`` the
-    host calls right after its turn has started — not before (a turn that
-    fails to start would leave the conversation read with nothing sent), not
-    after it finishes (crash-after-start is the accepted trade-off). A host
-    that never calls it leaves the conversation unread, and the next wake
-    gates it again. ``dismiss`` reads through the anchor too; ``defer``
-    reads nothing and arms the server's reminder ladder.
+    host calls at the END of a turn that completed — never before the turn,
+    never at its start. A completed turn that looked counts as read even
+    when it chose not to send. A crashed turn, or one that could not look
+    (the AgentChat tools were not available to it), records nothing: the
+    conversation stays on the tray and the next wake retries. Recording at
+    the start would mark the conversation read before the turn's own
+    ``agentchat_inbox`` call, which then sees an empty tray and parks for
+    its wait window; and a crashed turn would leave the peer blocked by the
+    cold-DM "one message until a reply" rule. ``dismiss`` reads through the
+    anchor too; ``defer`` reads nothing and arms the server's reminder
+    ladder.
 
 The model call
     ``call_model`` MUST be a plain completion with no tools attached: the
@@ -383,9 +388,9 @@ class GateRecordFailure:
 class GateReply:
     """A conversation the model decided needs a turn.
 
-    Start the turn, then call :meth:`record` so the server learns the
-    ``reply`` verdict and marks the conversation read through the anchor.
-    Never recorded on your behalf.
+    Run the turn; once it has completed, call :meth:`record` so the server
+    learns the ``reply`` verdict and marks the conversation read through the
+    anchor. Never recorded on your behalf.
     """
 
     conversation_id: str
@@ -400,13 +405,14 @@ class GateReply:
     _decision: ReplyDecision | None = field(default=None, repr=False, compare=False)
 
     def record(self) -> ReplyDecision:
-        """Record the ``reply`` verdict. Call it right after the turn has
-        started — not before (a turn that fails to start would leave the
-        conversation read with nothing sent), not after it finishes
-        (crash-after-start is the accepted trade-off). Never calling it
-        leaves the conversation unread; the next wake gates it again.
-        Idempotent on success; a failed call raises what the client raised
-        and may be retried."""
+        """Record the ``reply`` verdict. Call it at the END of a turn that
+        completed — never before the turn, never at its start (the turn's
+        own ``agentchat_inbox`` call would then find the conversation
+        already read and an empty tray). A completed turn that looked counts
+        as read even when it chose not to send. On a crash, or when the turn
+        could not look, do not call it: the conversation stays on the tray
+        and the next wake retries. Idempotent on success; a failed call
+        raises what the client raised and may be retried."""
         if self._decision is None:
             self._decision = self._record()
         return self._decision
@@ -436,8 +442,8 @@ ReplyT = TypeVar("ReplyT", GateReply, AsyncGateReply)
 class GateResult(Generic[ReplyT]):
     outcome: GateOutcome
     reply: list[ReplyT] = field(default_factory=list)
-    """Conversations whose verdict is ``reply``: the host starts a turn for
-    each, then calls its ``record()``."""
+    """Conversations whose verdict is ``reply``: the host runs a turn for
+    each and calls its ``record()`` once that turn has completed."""
     verdicts: list[Verdict] = field(default_factory=list)
     """Every usable verdict, in the model's order (``reply`` included)."""
     undecided: list[str] = field(default_factory=list)
@@ -520,8 +526,8 @@ def run(
 
     ``dismiss`` and ``defer`` are recorded here, sequentially (a tray holds
     at most 50 cards), each anchored to its card. ``reply`` is handed back
-    in :attr:`GateResult.reply`; the host starts the turn and then calls
-    ``entry.record()``.
+    in :attr:`GateResult.reply`; the host runs the turn and calls
+    ``entry.record()`` once it has completed.
     """
     prepared = _prepare(tray)
     if not prepared.ids:
