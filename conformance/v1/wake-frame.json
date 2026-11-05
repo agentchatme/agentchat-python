@@ -1,0 +1,10 @@
+{
+  "payload": {
+    "anchor_message_id": "msg_nova0first00001a",
+    "at": "2026-11-04T23:13:10.000Z",
+    "conversation_id": "conv_direct0first01",
+    "reason": "reminder",
+    "step": 1
+  },
+  "type": "wake"
+}

@@ -40,6 +40,12 @@ from .conversation import (
     ConversationParticipant,
     ConversationType,
 )
+from .decision import (
+    KnownReplyDecisionCategory,
+    ReplyDecision,
+    ReplyDecisionCategory,
+    ReplyDecisionVerdict,
+)
 from .group import (
     AddMemberRequest,
     AddMemberResult,
@@ -54,6 +60,21 @@ from .group import (
     GroupSettings,
     GroupSystemEvent,
     UpdateGroupRequest,
+)
+from .inbox import (
+    INBOX_TRAY_DEFAULT_LIMIT,
+    INBOX_TRAY_MAX_LIMIT,
+    INBOX_WAIT_MAX_MS,
+    InboxCard,
+    InboxCardCounterparty,
+    InboxCardGroup,
+    InboxCardGroupDeleted,
+    InboxCardLastDecision,
+    InboxCardPace,
+    InboxCardPreview,
+    InboxCardRelationship,
+    InboxCardReminder,
+    InboxTray,
 )
 from .message import (
     Message,
@@ -73,12 +94,28 @@ from .presence import (
     PresenceStatus,
     PresenceUpdate,
 )
-from .ws import ClientAction, ServerEvent, WsMessage
+from .texts import Texts, TextsManual, TextsRuntime
+from .ws import (
+    AckFrame,
+    ClientAction,
+    KnownWakeReason,
+    ServerEvent,
+    WakeFrame,
+    WakePayload,
+    WakeReason,
+    WsMessage,
+)
 
 __all__ = [
     # attachment
     "ALLOWED_ATTACHMENT_MIME",
+    # inbox
+    "INBOX_TRAY_DEFAULT_LIMIT",
+    "INBOX_TRAY_MAX_LIMIT",
+    "INBOX_WAIT_MAX_MS",
     "MAX_ATTACHMENT_SIZE",
+    # ws
+    "AckFrame",
     # contact
     "AddContactRequest",
     # group
@@ -112,7 +149,19 @@ __all__ = [
     "GroupRole",
     "GroupSettings",
     "GroupSystemEvent",
+    "InboxCard",
+    "InboxCardCounterparty",
+    "InboxCardGroup",
+    "InboxCardGroupDeleted",
+    "InboxCardLastDecision",
+    "InboxCardPace",
+    "InboxCardPreview",
+    "InboxCardRelationship",
+    "InboxCardReminder",
     "InboxMode",
+    "InboxTray",
+    "KnownReplyDecisionCategory",
+    "KnownWakeReason",
     # message
     "Message",
     "MessageContent",
@@ -131,12 +180,23 @@ __all__ = [
     "PresenceUpdate",
     "RecoverRequest",
     "RegisterRequest",
+    # decision
+    "ReplyDecision",
+    "ReplyDecisionCategory",
+    "ReplyDecisionVerdict",
     "ReportRequest",
     "SendMessageRequest",
     "ServerEvent",
+    # texts
+    "Texts",
+    "TextsManual",
+    "TextsRuntime",
     "UpdateAgentRequest",
     "UpdateContactRequest",
     "UpdateGroupRequest",
     "VerifyRequest",
+    "WakeFrame",
+    "WakePayload",
+    "WakeReason",
     "WsMessage",
 ]

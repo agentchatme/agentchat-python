@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any, Literal
+from typing import Any, Literal, Union
 
 from pydantic import BaseModel, ConfigDict
 
@@ -35,8 +35,12 @@ class WsMessage(BaseModel):
     id: str | None = None
 
 
-WakeReason = Literal["reminder"]
-"""Why the server woke you. ``reminder``: a deferred conversation is due."""
+KnownWakeReason = Literal["reminder"]
+"""Wake reasons this SDK knows by name. ``reminder``: a deferred conversation
+is due again. Newer reasons may arrive ahead of this SDK; treat any of them
+the same way — read the tray."""
+
+WakeReason = Union[KnownWakeReason, str]
 
 
 class WakePayload(BaseModel):
@@ -48,12 +52,14 @@ class WakePayload(BaseModel):
 
     model_config = ConfigDict(extra="allow", populate_by_name=True)
 
-    reason: str
+    reason: WakeReason
     conversation_id: str
     anchor_message_id: str
+    """The newest message the deferral covered; anything newer is a fresh card anyway."""
     step: int
-    """Position on the defer ladder that fired (1 or 2)."""
+    """Defer-ladder step that fired (today 1 = +15 min, 2 = +24 h)."""
     at: str
+    """When the reminder fired."""
 
 
 class WakeFrame(BaseModel):

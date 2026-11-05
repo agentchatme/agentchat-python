@@ -18,10 +18,12 @@ from typing import (
     Literal,
     TypedDict,
 )
-from urllib.parse import quote, urlencode
 
 import httpx
 
+from ._call import CallOptions
+from ._call import encode_segment as _encode
+from ._call import query_string as _qs
 from ._client_identity import (
     AgentChatClientIdentity,
     client_identity_headers,
@@ -34,6 +36,16 @@ from ._http import (
     RetryPolicy,
 )
 from ._pagination import apaginate, paginate
+from ._resources import (
+    AsyncConversationsResource,
+    AsyncDecisionsResource,
+    AsyncInboxResource,
+    AsyncTextsResource,
+    ConversationsResource,
+    DecisionsResource,
+    InboxResource,
+    TextsResource,
+)
 from .errors import AgentChatError, NotFoundError
 
 DEFAULT_BASE_URL = "https://api.agentchat.me"
@@ -124,24 +136,10 @@ class MuteEntry:
     created_at: str
 
 
-@dataclass
-class CallOptions:
-    """Per-call overrides accepted by every client method.
-
-    ``idempotency_key`` supplies an explicit ``Idempotency-Key`` header —
-    any UUID/ULID works. Reusing the same key makes the call safe to retry:
-    the server returns the original outcome rather than double-executing.
-    """
-
-    timeout_ms: int | None = None
-    idempotency_key: str | None = None
-
-
-_DEFAULT_OPTS = CallOptions()
-
-
 def _call_opts(opts: CallOptions | None) -> CallOptions:
-    return opts or _DEFAULT_OPTS
+    # A fresh instance per call: no shared default that a caller could
+    # mutate, so the SDK holds no process-wide state (it runs as a guest).
+    return opts if opts is not None else CallOptions()
 
 
 def _parse_backlog_warning(header: str | None) -> BacklogWarning | None:
@@ -168,19 +166,6 @@ def _parse_backlog_warning(header: str | None) -> BacklogWarning | None:
 
 def _generate_client_msg_id() -> str:
     return str(uuid.uuid4())
-
-
-def _encode(segment: str) -> str:
-    """URL-path segment encoder that matches ``encodeURIComponent``."""
-    return quote(segment, safe="")
-
-
-def _qs(params: dict[str, Any]) -> str:
-    """Build a query-string, skipping ``None`` values."""
-    filtered = {k: v for k, v in params.items() if v is not None}
-    if not filtered:
-        return ""
-    return "?" + urlencode(filtered, doseq=True)
 
 
 def _to_http_opts(opts: CallOptions) -> dict[str, Any]:
@@ -238,6 +223,14 @@ class AgentChatClient:
             client=http_client,
         )
         self._on_backlog_warning = on_backlog_warning
+        self.inbox = InboxResource(self)
+        """The tray: ``client.inbox.tray(wait_ms=..., limit=...)``."""
+        self.decisions = DecisionsResource(self)
+        """Reply-gate verdicts: ``client.decisions.record(conversation_id, decision=...)``."""
+        self.conversations = ConversationsResource(self)
+        """Read state: ``client.conversations.mark_read(conversation_id, through_message_id)``."""
+        self.texts = TextsResource(self)
+        """Served texts: ``client.texts.get(runtime=...)``."""
 
     def close(self) -> None:
         self._http.close()
@@ -1113,6 +1106,10 @@ class AsyncAgentChatClient:
             client=http_client,
         )
         self._on_backlog_warning = on_backlog_warning
+        self.inbox = AsyncInboxResource(self)
+        self.decisions = AsyncDecisionsResource(self)
+        self.conversations = AsyncConversationsResource(self)
+        self.texts = AsyncTextsResource(self)
 
     async def aclose(self) -> None:
         await self._http.aclose()

@@ -1,0 +1,226 @@
+[
+  {
+    "expected": [
+      {
+        "category": "open_request",
+        "conversation_id": "conv_direct0first01",
+        "decision": "reply"
+      },
+      {
+        "category": "acknowledgement",
+        "conversation_id": "conv_group0crew0001",
+        "decision": "dismiss"
+      },
+      {
+        "category": "open_request",
+        "conversation_id": "conv_group0ops00001",
+        "decision": "reply"
+      },
+      {
+        "category": "no_action_needed",
+        "conversation_id": "conv_group0gone0001",
+        "decision": "dismiss"
+      }
+    ],
+    "name": "clean-json",
+    "text": "{\"decisions\": [{\"conversation_id\": \"conv_direct0first01\", \"decision\": \"reply\", \"category\": \"open_request\"}, {\"conversation_id\": \"conv_group0crew0001\", \"decision\": \"dismiss\", \"category\": \"acknowledgement\"}, {\"conversation_id\": \"conv_group0ops00001\", \"decision\": \"reply\", \"category\": \"open_request\"}, {\"conversation_id\": \"conv_group0gone0001\", \"decision\": \"dismiss\", \"category\": \"no_action_needed\"}]}"
+  },
+  {
+    "expected": [
+      {
+        "category": "open_request",
+        "conversation_id": "conv_direct0first01",
+        "decision": "reply"
+      },
+      {
+        "category": "acknowledgement",
+        "conversation_id": "conv_group0crew0001",
+        "decision": "dismiss"
+      },
+      {
+        "category": "goal_followup",
+        "conversation_id": "conv_group0ops00001",
+        "decision": "defer"
+      },
+      {
+        "category": "no_action_needed",
+        "conversation_id": "conv_group0gone0001",
+        "decision": "dismiss"
+      }
+    ],
+    "name": "synonyms",
+    "text": "{\"decisions\": [{\"conversation_id\": \"conv_direct0first01\", \"decision\": \"respond\", \"category\": \"open_request\"}, {\"conversation_id\": \"conv_group0crew0001\", \"decision\": \"No\", \"category\": \"acknowledgement\"}, {\"conversation_id\": \"conv_group0ops00001\", \"decision\": \"later\", \"category\": \"goal_followup\"}, {\"conversation_id\": \"conv_group0gone0001\", \"decision\": \"ignore\", \"category\": \"no_action_needed\"}]}"
+  },
+  {
+    "expected": [
+      {
+        "category": "open_request",
+        "conversation_id": "conv_direct0first01",
+        "decision": "reply"
+      },
+      {
+        "category": "closing",
+        "conversation_id": "conv_group0crew0001",
+        "decision": "dismiss"
+      },
+      {
+        "category": "not_addressed",
+        "conversation_id": "conv_group0ops00001",
+        "decision": "dismiss"
+      },
+      {
+        "category": "other",
+        "conversation_id": "conv_group0gone0001",
+        "decision": "defer"
+      }
+    ],
+    "name": "synonyms-legacy-and-spaced",
+    "text": "{\"decisions\": [{\"conversation_id\": \"conv_direct0first01\", \"decision\": \"yes\", \"category\": \"open_request\"}, {\"conversation_id\": \"conv_group0crew0001\", \"decision\": \"no_reply\", \"category\": \"closing\"}, {\"conversation_id\": \"conv_group0ops00001\", \"decision\": \"No Reply\", \"category\": \"not_addressed\"}, {\"conversation_id\": \"conv_group0gone0001\", \"decision\": \"postpone\", \"category\": \"other\"}]}"
+  },
+  {
+    "expected": [
+      {
+        "category": "open_request",
+        "conversation_id": "conv_direct0first01",
+        "decision": "reply"
+      },
+      {
+        "category": "acknowledgement",
+        "conversation_id": "conv_group0crew0001",
+        "decision": "dismiss"
+      }
+    ],
+    "name": "unknown-conversation-dropped",
+    "text": "{\"decisions\": [{\"conversation_id\": \"conv_direct0first01\", \"decision\": \"reply\", \"category\": \"open_request\"}, {\"conversation_id\": \"conv_not0on0tray00\", \"decision\": \"dismiss\", \"category\": \"spam\"}, {\"conversation_id\": \"conv_group0crew0001\", \"decision\": \"dismiss\", \"category\": \"acknowledgement\"}]}"
+  },
+  {
+    "expected": null,
+    "name": "malformed-fails-closed",
+    "text": "I think you should reply to Nova and ignore the rest."
+  },
+  {
+    "expected": null,
+    "name": "empty-fails-closed",
+    "text": ""
+  },
+  {
+    "expected": null,
+    "name": "broken-json-fails-closed",
+    "text": "{\"decisions\": [{\"conversation_id\": \"conv_direct0first01\", \"decision\": \"reply\","
+  },
+  {
+    "expected": [
+      {
+        "category": "open_request",
+        "conversation_id": "conv_direct0first01",
+        "decision": "defer"
+      }
+    ],
+    "name": "defer-with-stray-defer-seconds",
+    "text": "{\"decisions\": [{\"conversation_id\": \"conv_direct0first01\", \"decision\": \"defer\", \"category\": \"open_request\", \"defer_seconds\": 900}]}"
+  },
+  {
+    "expected": [
+      {
+        "category": "open_request",
+        "conversation_id": "conv_direct0first01",
+        "decision": "defer"
+      }
+    ],
+    "name": "defer-without-defer-seconds",
+    "text": "{\"decisions\": [{\"conversation_id\": \"conv_direct0first01\", \"decision\": \"defer\", \"category\": \"open_request\"}]}"
+  },
+  {
+    "expected": [
+      {
+        "category": "acknowledgement",
+        "conversation_id": "conv_group0crew0001",
+        "decision": "dismiss"
+      }
+    ],
+    "name": "fenced-json",
+    "text": "```json\n{\"decisions\": [{\"conversation_id\": \"conv_group0crew0001\", \"decision\": \"dismiss\", \"category\": \"acknowledgement\"}]}\n```"
+  },
+  {
+    "expected": [
+      {
+        "category": "open_request",
+        "conversation_id": "conv_group0ops00001",
+        "decision": "reply"
+      }
+    ],
+    "name": "prose-around-json",
+    "text": "Here are my decisions:\n{\"decisions\": [{\"conversation_id\": \"conv_group0ops00001\", \"decision\": \"reply\", \"category\": \"open_request\"}]}\nDone."
+  },
+  {
+    "expected": [
+      {
+        "category": "no_action_needed",
+        "conversation_id": "conv_group0gone0001",
+        "decision": "dismiss"
+      }
+    ],
+    "name": "bare-array",
+    "text": "[{\"conversation_id\": \"conv_group0gone0001\", \"decision\": \"dismiss\", \"category\": \"no_action_needed\"}]"
+  },
+  {
+    "expected": [
+      {
+        "category": null,
+        "conversation_id": "conv_group0crew0001",
+        "decision": "dismiss"
+      }
+    ],
+    "name": "single-object-no-category",
+    "text": "{\"conversation_id\": \"conv_group0crew0001\", \"decision\": \"dismiss\"}"
+  },
+  {
+    "expected": [
+      {
+        "category": null,
+        "conversation_id": "conv_direct0first01",
+        "decision": "reply"
+      }
+    ],
+    "name": "unknown-category-becomes-null",
+    "text": "{\"decisions\": [{\"conversation_id\": \"conv_direct0first01\", \"decision\": \"reply\", \"category\": \"urgent\"}]}"
+  },
+  {
+    "expected": [
+      {
+        "category": "open_request",
+        "conversation_id": "conv_direct0first01",
+        "decision": "reply"
+      }
+    ],
+    "name": "category-case-insensitive",
+    "text": "{\"decisions\": [{\"conversation_id\": \"conv_direct0first01\", \"decision\": \"reply\", \"category\": \"Open_Request\"}]}"
+  },
+  {
+    "expected": [
+      {
+        "category": "acknowledgement",
+        "conversation_id": "conv_group0crew0001",
+        "decision": "dismiss"
+      }
+    ],
+    "name": "unknown-decision-leaves-card-undecided",
+    "text": "{\"decisions\": [{\"conversation_id\": \"conv_direct0first01\", \"decision\": \"maybe\", \"category\": \"open_request\"}, {\"conversation_id\": \"conv_group0crew0001\", \"decision\": \"dismiss\", \"category\": \"acknowledgement\"}]}"
+  },
+  {
+    "expected": [],
+    "name": "close-is-not-a-dismiss",
+    "text": "{\"decisions\": [{\"conversation_id\": \"conv_group0crew0001\", \"decision\": \"close\", \"category\": \"closing\"}]}"
+  },
+  {
+    "expected": [
+      {
+        "category": "open_request",
+        "conversation_id": "conv_direct0first01",
+        "decision": "reply"
+      }
+    ],
+    "name": "duplicate-id-first-wins",
+    "text": "{\"decisions\": [{\"conversation_id\": \"conv_direct0first01\", \"decision\": \"reply\", \"category\": \"open_request\"}, {\"conversation_id\": \"conv_direct0first01\", \"decision\": \"dismiss\", \"category\": \"closing\"}]}"
+  }
+]
