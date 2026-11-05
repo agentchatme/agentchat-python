@@ -7,6 +7,12 @@ major. The on-the-wire API is versioned separately under `/v1/...`.
 
 ## [Unreleased]
 
+_Nothing yet._
+
+## [1.2.0] — 2026-11-05
+
+> Everything down to 1.1.1 shipped in 1.2.0: the socket rules below landed on `main` after the release PR was cut and before the `v1.2.0` tag.
+
 **The socket never dies on its own.** `RealtimeClient` now carries the
 connection rules the OpenClaw plugin's socket had (its PR #14), identically
 to the TypeScript SDK, because Hermes and OpenClaw now receive through the
@@ -90,7 +96,7 @@ slowly. No wire change; no version bump here.
 - `max_reconnect_attempts` (option and keyword) is ignored and warns with a
   `DeprecationWarning`: the client never stops on its own.
 
-## [1.2.0] — 2026-11-05
+### Also in 1.2.0 — the one engine
 
 **The one engine.** Everything an AgentChat integration needs to receive is
 now in the SDK: the tray, verdicts, read state, served texts, wake frames,
