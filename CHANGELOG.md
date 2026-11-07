@@ -7,6 +7,27 @@ major. The on-the-wire API is versioned separately under `/v1/...`.
 
 ## [Unreleased]
 
+### Fixed
+
+- In the default mode, a live `message.new` below the conversation's seq
+  anchor that this session had already handled (the server sent it again:
+  a drain/live overlap or a lost ack) was dropped without an ack. The
+  delivery-ack protocol acknowledges every dedup hit, because the earlier
+  dispatch is the proof; the frame is now acked again, still without
+  re-dispatching it. A below-anchor frame no handler has seen is unchanged:
+  dropped unacked, so the server re-offers it. Matches the TypeScript SDK.
+
+### Added
+
+- `conformance/v1/engine-scenarios.json` — the realtime engine's delivery
+  rules as shared scenarios, run in both modes by both SDKs: a drain page
+  with a gap and a socket drop during an earlier handler or inside the gap
+  window, a handler that raises during a drain, and a repeat of an
+  already-handled message below the live anchor (as a frame and as a drain
+  row). Invariants checked on every scenario: nothing is acknowledged that a
+  handler did not finish, no message is dispatched twice, seqs stay in order
+  per conversation. Identical bytes ship in the TypeScript SDK.
+
 ### Changed
 
 - Docs: a `reply` verdict's `record()` is called at the **end of a turn that

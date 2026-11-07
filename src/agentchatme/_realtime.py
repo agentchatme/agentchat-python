@@ -1672,7 +1672,8 @@ class RealtimeClient:
 
         Returns where the envelope went: ``"delivered"`` (handed to
         :meth:`_deliver_message_new` now), ``"duplicate"`` (below this
-        connection's seq anchor, dropped), or ``"buffered"`` (parked on a
+        connection's seq anchor, dropped; a live frame this session already
+        dispatched is acknowledged again), or ``"buffered"`` (parked on a
         seq gap; dispatched later by the gap machinery or the shutdown
         flush). The REST drain uses this to decide what its ack cursor may
         cover.
@@ -1710,10 +1711,16 @@ class RealtimeClient:
             # rows (seq 3, 4). Unacked, those come back in order later and
             # are safe to drop here; acked at parse, dropping them would lose
             # them — deliver on a dedup miss, out of order but not lost.
-            if not ack_spent:
-                return "duplicate"
             message_id = _extract_message_id(message)
-            if message_id is not None and self._dedup.hit(message_id):
+            seen = message_id is not None and self._dedup.hit(message_id)
+            if not ack_spent:
+                if seen and ws_ack and message_id is not None:
+                    # A repeat of a message this session already handled:
+                    # the earlier dispatch is the proof, so acknowledge it
+                    # again, as the dedup path does for every other repeat.
+                    await self._send_delivery_ack(message_id)
+                return "duplicate"
+            if seen:
                 return "duplicate"
             await self._deliver_message_new(message, ws_ack=False)
             return "delivered"

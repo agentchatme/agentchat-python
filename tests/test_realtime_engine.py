@@ -296,6 +296,51 @@ async def test_ack_on_receipt_flushes_acked_parked_frames_when_the_socket_closes
 
 
 @pytest.mark.asyncio
+async def test_default_mode_acks_a_below_anchor_repeat_it_already_handled() -> None:
+    # Seq 3 parks, so the ordering state stays live and the repeat of seq 1
+    # really is below the anchor. It is not handed over again, and it is
+    # acknowledged again: the earlier dispatch is the proof (the dedup rule
+    # of the delivery-ack protocol).
+    rt, ws = await connected(capabilities=["ack"])
+    handled: list[str] = []
+    rt.on("message.new", lambda m: handled.append(m["payload"]["id"]))
+    try:
+        await ws.push(message_new("c", 1))
+        await ws.push(message_new("c", 3))
+        await _settle()
+        await ws.push(message_new("c", 1))
+        await _settle()
+        assert handled == ["msg_1"]
+        assert _ack_frames(ws) == ["msg_1", "msg_1"]
+
+        await ws.push(message_new("c", 2))
+        await _settle()
+        assert handled == ["msg_1", "msg_2", "msg_3"]
+        assert _ack_frames(ws) == ["msg_1", "msg_1", "msg_2", "msg_3"]
+    finally:
+        await rt.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_default_mode_never_acks_a_below_anchor_frame_nobody_handled() -> None:
+    # Live seq 5 anchors before the server's reconnect backlog brings the
+    # stored seq 3. Unseen and unacked, it stays `stored` for the next drain.
+    rt, ws = await connected(capabilities=["ack"])
+    handled: list[str] = []
+    rt.on("message.new", lambda m: handled.append(m["payload"]["id"]))
+    try:
+        await ws.push(message_new("c", 5))
+        await ws.push(message_new("c", 7))
+        await _settle()
+        await ws.push(message_new("c", 3))
+        await _settle()
+        assert handled == ["msg_5"]
+        assert _ack_frames(ws) == ["msg_5"]
+    finally:
+        await rt.disconnect()
+
+
+@pytest.mark.asyncio
 async def test_default_mode_leaves_unacked_parked_frames_to_the_next_drain() -> None:
     gaps: list[Any] = []
     rt, ws = await connected(capabilities=["ack"], on_sequence_gap=lambda info: gaps.append(info))
