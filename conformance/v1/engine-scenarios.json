@@ -519,6 +519,170 @@
         ]
       ],
       "why": "As above, but the repeat of seq 1 is a REST drain row. It is not handed over again and the cursor covers it: this client already handled that message id. Drain rows are acknowledged by the cursor, never by an ack frame."
+    },
+    {
+      "expect": {
+        "ack_on_receipt": {
+          "cursor_acks": [
+            "del_000000000000000000000000000d0002"
+          ],
+          "dispatched": [
+            "msg_ops0slow00001",
+            "msg_ops0slow00002"
+          ],
+          "ws_acks": [
+            "msg_ops0slow00001",
+            "msg_ops0slow00002"
+          ]
+        },
+        "default": {
+          "cursor_acks": [
+            "del_000000000000000000000000000d0002"
+          ],
+          "dispatched": [
+            "msg_ops0slow00001",
+            "msg_ops0slow00002"
+          ],
+          "ws_acks": [
+            "msg_ops0slow00001",
+            "msg_ops0slow00002"
+          ]
+        }
+      },
+      "hold": [
+        "msg_ops0slow00002"
+      ],
+      "name": "repeat-while-handler-runs-in-order",
+      "steps": [
+        {
+          "op": "connect"
+        },
+        {
+          "op": "frame",
+          "payload": {
+            "content": {
+              "text": "message 1"
+            },
+            "conversation_id": "conv_group0ops00001",
+            "created_at": "2026-11-04T23:01:00.000Z",
+            "id": "msg_ops0slow00001",
+            "sender": "nova",
+            "seq": 1,
+            "type": "text"
+          }
+        },
+        {
+          "op": "frame",
+          "payload": {
+            "content": {
+              "text": "message 2"
+            },
+            "conversation_id": "conv_group0ops00001",
+            "created_at": "2026-11-04T23:02:00.000Z",
+            "id": "msg_ops0slow00002",
+            "sender": "nova",
+            "seq": 2,
+            "type": "text"
+          }
+        },
+        {
+          "op": "drain"
+        },
+        {
+          "message_id": "msg_ops0slow00002",
+          "op": "release"
+        }
+      ],
+      "sync_pages": [
+        [
+          {
+            "content": {
+              "text": "message 2"
+            },
+            "conversation_id": "conv_group0ops00001",
+            "created_at": "2026-11-04T23:02:00.000Z",
+            "delivery_id": "del_000000000000000000000000000d0002",
+            "id": "msg_ops0slow00002",
+            "sender": "nova",
+            "seq": 2,
+            "type": "text"
+          }
+        ]
+      ],
+      "why": "Seq 2 arrives live and its handler is slow (it calls a model). Meanwhile the same stored row comes back through the REST drain, as it does after every reconnect because the server also pushes its backlog on the socket. The second copy is not handed to the handler: it takes the first copy's outcome, so the cursor covers it once that handler finished."
+    },
+    {
+      "expect": {
+        "ack_on_receipt": {
+          "cursor_acks": [
+            "del_00000000000000000000000000090001"
+          ],
+          "dispatched": [
+            "msg_crew0slow0001"
+          ],
+          "ws_acks": [
+            "msg_crew0slow0001"
+          ]
+        },
+        "default": {
+          "cursor_acks": [
+            "del_00000000000000000000000000090001"
+          ],
+          "dispatched": [
+            "msg_crew0slow0001"
+          ],
+          "ws_acks": [
+            "msg_crew0slow0001"
+          ]
+        }
+      },
+      "hold": [
+        "msg_crew0slow0001"
+      ],
+      "name": "repeat-while-handler-runs-below-anchor",
+      "steps": [
+        {
+          "op": "connect"
+        },
+        {
+          "op": "frame",
+          "payload": {
+            "content": {
+              "text": "message 1"
+            },
+            "conversation_id": "conv_group0crew0001",
+            "created_at": "2026-11-04T23:01:00.000Z",
+            "id": "msg_crew0slow0001",
+            "sender": "nova",
+            "seq": 1,
+            "type": "text"
+          }
+        },
+        {
+          "op": "drain"
+        },
+        {
+          "message_id": "msg_crew0slow0001",
+          "op": "release"
+        }
+      ],
+      "sync_pages": [
+        [
+          {
+            "content": {
+              "text": "message 1"
+            },
+            "conversation_id": "conv_group0crew0001",
+            "created_at": "2026-11-04T23:01:00.000Z",
+            "delivery_id": "del_00000000000000000000000000090001",
+            "id": "msg_crew0slow0001",
+            "sender": "nova",
+            "seq": 1,
+            "type": "text"
+          }
+        ]
+      ],
+      "why": "The conversation's first live frame has a slow handler, and the REST drain brings the same row while it runs: below the anchor, not yet in the dedup cache. It is not handed over again; the cursor covers it once the first copy's handler finished."
     }
   ]
 }

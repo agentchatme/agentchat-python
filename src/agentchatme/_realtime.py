@@ -437,6 +437,10 @@ class _BoundedLruSet:
         self._capacity = capacity
         self._entries: OrderedDict[str, None] = OrderedDict()
 
+    @property
+    def enabled(self) -> bool:
+        return self._capacity > 0
+
     def hit(self, key: str) -> bool:
         """Return ``True`` (and refresh recency) if ``key`` was seen before."""
         if key not in self._entries:
@@ -602,6 +606,14 @@ class RealtimeClient:
         # reconnects deliberately: redelivery across connections is exactly
         # the duplicate source it exists to absorb.
         self._dedup = _BoundedLruSet(options.dedup_cache_size)
+        # Dispatches still running, by message id: resolves to the first
+        # copy's outcome. A second copy that arrives meanwhile (the server's
+        # reconnect backlog and the REST drain bring the same stored rows; a
+        # slow handler is still on the first) is not handed to the handlers
+        # again. An entry lives exactly as long as its handlers run, so the
+        # map is bounded by the dispatches in flight. Off with the dedup
+        # cache (``dedup_cache_size=0``).
+        self._inflight: dict[str, asyncio.Future[bool]] = {}
         # One REST drain at a time: the server-side ack pointer only moves
         # forward, so a second concurrent drain adds nothing but races.
         self._drain_in_flight = False
@@ -1608,14 +1620,55 @@ class RealtimeClient:
                 await self._send_delivery_ack(message_id)
             return self._settle_drain_row(message, True)
 
-        dispatched_cleanly = await self._dispatch(message)
+        first = self._inflight.get(message_id) if message_id is not None else None
+        if first is not None and message_id is not None:
+            # The same message is still with the handlers. Take that
+            # outcome instead of dispatching it twice: success covers this
+            # copy too (acked like a dedup hit), a failure leaves it unacked
+            # so the server re-offers it. The caller waits exactly where it
+            # would otherwise have waited for its own handler call; shielded
+            # so that cancelling this caller never cancels the first copy.
+            ok = await asyncio.shield(first)
+            if ok and ws_ack:
+                await self._send_delivery_ack(message_id)
+            return self._settle_drain_row(message, ok)
+
+        own: asyncio.Future[bool] | None = None
+        if message_id is not None and self._dedup.enabled:
+            own = asyncio.get_running_loop().create_future()
+            self._inflight[message_id] = own
+        dispatched_cleanly = False
+        try:
+            dispatched_cleanly = await self._dispatch(message)
+            if dispatched_cleanly and message_id is not None:
+                self._dedup.add(message_id)
+        finally:
+            # In the same step the outcome is known (and, on success, the id
+            # is in the dedup cache): a later copy finds one or the other,
+            # never neither. A cancelled dispatch counts as not handled.
+            if own is not None and message_id is not None:
+                if self._inflight.get(message_id) is own:
+                    del self._inflight[message_id]
+                if not own.done():
+                    own.set_result(dispatched_cleanly)
         if not dispatched_cleanly:
             return self._settle_drain_row(message, False)
-        if message_id is not None:
-            self._dedup.add(message_id)
-            if ws_ack:
-                await self._send_delivery_ack(message_id)
+        if message_id is not None and ws_ack:
+            await self._send_delivery_ack(message_id)
         return self._settle_drain_row(message, True)
+
+    def _ack_when_handled(self, message_id: str) -> None:
+        """Acknowledge ``message_id`` once its in-flight first copy finishes
+        cleanly, without waiting for it here."""
+        first = self._inflight.get(message_id)
+        if first is None:
+            return
+
+        def done(future: asyncio.Future[bool]) -> None:
+            if not future.cancelled() and future.result() and not self._disposed:
+                self._spawn(self._send_delivery_ack(message_id))
+
+        first.add_done_callback(done)
 
     def _settle_drain_row(self, message: dict[str, Any], ok: bool) -> bool:
         key = id(message)
@@ -1719,6 +1772,17 @@ class RealtimeClient:
                     # the earlier dispatch is the proof, so acknowledge it
                     # again, as the dedup path does for every other repeat.
                     await self._send_delivery_ack(message_id)
+                elif message_id is not None and message_id in self._inflight:
+                    # A repeat of a message whose first copy is still with
+                    # the handlers. A drain row takes that outcome for its
+                    # cursor (the drain waits on handlers anyway); a live
+                    # frame never holds up the socket for it and is acked
+                    # once the first copy finished cleanly.
+                    if id(message) in self._drain_settlements:
+                        await self._deliver_message_new(message, ws_ack=False)
+                        return "delivered"
+                    if ws_ack:
+                        self._ack_when_handled(message_id)
                 return "duplicate"
             if seen:
                 return "duplicate"
@@ -1727,7 +1791,9 @@ class RealtimeClient:
 
         if seq == state.next_expected_seq:
             await self._deliver_message_new(message, ws_ack=ws_ack)
-            state.next_expected_seq = seq + 1
+            # Never backwards: another copy of this message (or a drain of
+            # the buffer) may have moved the cursor on during the await.
+            _advance_past(state, seq)
             await self._drain_consecutive(conversation_id, state)
             self._maybe_clear_gap_timer(state)
             self._cleanup_if_idle(conversation_id, state)
@@ -1870,9 +1936,10 @@ class RealtimeClient:
             return False
         drained = False
         while state.next_expected_seq in state.buffer:
-            pending = state.buffer.pop(state.next_expected_seq)
+            seq = state.next_expected_seq
+            pending = state.buffer.pop(seq)
             await self._deliver_message_new(pending.message, ws_ack=pending.ws_ack)
-            state.next_expected_seq += 1
+            _advance_past(state, seq)
             drained = True
         if drained:
             self._cleanup_if_idle(conversation_id, state)
@@ -1944,6 +2011,9 @@ class RealtimeClient:
             not state.buffer
             and state.gap_task is None
             and not state.gap_fill_in_flight
+            # A state a socket close replaced while this caller was awaiting
+            # a handler is not the conversation's state any more.
+            and self._order_states.get(conversation_id) is state
         ):
             self._order_states.pop(conversation_id, None)
 
@@ -2092,6 +2162,13 @@ def _is_valid_sync_row(row: object) -> bool:
         if key in row and not isinstance(row[key], str):
             return False
     return "content" not in row or isinstance(row["content"], dict)
+
+
+def _advance_past(state: _OrderState, seq: int) -> None:
+    """Move the conversation's cursor past ``seq``, never backwards."""
+    current = state.next_expected_seq
+    if current is None or current <= seq:
+        state.next_expected_seq = seq + 1
 
 
 def _min_buffered_seq(state: _OrderState) -> int | None:

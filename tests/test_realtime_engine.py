@@ -12,7 +12,7 @@ from typing import Any
 
 import pytest
 
-from agentchatme import RealtimeClient
+from agentchatme import RealtimeClient, _realtime
 from agentchatme.types.ws import WakePayload
 
 from .test_realtime import MockAsyncClient, MockWebSocket, _ack_frames, _make_client, _settle
@@ -403,6 +403,213 @@ async def test_default_mode_acks_gap_fill_rows_after_dispatch(
         assert dispatched == [1, 2, 3]
         # The fetched row rides the live ack path: acked once dispatched.
         assert _ack_frames(ws) == ["msg_1", "msg_2", "msg_3"]
+    finally:
+        await rt.disconnect()
+
+
+# ─────────────── a repeat while the first copy is still with the handlers ───────────────
+#
+# After a reconnect the server pushes its stored backlog on the socket and the
+# REST drain brings the same rows. With a slow handler the second copy comes
+# before the first one finished, so the dedup cache (filled on success) cannot
+# catch it.
+
+
+def _row(seq: int, *, mid: str | None = None) -> dict[str, Any]:
+    return {
+        "id": mid or f"msg_{seq}",
+        "conversation_id": "c",
+        "seq": seq,
+        "delivery_id": f"del_{seq}",
+        "sender": "nova",
+        "type": "text",
+        "content": {"text": "hi"},
+        "created_at": "2026-11-04T23:00:00.000Z",
+    }
+
+
+@pytest.mark.parametrize("ack_on_receipt", [False, True])
+@pytest.mark.asyncio
+async def test_a_drain_row_repeat_of_a_running_live_message_is_not_dispatched_again(
+    ack_on_receipt: bool,
+) -> None:
+    api = MockAsyncClient(sync_pages=[[_row(2)]])
+    rt, ws = await connected(
+        capabilities=["ack"], client=api, auto_drain_on_connect=False, ack_on_receipt=ack_on_receipt
+    )
+    release = asyncio.Event()
+    calls: list[str] = []
+
+    async def slow(m: dict[str, Any]) -> None:
+        calls.append(m["payload"]["id"])
+        if m["payload"]["id"] == "msg_2":
+            await release.wait()
+
+    rt.on("message.new", slow)
+    try:
+        await ws.push(message_new("c", 1))
+        await ws.push(message_new("c", 2))  # in order; its handler is slow
+        await _settle()
+        drain = asyncio.create_task(rt.drain_offline_envelopes())
+        await _settle()
+        assert calls == ["msg_1", "msg_2"]
+        assert api.sync_ack_calls == []
+
+        release.set()
+        await asyncio.wait_for(drain, timeout=1.0)
+        await _settle()
+        assert calls == ["msg_1", "msg_2"]
+        assert api.sync_ack_calls == ["del_2"]
+        assert _ack_frames(ws) == ["msg_1", "msg_2"]
+    finally:
+        release.set()
+        await rt.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_a_live_repeat_below_the_anchor_never_holds_up_the_socket() -> None:
+    # The first copy is a drain row whose handler is slow. The server's
+    # backlog push brings the same message live, below the anchor. It is not
+    # dispatched, the socket keeps flowing (another conversation's frame is
+    # handled meanwhile), and it is acked once the first copy finished.
+    api = MockAsyncClient(sync_pages=[[_row(1)]])
+    rt, ws = await connected(capabilities=["ack"], client=api, auto_drain_on_connect=False)
+    release = asyncio.Event()
+    calls: list[str] = []
+
+    async def slow(m: dict[str, Any]) -> None:
+        calls.append(m["payload"]["id"])
+        if m["payload"]["id"] == "msg_1":
+            await release.wait()
+
+    rt.on("message.new", slow)
+    try:
+        drain = asyncio.create_task(rt.drain_offline_envelopes())
+        await _settle()
+        assert calls == ["msg_1"]
+        await ws.push(message_new("c", 1))  # the same message, live
+        await ws.push(message_new("other", 9, id="msg_other"))
+        await _settle()
+        assert calls == ["msg_1", "msg_other"]
+        assert _ack_frames(ws) == ["msg_other"]
+
+        release.set()
+        await asyncio.wait_for(drain, timeout=1.0)
+        await _settle()
+        assert calls == ["msg_1", "msg_other"]
+        assert _ack_frames(ws) == ["msg_other", "msg_1"]
+        assert api.sync_ack_calls == ["del_1"]
+    finally:
+        release.set()
+        await rt.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_a_failed_first_copy_leaves_the_repeat_unacked_and_a_later_copy_is_dispatched() -> None:
+    api = MockAsyncClient(sync_pages=[[_row(2)]])
+    rt, ws = await connected(capabilities=["ack"], client=api, auto_drain_on_connect=False)
+    release = asyncio.Event()
+    calls: list[str] = []
+
+    async def flaky(m: dict[str, Any]) -> None:
+        calls.append(m["payload"]["id"])
+        if m["payload"]["id"] == "msg_2" and calls.count("msg_2") == 1:
+            await release.wait()
+            raise RuntimeError("model call failed")
+
+    rt.on("message.new", flaky)
+    try:
+        await ws.push(message_new("c", 1))
+        await ws.push(message_new("c", 2))
+        await _settle()
+        drain = asyncio.create_task(rt.drain_offline_envelopes())
+        await _settle()
+        release.set()
+        await asyncio.wait_for(drain, timeout=1.0)
+        await _settle()
+        # Neither copy is acknowledged: the server re-offers the message.
+        assert calls == ["msg_1", "msg_2"]
+        assert api.sync_ack_calls == []
+        assert _ack_frames(ws) == ["msg_1"]
+
+        # The re-offer is a fresh attempt.
+        await ws.push(message_new("c", 2))
+        await _settle()
+        assert calls == ["msg_1", "msg_2", "msg_2"]
+        assert _ack_frames(ws) == ["msg_1", "msg_2"]
+    finally:
+        release.set()
+        await rt.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_a_cancelled_first_copy_releases_the_repeat_as_not_handled() -> None:
+    rt, _ws = await connected(capabilities=["ack"])
+    entered = asyncio.Event()
+
+    async def hangs(_m: dict[str, Any]) -> None:
+        entered.set()
+        await asyncio.Event().wait()
+
+    rt.on("message.new", hangs)
+    try:
+        frame = message_new("c", 1)
+        first = asyncio.create_task(rt._deliver_message_new(frame, ws_ack=False))
+        await entered.wait()
+        repeat = asyncio.create_task(rt._deliver_message_new(dict(frame), ws_ack=False))
+        await _settle()
+        assert not repeat.done()
+        first.cancel()
+        assert await asyncio.wait_for(repeat, timeout=1.0) is False
+        assert rt._inflight == {}
+    finally:
+        await rt.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_with_the_dedup_cache_off_every_copy_is_dispatched() -> None:
+    rt, _ws = await connected(capabilities=["ack"], dedup_cache_size=0)
+    release = asyncio.Event()
+    calls: list[str] = []
+
+    async def slow(m: dict[str, Any]) -> None:
+        calls.append(m["payload"]["id"])
+        await release.wait()
+
+    rt.on("message.new", slow)
+    try:
+        frame = message_new("c", 1)
+        tasks = [
+            asyncio.create_task(rt._deliver_message_new(dict(frame), ws_ack=False))
+            for _ in range(2)
+        ]
+        await _settle()
+        assert calls == ["msg_1", "msg_1"]
+        release.set()
+        await asyncio.gather(*tasks)
+    finally:
+        release.set()
+        await rt.disconnect()
+
+
+def test_the_ordering_cursor_never_moves_backwards() -> None:
+    state = _realtime._OrderState(next_expected_seq=8)
+    _realtime._advance_past(state, 5)  # a late copy of seq 5 finishing
+    assert state.next_expected_seq == 8
+    _realtime._advance_past(state, 8)
+    assert state.next_expected_seq == 9
+
+
+@pytest.mark.asyncio
+async def test_cleanup_never_drops_a_state_a_close_replaced() -> None:
+    rt, _ws = await connected(capabilities=["ack"])
+    try:
+        stale = _realtime._OrderState(next_expected_seq=3)
+        current = _realtime._OrderState(next_expected_seq=1)
+        current.buffer[2] = _realtime._PendingEnvelope(message=message_new("c", 2), ws_ack=True)
+        rt._order_states["c"] = current
+        rt._cleanup_if_idle("c", stale)  # an idle orphan from before the close
+        assert rt._order_states["c"] is current
     finally:
         await rt.disconnect()
 

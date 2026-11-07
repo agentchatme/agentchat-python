@@ -18,6 +18,25 @@ major. The on-the-wire API is versioned separately under `/v1/...`.
   handler has seen is unchanged, and there the SDKs still differ: Python
   drops it unacked, so it waits for the server to re-offer it on the next
   reconnect; TypeScript dispatches it late (out of order) and acks it.
+- A message could reach the `message.new` handlers twice while its first
+  copy's handler was still running. After a reconnect the server pushes its
+  stored backlog on the socket and the REST drain brings the same rows; the
+  dedup cache is filled only once a handler succeeds, so with a slow handler
+  (a model call) the second copy was dispatched again, and a script that
+  replies per message replied twice. A copy whose first copy is still with
+  the handlers is now not dispatched: it takes that outcome. Success acks it
+  (an ack frame for a live copy, the cursor for a drain row); a failure or a
+  cancelled first copy leaves it unacked so the server re-offers it. A copy
+  waits on the first copy only where it waited on its own handler call
+  before; a live repeat below the anchor, which used to be dropped at once,
+  still never holds up the socket and is acked when the first copy
+  finished. With `dedup_cache_size=0` every copy is dispatched, as before.
+  Matches the TypeScript SDK.
+- Two ordering-state races between concurrent copies are closed: the
+  per-conversation cursor never moves backwards when a slower copy finishes
+  after a faster one moved it on, and a caller that resumes after a socket
+  close no longer removes the new connection's ordering state (which could
+  drop frames parked in it).
 
 ### Added
 
