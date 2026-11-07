@@ -14,15 +14,17 @@ major. The on-the-wire API is versioned separately under `/v1/...`.
   a drain/live overlap or a lost ack) was dropped without an ack. The
   delivery-ack protocol acknowledges every dedup hit, because the earlier
   dispatch is the proof; the frame is now acked again, still without
-  re-dispatching it. A below-anchor frame no handler has seen is unchanged:
-  dropped unacked, so the server re-offers it. Matches the TypeScript SDK.
+  re-dispatching it, as the TypeScript SDK does. A below-anchor frame no
+  handler has seen is unchanged, and there the SDKs still differ: Python
+  drops it unacked, so it waits for the server to re-offer it on the next
+  reconnect; TypeScript dispatches it late (out of order) and acks it.
 
 ### Added
 
 - `conformance/v1/engine-scenarios.json` — the realtime engine's delivery
   rules as shared scenarios, run in both modes by both SDKs: a drain page
-  with a gap and a socket drop during an earlier handler or inside the gap
-  window, a handler that raises during a drain, and a repeat of an
+  with a gap and a socket drop during an earlier or a later row's handler
+  or inside the gap window, a handler that raises during a drain, and a repeat of an
   already-handled message below the live anchor (as a frame and as a drain
   row). Invariants checked on every scenario: nothing is acknowledged that a
   handler did not finish, no message is dispatched twice, seqs stay in order

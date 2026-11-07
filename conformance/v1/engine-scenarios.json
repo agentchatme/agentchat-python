@@ -97,6 +97,92 @@
     {
       "expect": {
         "ack_on_receipt": {
+          "dispatched": [
+            "msg_crew0late0001",
+            "msg_first0late001",
+            "msg_crew0late0003"
+          ],
+          "ws_acks": []
+        },
+        "default": {
+          "cursor_acks": [
+            "del_000000000000000000000000000f0001"
+          ],
+          "dispatched": [
+            "msg_crew0late0001",
+            "msg_first0late001"
+          ],
+          "ws_acks": []
+        }
+      },
+      "hold": [
+        "msg_first0late001"
+      ],
+      "name": "drain-gap-close-during-later-handler",
+      "steps": [
+        {
+          "op": "connect"
+        },
+        {
+          "op": "drain"
+        },
+        {
+          "message_id": "msg_first0late001",
+          "op": "wait_handler"
+        },
+        {
+          "op": "close"
+        },
+        {
+          "message_id": "msg_first0late001",
+          "op": "release"
+        }
+      ],
+      "sync_pages": [
+        [
+          {
+            "content": {
+              "text": "message 1"
+            },
+            "conversation_id": "conv_group0crew0001",
+            "created_at": "2026-11-04T23:01:00.000Z",
+            "delivery_id": "del_000000000000000000000000000f0001",
+            "id": "msg_crew0late0001",
+            "sender": "nova",
+            "seq": 1,
+            "type": "text"
+          },
+          {
+            "content": {
+              "text": "message 3"
+            },
+            "conversation_id": "conv_group0crew0001",
+            "created_at": "2026-11-04T23:03:00.000Z",
+            "delivery_id": "del_000000000000000000000000000f0003",
+            "id": "msg_crew0late0003",
+            "sender": "nova",
+            "seq": 3,
+            "type": "text"
+          },
+          {
+            "content": {
+              "text": "message 1"
+            },
+            "conversation_id": "conv_direct0first01",
+            "created_at": "2026-11-04T23:01:00.000Z",
+            "delivery_id": "del_000000000000000000000000000f0004",
+            "id": "msg_first0late001",
+            "sender": "nova",
+            "seq": 1,
+            "type": "text"
+          }
+        ]
+      ],
+      "why": "Drain page [g1, g3, h1]: seq 3 of the group waits on the gap (seq 2 is the agent's own message) and the handler for the direct message h1, a later row, is slow. The socket drops while it runs, which clears the parked g3 without dispatching it. The cursor stops at g1: an SDK that routes rows one at a time sees g3 cleared, not parked, by the time it computes the cursor."
+    },
+    {
+      "expect": {
+        "ack_on_receipt": {
           "cursor_acks": [
             "del_000000000000000000000000000a0001"
           ],
