@@ -1966,19 +1966,17 @@ class RealtimeClient:
             else 0
         )
 
-        seqs = sorted(state.buffer.keys())
-        if state.next_expected_seq is not None:
-            highest_dispatched = state.next_expected_seq - 1
-        else:
-            highest_dispatched = -1
-        for s in seqs:
-            pending = state.buffer[s]
+        # Take each frame out of the buffer before handing it over, lowest
+        # seq first, until the buffer is empty. The receive loop keeps
+        # running while a handler is awaited here: a frame that parks
+        # meanwhile is handed over too, never cleared unseen (under
+        # ack_on_receipt it is already acked and would be lost), and an entry
+        # another caller took in the meantime is simply not here any more.
+        while state.buffer:
+            seq = min(state.buffer)
+            pending = state.buffer.pop(seq)
             await self._deliver_message_new(pending.message, ws_ack=pending.ws_ack)
-            if s > highest_dispatched:
-                highest_dispatched = s
-        state.buffer.clear()
-        if highest_dispatched >= 0:
-            state.next_expected_seq = highest_dispatched + 1
+            _advance_past(state, seq)
 
         if state.gap_task is not None:
             state.gap_task.cancel()
@@ -2032,40 +2030,60 @@ class RealtimeClient:
         close (the frames are already acked). No gap-fill: an in-flight
         HTTP request would race the close.
         """
-        for conversation_id, state in list(self._order_states.items()):
+        # Keep going until no conversation has a parked frame: handlers are
+        # awaited here and the receive loop may still be running (disconnect
+        # flushes before it closes the socket), so a frame can park in any
+        # conversation meanwhile. Clearing it unseen would lose it once it is
+        # acked at receipt.
+        for state in self._order_states.values():
             if state.gap_task is not None:
                 state.gap_task.cancel()
                 state.gap_task = None
-            if not state.buffer:
-                continue
-            seqs = sorted(state.buffer.keys())
-            for s in seqs:
-                pending = state.buffer[s]
-                await self._deliver_message_new(
-                    pending.message, ws_ack=pending.ws_ack
-                )
-            state.buffer.clear()
-            if self._opts.on_sequence_gap is not None:
-                if state.gap_started_expected_seq is not None:
-                    expected_seq = state.gap_started_expected_seq
-                elif state.next_expected_seq is not None:
-                    expected_seq = state.next_expected_seq
-                else:
-                    expected_seq = 0
-                info = SequenceGapInfo(
-                    conversation_id=conversation_id,
-                    expected_seq=expected_seq,
-                    buffered_seq=seqs[0] if seqs else None,
-                    gap_ms=(
-                        int((time.monotonic() - state.gap_started_at) * 1000)
-                        if state.gap_started_at is not None
-                        else 0
-                    ),
-                    recovered=False,
-                    reason=reason,
-                )
-                await _invoke(self._opts.on_sequence_gap, info)
+        while True:
+            parked = [(cid, st) for cid, st in self._order_states.items() if st.buffer]
+            if not parked:
+                break
+            for conversation_id, state in parked:
+                await self._flush_conversation(conversation_id, state, reason)
+        for state in self._order_states.values():
+            if state.gap_task is not None:
+                state.gap_task.cancel()
+                state.gap_task = None
         self._order_states.clear()
+
+    async def _flush_conversation(
+        self, conversation_id: str, state: _OrderState, reason: GapReason
+    ) -> None:
+        if state.gap_task is not None:
+            state.gap_task.cancel()
+            state.gap_task = None
+        seqs: list[int] = []
+        while state.buffer:
+            seq = min(state.buffer)
+            pending = state.buffer.pop(seq)
+            seqs.append(seq)
+            await self._deliver_message_new(pending.message, ws_ack=pending.ws_ack)
+        if not seqs or self._opts.on_sequence_gap is None:
+            return
+        if state.gap_started_expected_seq is not None:
+            expected_seq = state.gap_started_expected_seq
+        elif state.next_expected_seq is not None:
+            expected_seq = state.next_expected_seq
+        else:
+            expected_seq = 0
+        info = SequenceGapInfo(
+            conversation_id=conversation_id,
+            expected_seq=expected_seq,
+            buffered_seq=seqs[0],
+            gap_ms=(
+                int((time.monotonic() - state.gap_started_at) * 1000)
+                if state.gap_started_at is not None
+                else 0
+            ),
+            recovered=False,
+            reason=reason,
+        )
+        await _invoke(self._opts.on_sequence_gap, info)
 
 
 # ───────────────────────── Module helpers ─────────────────────────

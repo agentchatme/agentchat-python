@@ -614,6 +614,127 @@ async def test_cleanup_never_drops_a_state_a_close_replaced() -> None:
         await rt.disconnect()
 
 
+# ─────────────── resolving a gap while a handler runs ───────────────
+#
+# When the gap window lapses, the gap task hands the parked frames over and
+# awaits each handler. The receive loop keeps running meanwhile, so frames
+# arrive while the gap is being resolved.
+
+
+def _gap_hook(errors: list[BaseException]) -> None:
+    asyncio.get_running_loop().set_exception_handler(
+        lambda _loop, context: errors.append(context.get("exception") or RuntimeError(context["message"]))
+    )
+
+
+@pytest.mark.parametrize("ack_on_receipt", [False, True])
+@pytest.mark.asyncio
+async def test_a_frame_that_parks_while_a_resolved_gap_is_handled_is_dispatched(
+    monkeypatch: pytest.MonkeyPatch, ack_on_receipt: bool
+) -> None:
+    # No REST client, so the lapsed gap is resolved without a fill. Seq 5
+    # parks while the handler for seq 3 runs. It was cleared with the buffer
+    # without ever being dispatched; under ack_on_receipt it was already
+    # acked, so no handler would ever see it.
+    monkeypatch.setattr("agentchatme._realtime._GAP_FILL_WINDOW_S", 0.05)
+    rt, ws = await connected(capabilities=["ack"], ack_on_receipt=ack_on_receipt)
+    release = asyncio.Event()
+    entered = asyncio.Event()
+    seen: list[int] = []
+
+    async def slow(m: dict[str, Any]) -> None:
+        seen.append(m["payload"]["seq"])
+        if m["payload"]["seq"] == 3:
+            entered.set()
+            await release.wait()
+
+    rt.on("message.new", slow)
+    try:
+        await ws.push(message_new("c", 1))
+        await ws.push(message_new("c", 3))
+        await asyncio.wait_for(entered.wait(), timeout=1.0)  # gap lapsed; 3 handed over
+        await ws.push(message_new("c", 5))
+        await _settle()
+        release.set()
+        await asyncio.sleep(0.2)
+        assert seen == [1, 3, 5]
+        assert sorted(_ack_frames(ws)) == ["msg_1", "msg_3", "msg_5"]
+    finally:
+        release.set()
+        await rt.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_the_missing_seq_arriving_while_a_resolved_gap_is_handled_is_not_a_crash(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Seq 2 arrives while the lapsed gap's handler for seq 3 runs. The
+    # receive loop dispatches it in order and drains the buffer; the gap
+    # task must not then look up an entry that is gone (KeyError) or hand
+    # seq 4 over a second time.
+    monkeypatch.setattr("agentchatme._realtime._GAP_FILL_WINDOW_S", 0.05)
+    errors: list[BaseException] = []
+    _gap_hook(errors)
+    rt, ws = await connected(capabilities=["ack"], ack_on_receipt=True)
+    release = asyncio.Event()
+    entered = asyncio.Event()
+    seen: list[int] = []
+
+    async def slow(m: dict[str, Any]) -> None:
+        seen.append(m["payload"]["seq"])
+        if m["payload"]["seq"] == 3:
+            entered.set()
+            await release.wait()
+
+    rt.on("message.new", slow)
+    try:
+        await ws.push(message_new("c", 1))
+        await ws.push(message_new("c", 3))
+        await ws.push(message_new("c", 4))
+        await asyncio.wait_for(entered.wait(), timeout=1.0)
+        await ws.push(message_new("c", 2))
+        await _settle()
+        release.set()
+        await asyncio.sleep(0.2)
+        assert sorted(seen) == [1, 2, 3, 4]
+        assert len(seen) == 4
+        assert errors == []
+        assert rt._order_states.get("c") is None or not rt._order_states["c"].buffer
+    finally:
+        release.set()
+        await rt.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_disconnect_dispatches_frames_that_park_during_its_own_flush() -> None:
+    # disconnect() flushes parked frames while the socket is still open; a
+    # frame that parks during that flush (the handler for an earlier one is
+    # awaited) was cleared with the ordering state. Acked at receipt, it
+    # must reach the handler.
+    rt, ws = await connected(capabilities=["ack"], ack_on_receipt=True)
+    release = asyncio.Event()
+    entered = asyncio.Event()
+    seen: list[int] = []
+
+    async def slow(m: dict[str, Any]) -> None:
+        seen.append(m["payload"]["seq"])
+        if m["payload"]["seq"] == 3:
+            entered.set()
+            await release.wait()
+
+    rt.on("message.new", slow)
+    await ws.push(message_new("c", 1))
+    await ws.push(message_new("c", 3))
+    await _settle()
+    stopping = asyncio.create_task(rt.disconnect())
+    await asyncio.wait_for(entered.wait(), timeout=1.0)
+    await ws.push(message_new("c", 6))
+    await _settle()
+    release.set()
+    await asyncio.wait_for(stopping, timeout=3.0)
+    assert seen == [1, 3, 6]
+
+
 # ─────────────── a guest in a host process ───────────────
 
 

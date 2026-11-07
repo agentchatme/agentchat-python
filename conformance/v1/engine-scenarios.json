@@ -17,6 +17,7 @@
     "connect": "Create the client for the mode, connect, open the socket and answer HELLO with {\"type\": \"hello.ok\", \"capabilities\": [\"ack\"]}.",
     "drain": "Start the client's offline drain (drainOfflineEnvelopes / drain_offline_envelopes) without awaiting it.",
     "frame": "The server sends {\"type\": \"message.new\", \"payload\": <payload>} on the socket.",
+    "gap_window_lapses": "Wait until the 2 s gap window has passed, so the client resolves the open gap (the REST gap fill returns nothing) and hands the parked frames over.",
     "release": "Let the held handler for message_id finish.",
     "wait_handler": "Wait until the handler has been entered for message_id."
   },
@@ -683,6 +684,94 @@
         ]
       ],
       "why": "The conversation's first live frame has a slow handler, and the REST drain brings the same row while it runs: below the anchor, not yet in the dedup cache. It is not handed over again; the cursor covers it once the first copy's handler finished."
+    },
+    {
+      "expect": {
+        "ack_on_receipt": {
+          "cursor_acks": [],
+          "dispatched": [
+            "msg_gone0wait0001",
+            "msg_gone0wait0003",
+            "msg_gone0wait0005"
+          ],
+          "ws_acks": [
+            "msg_gone0wait0001",
+            "msg_gone0wait0003",
+            "msg_gone0wait0005"
+          ]
+        },
+        "default": {
+          "cursor_acks": [],
+          "dispatched": [
+            "msg_gone0wait0001",
+            "msg_gone0wait0003",
+            "msg_gone0wait0005"
+          ]
+        }
+      },
+      "hold": [
+        "msg_gone0wait0003"
+      ],
+      "name": "frame-arrives-while-a-lapsed-gap-is-handled",
+      "steps": [
+        {
+          "op": "connect"
+        },
+        {
+          "op": "frame",
+          "payload": {
+            "content": {
+              "text": "message 1"
+            },
+            "conversation_id": "conv_group0gone0001",
+            "created_at": "2026-11-04T23:01:00.000Z",
+            "id": "msg_gone0wait0001",
+            "sender": "nova",
+            "seq": 1,
+            "type": "text"
+          }
+        },
+        {
+          "op": "frame",
+          "payload": {
+            "content": {
+              "text": "message 3"
+            },
+            "conversation_id": "conv_group0gone0001",
+            "created_at": "2026-11-04T23:03:00.000Z",
+            "id": "msg_gone0wait0003",
+            "sender": "nova",
+            "seq": 3,
+            "type": "text"
+          }
+        },
+        {
+          "op": "gap_window_lapses"
+        },
+        {
+          "message_id": "msg_gone0wait0003",
+          "op": "wait_handler"
+        },
+        {
+          "op": "frame",
+          "payload": {
+            "content": {
+              "text": "message 5"
+            },
+            "conversation_id": "conv_group0gone0001",
+            "created_at": "2026-11-04T23:05:00.000Z",
+            "id": "msg_gone0wait0005",
+            "sender": "nova",
+            "seq": 5,
+            "type": "text"
+          }
+        },
+        {
+          "message_id": "msg_gone0wait0003",
+          "op": "release"
+        }
+      ],
+      "why": "Seq 3 waits on a gap that is never filled. When the gap window lapses, seq 3 is handed over and its handler is slow. Seq 5 arrives while it runs. It must reach the handler: under ack_on_receipt it was acked at receipt, so a client that clears it with the buffer loses it for good."
     }
   ]
 }

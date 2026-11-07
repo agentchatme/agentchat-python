@@ -16,7 +16,7 @@ from typing import Any
 
 import pytest
 
-from agentchatme import RealtimeClient
+from agentchatme import RealtimeClient, _realtime
 
 from .test_realtime import MockWebSocket, _make_client
 
@@ -24,7 +24,7 @@ FIXTURE = Path(__file__).resolve().parent.parent / "conformance" / "v1" / "engin
 DOC: dict[str, Any] = json.loads(FIXTURE.read_text(encoding="utf-8"))
 
 MODES = ["default", "ack_on_receipt"]
-OPS = ["close", "connect", "drain", "frame", "release", "wait_handler"]
+OPS = ["close", "connect", "drain", "frame", "gap_window_lapses", "release", "wait_handler"]
 EXPECTATIONS = ["cursor_acks", "dispatched", "dispatched_includes", "ws_acks"]
 INVARIANTS = ["acked_was_handled", "acks_follow_handling", "dispatched_once", "seq_order"]
 
@@ -119,6 +119,9 @@ async def _run(scenario: dict[str, Any], mode: str) -> _Outcome:
             elif op == "drain":
                 assert rt is not None
                 drains.append(asyncio.create_task(rt.drain_offline_envelopes()))
+            elif op == "gap_window_lapses":
+                # The client's gap window plus slack, in real time.
+                await asyncio.sleep(_realtime._GAP_FILL_WINDOW_S + 0.15)
             elif op == "wait_handler":
                 for _ in range(100):
                     if any(p["id"] == step["message_id"] for p in out.dispatched):

@@ -37,6 +37,18 @@ major. The on-the-wire API is versioned separately under `/v1/...`.
   after a faster one moved it on, and a caller that resumes after a socket
   close no longer removes the new connection's ordering state (which could
   drop frames parked in it).
+- A frame could be acked and never handed to a handler under
+  `ack_on_receipt` (the Hermes setting). When a gap is resolved without a
+  fill (the window lapsed, the fill failed, or the buffer overflowed), or
+  parked frames are flushed at close or `disconnect()`, the client awaits
+  each handler in turn, and the receive loop keeps running meanwhile. A frame
+  that parked during those awaits was then cleared with the buffer: acked at
+  receipt, it was never handled. In the default mode it was left unacked and
+  waited for the next reconnect. Each frame is now taken out of the buffer
+  before it is handed over, and the client keeps going until no frame is
+  parked, so such frames are handed over too. This also ends a crash: when
+  the missing seq arrived meanwhile, the receive loop could take buffered
+  frames the gap task still expected (`KeyError`), or hand them over twice.
 
 ### Added
 
@@ -48,6 +60,9 @@ major. The on-the-wire API is versioned separately under `/v1/...`.
   row). Invariants checked on every scenario: nothing is acknowledged that a
   handler did not finish, no message is dispatched twice, seqs stay in order
   per conversation. Identical bytes ship in the TypeScript SDK.
+- Engine scenarios `repeat-while-handler-runs-in-order` / `-below-anchor`
+  and `frame-arrives-while-a-lapsed-gap-is-handled` (new op
+  `gap_window_lapses`, a real 2 s wait).
 
 ### Changed
 
