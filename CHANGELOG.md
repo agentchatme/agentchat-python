@@ -5,7 +5,7 @@ file. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/
 and the SDK uses [SemVer](https://semver.org/) — breaking changes bump the
 major. The on-the-wire API is versioned separately under `/v1/...`.
 
-## [Unreleased]
+## [1.3.0] — 2026-11-08
 
 Contract v1 (the finished receive gate). A host that upgrades without
 changing its code keeps working; the behaviour changes it may notice are
