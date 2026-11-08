@@ -814,6 +814,95 @@ async def test_stop_tells_running_turns_and_an_outcome_after_stop_is_still_recor
     ]
 
 
+# ─────────────── deadlines ───────────────
+
+
+@pytest.mark.asyncio
+async def test_a_gate_call_past_its_deadline_fails_closed_and_records_nothing() -> None:
+    client = _LoopClient([_tray([_card("c1", "m1")])])
+    hang = asyncio.Event()
+
+    async def call_model(_prompt: str) -> str:
+        await hang.wait()
+        return _answer(("c1", "dismiss"))
+
+    loop = _loop(client, call_model=call_model, start_turn=_Turns(), gate_call_timeout_ms=30)
+    await loop.start()
+    await _cycle(loop)
+    await asyncio.sleep(0.05)
+    await loop.idle()
+    summary = loop.status().last_cycle
+    assert summary is not None and summary.outcome == "fail_closed"
+    assert "timed out" in (summary.failure or "")
+    assert client.decisions.recorded == []
+    hang.set()
+    await loop.stop()
+
+
+@pytest.mark.asyncio
+async def test_a_cycle_that_never_finishes_is_abandoned_and_wakes_are_taken_again() -> None:
+    client = _LoopClient([_tray([_card("c1", "m1")])])
+    stuck = asyncio.Event()
+    checks = 0
+
+    async def readiness() -> Readiness:
+        nonlocal checks
+        checks += 1
+        if checks == 1:
+            await stuck.wait()  # never answers
+        return Readiness(ready=True)
+
+    loop = _loop(
+        client,
+        call_model=lambda _p: _answer(("c1", "dismiss")),
+        start_turn=_Turns(),
+        readiness=readiness,
+        cycle_timeout_ms=50,
+    )
+    await loop.start()
+    loop.wake()
+    await asyncio.sleep(0.15)
+    await loop.idle()
+    outcomes = [c.outcome for c in loop.status().recent_cycles]
+    assert outcomes == ["abandoned"]
+    await _cycle(loop)  # the coalescer takes wakes again
+    assert [c.outcome for c in loop.status().recent_cycles] == ["abandoned", "decided"]
+    assert client.decisions.recorded[0]["decision"] == "dismiss"
+    await loop.stop()
+
+
+@pytest.mark.asyncio
+async def test_time_spent_starting_a_turn_does_not_count_against_the_cycle() -> None:
+    client = _LoopClient([_tray([_card("c1", "m1")])])
+
+    async def slow_start(_request: TurnRequest) -> TurnAdmission:
+        await asyncio.sleep(0.15)  # longer than the cycle deadline
+        done: asyncio.Future[TurnEnd] = asyncio.get_running_loop().create_future()
+        return TurnAdmission(started=True, done=done)
+
+    loop = _loop(
+        client, call_model=lambda _p: _answer(("c1", "reply")), start_turn=slow_start, cycle_timeout_ms=50
+    )
+    await loop.start()
+    loop.wake()
+    await asyncio.sleep(0.3)
+    await loop.idle()
+    summary = loop.status().last_cycle
+    assert summary is not None and summary.outcome == "decided" and summary.turns_started == 1
+    await loop.stop()
+
+
+@pytest.mark.asyncio
+async def test_status_keeps_the_recent_cycle_outcomes() -> None:
+    client = _LoopClient([_tray([])])
+    loop = _loop(client, call_model=lambda _p: "", start_turn=_Turns())
+    await loop.start()
+    for _ in range(3):
+        await _cycle(loop)
+    assert [c.outcome for c in loop.status().recent_cycles] == ["empty", "empty", "empty"]
+    await loop.stop()
+
+
 # ─────────────── a truncated tray never spins ───────────────
 
 

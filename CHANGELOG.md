@@ -109,6 +109,13 @@ changes under **Types**.
   to 60 s; `status()` marks turns running past 30 min as overdue; `idle()`
   waits for the running cycle. `turn_outcome` recognises the turn's own
   verdict by the `your_last_decision` key only (no clock).
+- `ReceiveLoop` deadlines: `gate_call_timeout_ms` (60 s; past it the cycle
+  fails closed for those cards, nothing recorded) and a cycle watchdog,
+  `cycle_timeout_ms` (10 min, not counting time spent starting turns or
+  runs; past it the cycle is abandoned, logged and summarised as
+  `abandoned`, and wakes are taken again). `status().recent_cycles` keeps
+  the last 20 cycle summaries. `gate.run_async(..., timeout_ms=)` bounds the
+  model call.
 - `inbox.tray(include_invites=True)` sends `invites=1`: a pending invite then
   also ends a held read (default off, as before).
 - `register`, `verify`, `recover` and `recover_verify` take `timeout_ms` and

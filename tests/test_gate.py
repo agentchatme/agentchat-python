@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from pathlib import Path
 from typing import Any
@@ -415,6 +416,21 @@ def test_run_with_a_typed_tray_hands_back_typed_cards() -> None:
 
 
 # ─────────────── run_async ───────────────
+
+
+@pytest.mark.asyncio
+async def test_run_async_fails_closed_when_the_model_call_passes_its_deadline() -> None:
+    decisions = FakeAsyncDecisions()
+
+    async def never(_prompt: str) -> str:
+        await asyncio.Event().wait()
+        return ""
+
+    result = await gate.run_async(
+        sample_tray(), never, FakeClient(decisions), texts=GATE_TEXTS, timeout_ms=20  # type: ignore[arg-type]
+    )
+    assert result.outcome == "fail_closed" and "timed out" in (result.failure or "")
+    assert decisions.calls == [] and result.recorded == 0
 
 
 @pytest.mark.asyncio

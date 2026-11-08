@@ -40,6 +40,15 @@ unless a newer message moves its anchor or an ``unanswered`` wake names it;
 after an invite turn that left the invite pending, no second invite turn for
 it within ``pace_ms`` unless an ``unanswered`` wake arrives. In memory.
 
+Deadlines: one gate call may take ``gate_call_timeout_ms`` (60 s); past it
+the cycle fails closed for those cards (nothing recorded; the next wake
+retries). A whole cycle may take ``cycle_timeout_ms`` (10 min), not counting
+time spent starting turns or running a run; past it the cycle is abandoned
+(logged, summarised as ``abandoned``) and wakes are taken again, so a cycle
+that never finishes cannot leave the loop looking healthy while it
+processes nothing. ``status().recent_cycles`` holds the last outcomes for a
+host to alarm on.
+
 Turns: at most ``max_concurrent_turns`` (default 1) reply and invite turns
 run at once; the rest wait for a slot, held out of the gate meanwhile (their
 cards stay on the tray; nothing is recorded for them). A turn that ends
@@ -61,7 +70,7 @@ import inspect
 import logging
 import time
 from collections import OrderedDict, deque
-from collections.abc import Awaitable, Mapping
+from collections.abc import Awaitable, Iterator, Mapping
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from typing import Any, Callable, Literal
@@ -89,6 +98,14 @@ TURN_OVERDUE_MS = 30 * 60_000
 """A running turn older than this is shown as overdue in ``status()``."""
 _NO_PROGRESS_BACKOFF_MS = 1_000
 _NO_PROGRESS_BACKOFF_MAX_MS = 60_000
+GATE_CALL_TIMEOUT_MS = 60_000
+"""Default bound on one gate call (the model answering the gate question)."""
+CYCLE_TIMEOUT_MS = 10 * 60_000
+"""Default bound on one cycle, not counting time spent starting turns or
+runs: past it the cycle is abandoned and wakes are taken again."""
+RECENT_CYCLES = 20
+"""How many cycle summaries ``status()`` keeps."""
+_WATCHDOG_TICK_S = 1.0
 PACE_MS = 60_000
 """D5 pacing: how long a silent turn's card (or an invite after its turn) is
 not gated again at the same anchor."""
@@ -109,6 +126,7 @@ CycleOutcome = Literal[
     "run_completed",
     "run_failed",
     "run_not_started",
+    "abandoned",
 ]
 
 
@@ -221,6 +239,10 @@ class ReceiveLoopStatus:
     coalescer: dict[str, Any]
     texts: dict[str, Any]
     last_cycle: CycleSummary | None
+    recent_cycles: list[CycleSummary]
+    """The last cycles, oldest first (at most ``RECENT_CYCLES``): alarm on a
+    run of ``fail_closed`` / ``tools_unavailable`` / ``texts_missing`` /
+    ``abandoned``."""
     turns: list[RunningTurn]
     counters: dict[str, Any]
     last_error: str | None
@@ -358,6 +380,8 @@ class ReceiveLoop:
         on_event: Callable[[ReceiveLoopEvent], Any] | None = None,
         max_concurrent_turns: int = 1,
         pace_ms: float = PACE_MS,
+        gate_call_timeout_ms: float = GATE_CALL_TIMEOUT_MS,
+        cycle_timeout_ms: float = CYCLE_TIMEOUT_MS,
         turn_tracker: TurnTracker | None = None,
         now: Callable[[], float] | None = None,
         set_timer: SetTimer | None = None,
@@ -416,6 +440,13 @@ class ReceiveLoop:
         self._stopped = False
         self._held_while_running = False
         self._last_cycle: CycleSummary | None = None
+        self._recent: deque[CycleSummary] = deque(maxlen=RECENT_CYCLES)
+        self._gate_call_timeout_ms = gate_call_timeout_ms
+        self._cycle_timeout_s = max(0.0, cycle_timeout_ms / 1000.0)
+        # Time spent starting turns / runs (excluded from the cycle watchdog).
+        self._turn_depth = 0
+        self._turn_since = 0.0
+        self._turn_clock = 0.0
         self._last_error: str | None = None
         self._counts: dict[str, int] = {
             "frames": 0,
@@ -567,6 +598,7 @@ class ReceiveLoop:
                 "last_error": getattr(self._texts, "last_error", None),
             },
             last_cycle=self._last_cycle,
+            recent_cycles=list(self._recent),
             turns=[
                 replace(turn, overdue=self._now() - turn.started_at > TURN_OVERDUE_MS)
                 for turn in self._tracker.running()
@@ -640,13 +672,67 @@ class ReceiveLoop:
     async def _cycle(self) -> None:
         if self._stopped:
             return
-        summary = (
-            await self._gate_call_cycle() if self._mode == "gate_call" else await self._single_run_cycle()
+        body: asyncio.Future[CycleSummary] = asyncio.ensure_future(
+            self._gate_call_cycle() if self._mode == "gate_call" else self._single_run_cycle()
         )
+        summary = await self._watch(body)
         self._last_cycle = summary
+        self._recent.append(summary)
         if summary.failure is not None:
             self._last_error = summary.failure
         self._emit({"type": "cycle", "summary": summary})
+
+    async def _watch(self, body: asyncio.Future[CycleSummary]) -> CycleSummary:
+        """The cycle watchdog: a cycle running longer than
+        ``cycle_timeout_ms`` — not counting time spent starting turns or
+        runs — is abandoned (cancelled, logged, summarised as ``abandoned``)
+        so the coalescer takes wakes again and the next wake retries."""
+        if self._cycle_timeout_s <= 0:
+            return await body
+        started = time.monotonic()
+        turns_at_start = self._turn_seconds()
+        try:
+            while True:
+                used = (time.monotonic() - started) - (self._turn_seconds() - turns_at_start)
+                left = self._cycle_timeout_s - used
+                if left <= 0 and self._turn_depth == 0:
+                    break
+                done, _ = await asyncio.wait(
+                    {body}, timeout=max(0.005, min(left, _WATCHDOG_TICK_S))
+                )
+                if body in done:
+                    return body.result()
+        except asyncio.CancelledError:
+            body.cancel()
+            raise
+        body.cancel()
+        with contextlib.suppress(BaseException):
+            await body
+        failure = (
+            f"cycle abandoned after {self._cycle_timeout_s:g}s (a tray read, the texts,"
+            " the readiness check, the gate call or a verdict never finished); the next"
+            " wake retries"
+        )
+        _log.error("receive loop: %s", failure)
+        return self._summary("abandoned", failure=failure)
+
+    def _turn_seconds(self) -> float:
+        extra = time.monotonic() - self._turn_since if self._turn_depth > 0 else 0.0
+        return self._turn_clock + extra
+
+    @contextlib.contextmanager
+    def _inside_turn(self) -> Iterator[None]:
+        """Time the cycle spends starting a turn or running a run: not
+        counted by the watchdog."""
+        if self._turn_depth == 0:
+            self._turn_since = time.monotonic()
+        self._turn_depth += 1
+        try:
+            yield
+        finally:
+            self._turn_depth -= 1
+            if self._turn_depth == 0:
+                self._turn_clock += time.monotonic() - self._turn_since
 
     async def _read_tray(self) -> dict[str, Any] | None:
         try:
@@ -746,6 +832,7 @@ class ReceiveLoop:
                 self._client,
                 tool_namer=self._tool_namer,
                 texts=texts,
+                timeout_ms=self._gate_call_timeout_ms if self._gate_call_timeout_ms > 0 else None,
             )
             for verdict in result.verdicts:
                 tally[verdict.decision] += 1
@@ -812,7 +899,8 @@ class ReceiveLoop:
         request = RunRequest(prompt=prompt, texts=texts, cards=cards, invites=invites, stopping=self._stopping)
         try:
             assert self._start_run is not None
-            raw = await self._call(self._start_run, request)
+            with self._inside_turn():
+                raw = await self._call(self._start_run, request)
             end = raw if isinstance(raw, RunEnd) else RunEnd(status="failed", detail=f"start_run returned {type(raw).__name__}")
         except Exception as err:
             end = RunEnd(status="not_started", detail=str(err) or type(err).__name__)
@@ -1055,7 +1143,8 @@ class ReceiveLoop:
         whole turn in a worker thread and returns its :class:`TurnEnd`."""
         try:
             if _is_async(start):
-                answer = await start(request)
+                with self._inside_turn():
+                    answer = await start(request)
             else:
                 return TurnAdmission(started=True, done=asyncio.ensure_future(self._run_sync_turn(start, request)))
         except Exception as err:

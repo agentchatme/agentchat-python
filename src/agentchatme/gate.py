@@ -72,6 +72,7 @@ in both SDKs.
 
 from __future__ import annotations
 
+import asyncio
 import inspect
 import json
 import re
@@ -642,9 +643,15 @@ async def run_async(
     *,
     tool_namer: ToolNamer | None = None,
     texts: TextsLike | None = None,
+    timeout_ms: float | None = None,
 ) -> GateResult[AsyncGateReply]:
     """Async counterpart of :func:`run`. ``call_model`` may be sync or async;
-    reply entries are recorded with ``await entry.record()``."""
+    reply entries are recorded with ``await entry.record()``.
+
+    ``timeout_ms`` bounds the model call: past it the gate fails closed for
+    every card on the tray (nothing recorded; the next wake asks again). A
+    sync ``call_model`` cannot be interrupted: it is left to finish, unheard.
+    ``None`` (default): no bound."""
     prepared = _prepare(tray)
     if not prepared.ids:
         return _closed("empty", [], None)
@@ -655,7 +662,20 @@ async def run_async(
         return _closed("fail_closed", prepared.ids, str(err))
     try:
         result = call_model(prompt)
-        text = await result if inspect.isawaitable(result) else result
+        if inspect.isawaitable(result):
+            text = (
+                await asyncio.wait_for(result, timeout_ms / 1000.0)
+                if timeout_ms is not None
+                else await result
+            )
+        else:
+            text = result
+    except asyncio.TimeoutError:
+        return _closed(
+            "fail_closed", prepared.ids, f"model call timed out after {timeout_ms / 1000.0:g}s"
+            if timeout_ms is not None
+            else "model call timed out",
+        )
     except Exception as err:
         return _closed("fail_closed", prepared.ids, f"model call failed: {err}")
 
