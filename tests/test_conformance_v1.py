@@ -9,7 +9,6 @@ import asyncio
 import hashlib
 import json
 import re
-from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -21,7 +20,6 @@ from agentchatme import (
     gate,
     verify_wake_webhook,
 )
-from agentchatme._connect_budget import BudgetClose, BudgetUpgrade
 from agentchatme._realtime import wake_payload_problem
 from agentchatme.integration import (
     AgentChatCallCount,
@@ -171,29 +169,19 @@ def test_wake_webhook_payload_v1_parses_every_reason() -> None:
 BUDGET = load("connect-budget.cases.json")
 
 
-def _budget_event(event: dict[str, Any]) -> BudgetClose | BudgetUpgrade:
-    if event["kind"] == "close":
-        return BudgetClose(code=event["code"], reason=event["reason"])
-    now = event.get("now")
-    now_ms = (
-        int(datetime.fromisoformat(now.replace("Z", "+00:00")).timestamp() * 1000)
-        if isinstance(now, str)
-        else None
-    )
-    return BudgetUpgrade(status=event["status"], retry_after=event["retry_after"], now_ms=now_ms)
-
-
 def test_connect_budget_rules_are_the_ones_this_harness_knows() -> None:
-    assert sorted(BUDGET["rules"]) == ["bounds", "close_1013", "jitter", "state", "upgrade_429"]
-    assert BUDGET["default_delay_ms"] == 60_000
+    assert sorted(BUDGET["rules"]) == ["bounds", "close_1013", "jitter", "state"]
     assert BUDGET["min_delay_ms"] == 1_000
     assert BUDGET["max_delay_ms"] == 3_600_000
+    assert all(case["event"]["kind"] == "close" for case in BUDGET["cases"])
 
 
 @pytest.mark.parametrize("case", BUDGET["cases"], ids=[c["name"] for c in BUDGET["cases"]])
 def test_connect_budget_case(case: dict[str, Any]) -> None:
     assert case["expect"]["blocked"] is False
-    assert connect_budget_delay_ms(_budget_event(case["event"])) == case["expect"]["delay_ms"]
+    event = case["event"]
+    got = connect_budget_delay_ms(code=event["code"], reason=event["reason"])
+    assert got == case["expect"]["delay_ms"]
 
 
 # ─────────────── wake webhook verification ───────────────

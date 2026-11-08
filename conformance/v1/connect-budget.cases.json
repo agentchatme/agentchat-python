@@ -1,5 +1,5 @@
 {
-  "about": "Connect budget (contract v1, D8). Over its per-agent connect budget the server answers the WebSocket upgrade with HTTP 429 and Retry-After, or closes the socket with 1013 and a retry hint in the close reason after the HELLO. Either way the client backs off for the server's delay; it never goes blocked. Cases give the event and the delay the next attempt waits; delay_ms null means the ordinary reconnect backoff applies.",
+  "about": "Connect budget (contract v1, D8). Over its per-agent connect budget the server accepts the WebSocket upgrade and closes the socket with 1013 and a retry hint in the close reason (\"rate_limited; retry_after=<seconds>\"), on both auth paths. The client backs off for the server's delay; it never goes blocked. Cases give the close and the delay the next attempt waits; delay_ms null means the ordinary reconnect backoff applies. (An upgrade answered with an HTTP status, 429 included, takes the ordinary backoff: no server answers that way, and a client only tolerates it.)",
   "cases": [
     {
       "event": {
@@ -17,18 +17,6 @@
       "event": {
         "code": 1013,
         "kind": "close",
-        "reason": "Retry-After: 12"
-      },
-      "expect": {
-        "blocked": false,
-        "delay_ms": 12000
-      },
-      "name": "close-1013-hint-with-a-dash-and-colon"
-    },
-    {
-      "event": {
-        "code": 1013,
-        "kind": "close",
         "reason": "rate_limited; retry_after=42"
       },
       "expect": {
@@ -36,6 +24,18 @@
         "delay_ms": 42000
       },
       "name": "close-1013-as-the-server-sends-it"
+    },
+    {
+      "event": {
+        "code": 1013,
+        "kind": "close",
+        "reason": "Retry-After: 12"
+      },
+      "expect": {
+        "blocked": false,
+        "delay_ms": 12000
+      },
+      "name": "close-1013-hint-with-a-dash-and-colon"
     },
     {
       "event": {
@@ -111,55 +111,6 @@
     },
     {
       "event": {
-        "kind": "upgrade",
-        "retry_after": "30",
-        "status": 429
-      },
-      "expect": {
-        "blocked": false,
-        "delay_ms": 30000
-      },
-      "name": "upgrade-429-delta-seconds"
-    },
-    {
-      "event": {
-        "kind": "upgrade",
-        "now": "2026-11-08T12:00:00.000Z",
-        "retry_after": "Sun, 08 Nov 2026 12:00:45 GMT",
-        "status": 429
-      },
-      "expect": {
-        "blocked": false,
-        "delay_ms": 45000
-      },
-      "name": "upgrade-429-http-date"
-    },
-    {
-      "event": {
-        "kind": "upgrade",
-        "retry_after": null,
-        "status": 429
-      },
-      "expect": {
-        "blocked": false,
-        "delay_ms": 60000
-      },
-      "name": "upgrade-429-without-retry-after"
-    },
-    {
-      "event": {
-        "kind": "upgrade",
-        "retry_after": "soon",
-        "status": 429
-      },
-      "expect": {
-        "blocked": false,
-        "delay_ms": 60000
-      },
-      "name": "upgrade-429-unusable-retry-after"
-    },
-    {
-      "event": {
         "code": 1006,
         "kind": "close",
         "reason": ""
@@ -183,14 +134,12 @@
       "name": "close-1011-is-the-ordinary-backoff"
     }
   ],
-  "default_delay_ms": 60000,
   "max_delay_ms": 3600000,
   "min_delay_ms": 1000,
   "rules": {
     "bounds": "The delay is clamped to [min_delay_ms, max_delay_ms].",
     "close_1013": "The hint is the first \"retry_after\" (or \"retry-after\"), case-insensitive, followed by \"=\", \":\" or spaces and whole seconds; the server sends \"rate_limited; retry_after=<seconds>\". A 1013 without a hint is not a budget answer (the server also closes a slow consumer with 1013 \"overload\"): the ordinary reconnect backoff applies, as before contract v1.",
     "jitter": "A client may wait up to 10% longer than delay_ms, never less.",
-    "state": "The client is in backoff (never blocked) until the attempt; the next attempt is a normal connect.",
-    "upgrade_429": "Retry-After per RFC 9110: whole seconds, or an HTTP date measured from now. Missing or unusable: default_delay_ms."
+    "state": "The client is in backoff (never blocked) until the attempt; the next attempt is a normal connect."
   }
 }

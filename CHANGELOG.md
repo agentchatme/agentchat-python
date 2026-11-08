@@ -27,7 +27,7 @@ that upgrades without changing its code keeps working as before.
   `headers`; `CallOptions(retry="never" | "auto" | RetryPolicy)`.
 - `verify_wake_webhook(dialect=, body=, headers=, secret=)` for the
   `agentchat`, `hermes` and `standard-webhooks` wake dialects;
-  `connect_budget_delay_ms`.
+  `connect_budget_delay_ms(code=, reason=)`.
 - Types for tray v1 (`version`, `invites`, `invites_truncated`), the served
   gate-call texts and manual `sha256`, the `unanswered` wake, the `heartbeat`
   frame, socket capabilities and wake webhook status/test/clear.
@@ -65,10 +65,11 @@ that upgrades without changing its code keeps working as before.
 - A re-offer whose first copy is still with the handlers is not dispatched
   again on a later connection either, while that copy has run less than
   `in_flight_adopt_ms` (15 min).
-- The connect budget: HTTP 429 before the upgrade (Retry-After; default
-  1 min) and a close 1013 carrying `retry_after=<s>` wait for the server's
-  delay (1 s to 1 h), never `blocked`. Any other 1013 (the slow-consumer
-  `overload` close) keeps the ordinary backoff.
+- The connect budget: a close 1013 carrying `retry_after=<s>` (the server
+  sends `rate_limited; retry_after=<s>`) waits for the server's delay
+  (1 s to 1 h, plus up to 10 %), never `blocked`. Any other 1013 (the
+  slow-consumer `overload` close), and an upgrade answered with an HTTP
+  status (429 included, Retry-After ignored), keeps the ordinary backoff.
 - Without `rewake`, `wake` frames keep the 1.2 validation.
 - `decisions.record` succeeds on any 2xx (an empty body, 204, or a body
   without the row): fields the server did not echo come from the request,

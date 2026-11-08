@@ -15,8 +15,9 @@ Mirrors the TypeScript ``RealtimeClient`` behavior:
   an inbound frame, so the idle watchdog works on any transport
 - Handlers run off the receive loop: a slow handler never holds up frame
   reads, acks of other frames, or the transport's pongs
-- A connect budget answer (HTTP 429 before the upgrade, close 1013 after
-  HELLO) is backoff with the server's delay, never ``blocked``
+- A connect budget answer (close 1013 with ``retry_after``) is backoff with
+  the server's delay, never ``blocked``; any other 1013, and an upgrade
+  answered with an HTTP status, is the ordinary backoff
 - Jittered exponential reconnect that never gives up, a ``blocked`` state
   with a slow retry after an auth rejection, handshake + liveness watchdogs,
   disposed flag, offline ``/sync`` drain speaking the bare-array wire
@@ -76,7 +77,7 @@ from typing import (
 
 from ._client import last_sync_delivery_id
 from ._client_identity import DEFAULT_CLIENT_IDENTITY, AgentChatClientIdentity
-from ._connect_budget import BudgetClose, BudgetUpgrade, connect_budget_delay_ms
+from ._connect_budget import connect_budget_delay_ms
 from .errors import ConnectionError as _RealtimeConnectionError
 
 if TYPE_CHECKING:
@@ -371,11 +372,10 @@ _SYNC_PAGE_SIZE = 100
 # exposes no ping(); this deadline is two missed heartbeats plus margin.
 _HEARTBEAT_LIVENESS_TIMEOUT_MS = 100_000
 
-# Connect budget (per agent on /v1/ws, D8): over budget the server answers
-# HTTP 429 with ``Retry-After`` before the upgrade, or closes 1013 with a
-# retry hint after HELLO. Both are backoff with the server's delay (see
-# ``_connect_budget``), never ``blocked``. The client waits up to 10 % longer
-# than that delay, never less, so a fleet told the same delay spreads out.
+# Connect budget (per agent on /v1/ws, D8): over budget the server closes
+# 1013 with a retry hint (see ``_connect_budget``): backoff with the server's
+# delay, never ``blocked``. The client waits up to 10 % longer than that
+# delay, never less, so a fleet told the same delay spreads out.
 _RATE_LIMIT_JITTER = 0.1
 
 # disconnect(): how long dispatches still running get to finish before they
@@ -458,34 +458,6 @@ def _budget_wait_ms(delay_ms: int) -> int:
     """The server's delay, up to 10 % longer to spread a fleet told the same
     delay, never shorter."""
     return _jittered_above_ms(delay_ms, _RATE_LIMIT_JITTER)
-
-
-def _upgrade_rejection(err: BaseException) -> tuple[int, str | None] | None:
-    """``(status, Retry-After)`` when opening the socket failed because the
-    server answered the upgrade with an HTTP status, else ``None``.
-
-    Duck-typed across ``websockets`` releases: the asyncio client raises
-    ``InvalidStatus`` (``err.response.status_code`` / ``.headers``), the
-    legacy one ``InvalidStatusCode`` (``err.status_code`` / ``err.headers``).
-    """
-    response = getattr(err, "response", None)
-    status = getattr(response, "status_code", None) if response is not None else None
-    headers = getattr(response, "headers", None) if response is not None else None
-    if not isinstance(status, int):
-        status = getattr(err, "status_code", None)
-        headers = getattr(err, "headers", None)
-    if not isinstance(status, int) or isinstance(status, bool):
-        return None
-    retry_after: str | None = None
-    if headers is not None:
-        getter = getattr(headers, "get", None)
-        if callable(getter):
-            value = getter("Retry-After")
-            if value is None:
-                value = getter("retry-after")
-            if isinstance(value, str):
-                retry_after = value
-    return status, retry_after
 
 
 async def _default_sleep(delay_s: float) -> None:
@@ -868,25 +840,12 @@ class RealtimeClient:
             ws = await connect_fn(url, **_keepalive_kwargs(connect_fn))
         except Exception as err:
             self._connecting = False
-            budget_ms: int | None = None
-            rejection = _upgrade_rejection(err)
-            if rejection is not None:
-                # The connect budget, before the upgrade (HTTP 429): backoff
-                # with the server's delay, never blocked.
-                budget_ms = connect_budget_delay_ms(
-                    BudgetUpgrade(status=rejection[0], retry_after=rejection[1])
-                )
-            if budget_ms is not None:
-                self._rate_limited_ms = budget_ms
-                error = _RealtimeConnectionError(
-                    f"the server refused the connection: connect budget exceeded"
-                    f" (HTTP {rejection[0] if rejection else 429});"
-                    f" retrying in {round(budget_ms / 1000)}s"
-                )
-            else:
-                error = _RealtimeConnectionError(f"WebSocket connection failed: {err}")
+            # Any failed open, an upgrade answered with an HTTP status (429
+            # included) too, is the ordinary backoff: the connect budget is
+            # answered after the upgrade (close 1013), never before it.
+            error = _RealtimeConnectionError(f"WebSocket connection failed: {err}")
             await self._emit_error(error)
-            await self._schedule_reconnect(server_delay_ms=budget_ms)
+            await self._schedule_reconnect()
             raise error from err
         finally:
             self._connecting = False
@@ -1333,9 +1292,7 @@ class RealtimeClient:
             # auth verdict, whenever it arrives.
             rate_limited_ms: int | None = None
             if not ours:
-                rate_limited_ms = connect_budget_delay_ms(
-                    BudgetClose(code=close_code, reason=close_reason)
-                )
+                rate_limited_ms = connect_budget_delay_ms(code=close_code, reason=close_reason)
                 if rate_limited_ms is not None:
                     self._rate_limited_ms = rate_limited_ms
 
@@ -1819,7 +1776,7 @@ class RealtimeClient:
     @property
     def rate_limited_ms(self) -> int | None:
         """The delay the server's connect budget asked for on the last
-        refused attempt (HTTP 429 or close 1013), until the next
+        refused attempt (a close 1013 with ``retry_after``), until the next
         ``hello.ok``; ``None`` otherwise."""
         return self._rate_limited_ms
 

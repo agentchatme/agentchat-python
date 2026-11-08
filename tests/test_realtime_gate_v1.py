@@ -13,7 +13,7 @@ from typing import Any
 import pytest
 
 from agentchatme import RealtimeClient, _realtime
-from agentchatme._realtime import _upgrade_rejection, wake_payload_problem
+from agentchatme._realtime import wake_payload_problem
 
 from .test_realtime import MockWebSocket, _ack_frames, _make_client, _settle
 from .test_realtime_engine import connected, message_new
@@ -596,47 +596,17 @@ async def test_a_hinted_1013_during_the_handshake_is_not_an_auth_rejection() -> 
         await rt.disconnect()
 
 
-class _Headers:
-    def __init__(self, values: dict[str, str]) -> None:
-        self._values = values
-
-    def get(self, key: str) -> str | None:
-        return self._values.get(key)
-
-
-class _Response:
-    def __init__(self, status: int, headers: dict[str, str]) -> None:
-        self.status_code = status
-        self.headers = _Headers(headers)
-
-
 class _InvalidStatus(Exception):
     """The shape of websockets' asyncio-client ``InvalidStatus``."""
 
     def __init__(self, status: int, headers: dict[str, str]) -> None:
         super().__init__(f"server rejected WebSocket connection: HTTP {status}")
-        self.response = _Response(status, headers)
-
-
-class _InvalidStatusCode(Exception):
-    """The shape of websockets' legacy ``InvalidStatusCode``."""
-
-    def __init__(self, status: int, headers: dict[str, str]) -> None:
-        super().__init__(f"server rejected WebSocket connection: HTTP {status}")
         self.status_code = status
-        self.headers = _Headers(headers)
+        self.headers = headers
 
 
-def test_upgrade_rejection_reads_both_websockets_shapes() -> None:
-    assert _upgrade_rejection(_InvalidStatus(429, {"Retry-After": "7"})) == (429, "7")
-    assert _upgrade_rejection(_InvalidStatusCode(429, {"retry-after": "9"})) == (429, "9")
-    assert _upgrade_rejection(_InvalidStatus(503, {})) == (503, None)
-    assert _upgrade_rejection(OSError("connection refused")) is None
-
-
-@pytest.mark.parametrize("exc_type", [_InvalidStatus, _InvalidStatusCode])
 @pytest.mark.asyncio
-async def test_a_429_upgrade_backs_off_with_retry_after_and_never_blocks(exc_type: Any) -> None:
+async def test_an_upgrade_answered_429_is_the_ordinary_backoff_never_blocked() -> None:
     attempts = 0
     ok = MockWebSocket()
 
@@ -644,10 +614,16 @@ async def test_a_429_upgrade_backs_off_with_retry_after_and_never_blocks(exc_typ
         nonlocal attempts
         attempts += 1
         if attempts == 1:
-            raise exc_type(429, {"Retry-After": "20"})
+            raise _InvalidStatus(429, {"Retry-After": "3600"})
         return ok
 
-    rt = RealtimeClient(api_key="sk_test", reconnect=True, websocket_connect=connect)
+    rt = RealtimeClient(
+        api_key="sk_test",
+        reconnect=True,
+        reconnect_interval_ms=10,
+        max_reconnect_interval_ms=20,
+        websocket_connect=connect,
+    )
     sleep = ControlledSleep(hold=True)
     rt._sleep = sleep
     try:
@@ -655,29 +631,12 @@ async def test_a_429_upgrade_backs_off_with_retry_after_and_never_blocks(exc_typ
             await rt.connect()
         assert rt.state == "backoff"
         await _until(lambda: bool(sleep.delays))
-        assert 20.0 <= sleep.delays[0] <= 22.0
+        assert sleep.delays[0] <= 0.02  # Retry-After ignored: the ordinary step
+        assert rt.blocked_reason is None and rt.rate_limited_ms is None
         sleep.release()
         await _until(lambda: attempts == 2)
         await ok.push({"type": "hello.ok"})
         await _until(lambda: rt.state == "ready")
-    finally:
-        sleep.release()
-        await rt.disconnect()
-
-
-@pytest.mark.asyncio
-async def test_a_429_without_retry_after_waits_the_default_window() -> None:
-    async def connect(_url: str, **_kw: Any) -> MockWebSocket:
-        raise _InvalidStatus(429, {})
-
-    rt = RealtimeClient(api_key="sk_test", reconnect=True, websocket_connect=connect)
-    sleep = ControlledSleep(hold=True)
-    rt._sleep = sleep
-    try:
-        with pytest.raises(Exception, match="HTTP 429"):
-            await rt.connect()
-        await _until(lambda: bool(sleep.delays))
-        assert 60.0 <= sleep.delays[0] <= 66.0
     finally:
         sleep.release()
         await rt.disconnect()
