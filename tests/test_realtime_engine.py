@@ -853,6 +853,93 @@ async def test_a_handler_that_disconnects_while_a_repeat_of_its_message_arrives_
 
 
 @pytest.mark.asyncio
+async def test_a_gap_fill_that_returns_during_disconnect_acks_nothing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Under ack_on_receipt a gap fill acks its rows as it receives them. If
+    # the fetch returns while disconnect() is flushing, the shutdown then
+    # cancels the gap task, possibly mid-handover: an acked row would never
+    # be handled. Once disconnect() has begun the fill takes nothing in.
+    monkeypatch.setattr("agentchatme._realtime._GAP_FILL_WINDOW_S", 0.05)
+    fetch_gate = asyncio.Event()
+    fetching = asyncio.Event()
+
+    class _SlowFill(MockAsyncClient):
+        async def get_messages(self, conversation_id: str, **kwargs: Any) -> list[dict[str, Any]]:
+            fetching.set()
+            await fetch_gate.wait()
+            return [message_new("c", 2)["payload"]]
+
+    rt, ws = await connected(
+        capabilities=["ack"], client=_SlowFill(), auto_drain_on_connect=False, ack_on_receipt=True
+    )
+    release = asyncio.Event()
+    entered = asyncio.Event()
+
+    async def slow(m: dict[str, Any]) -> None:
+        if m["payload"]["seq"] == 3:
+            entered.set()
+            await release.wait()
+
+    rt.on("message.new", slow)
+    await ws.push(message_new("c", 1))
+    await ws.push(message_new("c", 3))
+    await asyncio.wait_for(fetching.wait(), timeout=1.0)  # the gap fill is in flight
+    stopping = asyncio.create_task(rt.disconnect())
+    await asyncio.wait_for(entered.wait(), timeout=1.0)  # the flush hands 3 over
+    fetch_gate.set()  # the fetch returns mid-shutdown
+    await _settle()
+    release.set()
+    await asyncio.wait_for(stopping, timeout=3.0)
+    assert "msg_2" not in _ack_frames(ws)
+
+
+@pytest.mark.asyncio
+async def test_an_adopted_in_order_repeat_moves_the_cursor_on(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The drain hands seq 2 over first and its handler is slow; the live
+    # repeat of seq 2 adopts it. The next live frame (seq 3) must be taken in
+    # order, not parked behind a gap that does not exist (2 s later: a REST
+    # gap fill and a gap report although nothing was missing).
+    monkeypatch.setattr("agentchatme._realtime._GAP_FILL_WINDOW_S", 0.05)
+    gaps: list[Any] = []
+    api = MockAsyncClient(sync_pages=[[_row(2)]])
+    rt, ws = await connected(
+        capabilities=["ack"], client=api, auto_drain_on_connect=False, on_sequence_gap=gaps.append
+    )
+    release = asyncio.Event()
+    seen: list[int] = []
+
+    async def slow(m: dict[str, Any]) -> None:
+        seen.append(m["payload"]["seq"])
+        if m["payload"]["seq"] == 2 and seen.count(2) == 1:
+            await release.wait()
+
+    rt.on("message.new", slow)
+    try:
+        await ws.push(message_new("c", 1))
+        await _settle()
+        drain = asyncio.create_task(rt.drain_offline_envelopes())
+        await _settle()
+        assert seen == [1, 2]  # the drain row's handler is running
+        await ws.push(message_new("c", 2))  # live repeat: adopted
+        await ws.push(message_new("c", 3))
+        await _settle()
+        assert seen == [1, 2, 3]
+        await asyncio.sleep(0.2)  # well past the gap window
+        assert gaps == []
+        assert api.get_messages_calls == []
+        release.set()
+        await asyncio.wait_for(drain, timeout=1.0)
+        await _settle()
+        assert sorted(_ack_frames(ws)) == ["msg_1", "msg_2", "msg_3"]
+    finally:
+        release.set()
+        await rt.disconnect()
+
+
+@pytest.mark.asyncio
 async def test_a_frame_behind_a_new_hole_gets_its_own_gap_window(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

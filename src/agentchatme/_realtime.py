@@ -1836,10 +1836,10 @@ class RealtimeClient:
             return "delivered"
 
         if seq == state.next_expected_seq:
-            if self._adopt_in_flight(message, ws_ack=ws_ack):
-                # The first copy is this same seq on this connection; its
-                # caller moves the cursor on once its handler finished.
-                return "delivered"
+            # Dispatched, or adopted by a copy of this message whose handler
+            # is still running (never waited for). Either way the cursor moves
+            # on now, so the next frame is not taken for a gap; that frame's
+            # handler may then start while the first copy's still runs.
             await self._deliver_message_new(message, ws_ack=ws_ack)
             # Never backwards: another copy of this message (or a drain of
             # the buffer) may have moved the cursor on during the await.
@@ -1925,9 +1925,13 @@ class RealtimeClient:
         finally:
             state.gap_fill_in_flight = False
 
-        # State may have been reset (disconnect during the await).
+        # State may have been reset (a close during the await), or
+        # disconnect() may have begun: then take nothing in. The fetched rows
+        # are neither acked nor handed over (a gap fill marks nothing on the
+        # server, which keeps them); acking them now would lose them when the
+        # shutdown cancels this task mid-handover.
         state_now = self._order_states.get(conversation_id)
-        if state_now is not state:
+        if self._disposed or state_now is not state:
             return
 
         if fill_error:

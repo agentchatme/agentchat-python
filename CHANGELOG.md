@@ -77,6 +77,15 @@ major. The on-the-wire API is versioned separately under `/v1/...`.
 
 ### Changed
 
+- Handlers in one conversation can now overlap, as they already do in the
+  TypeScript SDK: they still *start* in seq order, but while a resolved gap's
+  frames are handed over, a frame that arrives in order is dispatched at once
+  (seq 4 can start while seq 3's handler runs), and a repeat that adopts a
+  running first copy moves the conversation on without waiting for it. Before,
+  the next frame waited (or, behind a gap resolution, could be lost). A
+  handler that needs one-at-a-time processing per conversation should queue
+  its own work. A gap fill that returns after `disconnect()` began acks
+  nothing (its rows stay with the server).
 - Docs: a `reply` verdict's `record()` is called at the **end of a turn that
   completed** — never before the turn, never at its start. A completed turn
   that looked counts as read even if it chose not to send; a crashed turn,
