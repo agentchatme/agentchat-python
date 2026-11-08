@@ -109,6 +109,60 @@ async def test_one_handler_at_a_time_per_conversation_and_conversations_in_paral
 
 
 @pytest.mark.asyncio
+async def test_a_hung_handler_holds_its_conversation_at_most_in_flight_adopt_ms() -> None:
+    rt, ws = await connected(capabilities=["ack"], in_flight_adopt_ms=50)
+    started: list[str] = []
+
+    async def handler(m: dict[str, Any]) -> None:
+        started.append(m["payload"]["id"])
+        if m["payload"]["id"] == "msg_1":
+            await asyncio.Event().wait()  # never finishes
+
+    rt.on("message.new", handler)
+    try:
+        await ws.push(message_new("c", 1))
+        await ws.push(message_new("c", 2))
+        await _settle()
+        assert started == ["msg_1"]
+        await asyncio.sleep(0.15)
+        assert started == ["msg_1", "msg_2"]  # the conversation went on
+        assert _ack_frames(ws) == ["msg_2"]  # the hung one is never acked
+    finally:
+        await rt.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_the_first_message_handler_after_a_hello_without_ack_renegotiates_once_quietly() -> None:
+    first, second = MockWebSocket(), MockWebSocket()
+    rt, handed = _client_with_sockets([first, second])
+    errors: list[BaseException] = []
+    rt.on_error(errors.append)
+    sleep = ControlledSleep(hold=True)
+    rt._sleep = sleep
+    try:
+        await rt.connect()
+        await _settle()
+        assert json.loads(first.sent[0])["capabilities"] == ["heartbeat"]
+        await first.push({"type": "hello.ok", "capabilities": ["heartbeat"]})
+        await _settle()
+        seen: list[str] = []
+        rt.on("message.new", lambda m: seen.append(m["payload"]["id"]))
+        await _until(lambda: len(handed) == 2)
+        assert first.closed and first.close_code == 1000
+        assert json.loads(second.sent[0])["capabilities"] == ["ack", "heartbeat"]
+        assert sleep.delays == [] and errors == []  # at once, no backoff step, no error
+        await second.push({"type": "hello.ok", "capabilities": ["ack", "heartbeat"]})
+        await _settle()
+        assert rt.ack_negotiated
+        rt.on("message.new", lambda _m: None)  # a second handler: nothing more
+        await _settle()
+        assert len(handed) == 2
+    finally:
+        sleep.release()
+        await rt.disconnect()
+
+
+@pytest.mark.asyncio
 async def test_frames_of_no_conversation_share_one_serial_lane() -> None:
     rt, ws = await connected(capabilities=["ack"])
     release = asyncio.Event()
@@ -163,7 +217,7 @@ async def test_handlers_of_one_conversation_start_in_seq_order() -> None:
         await ws.push(message_new("c", 1))
         await ws.push(message_new("c", 3))
         await ws.push(message_new("c", 2))
-        await _settle()
+        await asyncio.sleep(0.05)
         assert started == [1, 2, 3]
     finally:
         await rt.disconnect()
@@ -454,11 +508,10 @@ async def test_a_re_offer_after_the_adoption_window_is_dispatched_afresh() -> No
         await ws2.push({"type": "hello.ok", "capabilities": ["ack"]})
         await ws2.push(message_new("c", 1))
         await _settle()
-        # Past the window the re-offer is not adopted: it is a dispatch of its
-        # own, queued behind the running one (one handler at a time per
-        # conversation).
-        lane = rt._lanes["conversation:c"]
-        assert [job.message_id for job in lane.jobs] == ["msg_1", "msg_1"]
+        # Past the window the re-offer is not adopted, and the hung handler no
+        # longer holds its conversation: the re-offer is dispatched afresh.
+        await asyncio.sleep(0.02)
+        assert calls == ["msg_1", "msg_1"]
     finally:
         await rt.disconnect()
 

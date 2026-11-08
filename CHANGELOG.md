@@ -48,7 +48,13 @@ that upgrades without changing its code keeps working as before.
   concurrently, and the receive loop never waits for a handler. A slow
   handler no longer holds up other conversations, other frames' acks or the
   transport's pongs, and messages still reach the app in seq order per
-  conversation.
+  conversation. A handler that never finishes holds its conversation at most
+  `in_flight_adopt_ms` (15 min).
+- The first `message.new` handler attached after a HELLO that offered no
+  `ack` triggers one quiet reconnect (no error, no backoff step) so the next
+  HELLO negotiates delivery acks.
+- `CallOptions(retry=...)` never makes a POST / PATCH without an
+  Idempotency-Key retry.
 - A `message.new` below the connection's seq anchor that nobody has handled
   is delivered late (out of order) instead of dropped, so the drain cursor
   never stalls behind it (TypeScript parity).
@@ -74,8 +80,13 @@ that upgrades without changing its code keeps working as before.
   not gated again at the same anchor for 60 s (`pace_ms`) unless a newer
   message or an `unanswered` wake naming it arrives, and no second invite
   turn for an invite within 60 s; an optional shared `turn_tracker`; a turn
-  that ends after `stop()` still has its outcome recorded; wake events carry
-  the wake `reason`; the tray is read with `include_invites=True`.
+  that ends after `stop()` still has its outcome recorded (a released turn
+  never records); wake events carry the wake `reason`; the tray is read with
+  `include_invites=True`; a truncated tray is read again at once only after
+  a cycle that recorded a verdict or started a turn, else after 1 s doubling
+  to 60 s; `status()` marks turns running past 30 min as overdue; `idle()`
+  waits for the running cycle. `turn_outcome` recognises the turn's own
+  verdict by the `your_last_decision` key only (no clock).
 - `inbox.tray(include_invites=True)` sends `invites=1`: a pending invite then
   also ends a held read (default off, as before).
 - `register`, `verify`, `recover` and `recover_verify` take `timeout_ms` and

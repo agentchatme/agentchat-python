@@ -80,6 +80,9 @@ class RunningTurn:
     started_at: float
     wait_timed_out_at: float | None
     """Epoch ms the last wait timed out without an end, or ``None``."""
+    overdue: bool = False
+    """Set by :meth:`~agentchatme.integration.ReceiveLoop.status` for a turn
+    running past 30 minutes (the runtime should have ended it)."""
 
 
 @dataclass
@@ -193,6 +196,14 @@ class TurnTracker:
             entry.waiter = waiter
         await waiter
         return None
+
+    def holds(self, handle: TurnHandle) -> bool:
+        """Whether ``handle`` is still tracked (not ended, not released). A
+        host checks it after every await before recording anything: a
+        released turn never records."""
+        with self._lock:
+            entry = self._turns.get(handle.key)
+            return entry is not None and entry.handle is handle and not entry.released
 
     def end(self, handle: TurnHandle) -> None:
         """Stop tracking a turn (its outcome is recorded, or it never started)."""

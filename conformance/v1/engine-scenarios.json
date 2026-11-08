@@ -10,7 +10,8 @@
     "acked_was_handled": "At the end, every message the client acknowledged (an ack frame, or a row a sync/ack cursor covers) was handled. An ack is a promise the server never re-offers the message.",
     "acks_follow_handling": "When each sync/ack cursor is sent (both modes), and each ack frame in the default mode, every message it acknowledges was already handled. Under ack_on_receipt an ack frame is sent at receipt, before the handler.",
     "dispatched_once": "No message id reaches the handler twice in these scenarios.",
-    "seq_order": "Within one conversation the handler sees seqs in ascending order."
+    "seq_order": "Within one conversation the handler sees seqs in ascending order.",
+    "serial_per_conversation": "Within one conversation the handler is never entered for a message while it is still running for another one: one message at a time, in seq order. Different conversations run concurrently."
   },
   "ops": {
     "close": "The server side ends the socket with close code 1006 (an abnormal drop).",
@@ -76,7 +77,7 @@
             "created_at": "2026-11-04T23:01:00.000Z",
             "delivery_id": "del_000000000000000000000000000c0001",
             "id": "msg_crew0seq0001",
-            "sender": "nova",
+            "sender": "example-scout",
             "seq": 1,
             "type": "text"
           },
@@ -88,7 +89,7 @@
             "created_at": "2026-11-04T23:03:00.000Z",
             "delivery_id": "del_000000000000000000000000000c0003",
             "id": "msg_crew0seq0003",
-            "sender": "nova",
+            "sender": "example-scout",
             "seq": 3,
             "type": "text"
           }
@@ -150,7 +151,7 @@
             "created_at": "2026-11-04T23:01:00.000Z",
             "delivery_id": "del_000000000000000000000000000f0001",
             "id": "msg_crew0late0001",
-            "sender": "nova",
+            "sender": "example-scout",
             "seq": 1,
             "type": "text"
           },
@@ -162,7 +163,7 @@
             "created_at": "2026-11-04T23:03:00.000Z",
             "delivery_id": "del_000000000000000000000000000f0003",
             "id": "msg_crew0late0003",
-            "sender": "nova",
+            "sender": "example-scout",
             "seq": 3,
             "type": "text"
           },
@@ -174,7 +175,7 @@
             "created_at": "2026-11-04T23:01:00.000Z",
             "delivery_id": "del_000000000000000000000000000f0004",
             "id": "msg_first0late001",
-            "sender": "nova",
+            "sender": "example-scout",
             "seq": 1,
             "type": "text"
           }
@@ -226,7 +227,7 @@
             "created_at": "2026-11-04T23:01:00.000Z",
             "delivery_id": "del_000000000000000000000000000a0001",
             "id": "msg_ops0seq00001",
-            "sender": "nova",
+            "sender": "example-scout",
             "seq": 1,
             "type": "text"
           },
@@ -238,7 +239,7 @@
             "created_at": "2026-11-04T23:03:00.000Z",
             "delivery_id": "del_000000000000000000000000000a0003",
             "id": "msg_ops0seq00003",
-            "sender": "nova",
+            "sender": "example-scout",
             "seq": 3,
             "type": "text"
           }
@@ -293,7 +294,7 @@
             "created_at": "2026-11-04T23:01:00.000Z",
             "delivery_id": "del_000000000000000000000000000e0001",
             "id": "msg_gone0seq0001",
-            "sender": "nova",
+            "sender": "example-scout",
             "seq": 1,
             "type": "text"
           },
@@ -305,7 +306,7 @@
             "created_at": "2026-11-04T23:02:00.000Z",
             "delivery_id": "del_000000000000000000000000000e0002",
             "id": "msg_gone0seq0002",
-            "sender": "nova",
+            "sender": "example-scout",
             "seq": 2,
             "type": "text"
           },
@@ -317,7 +318,7 @@
             "created_at": "2026-11-04T23:03:00.000Z",
             "delivery_id": "del_000000000000000000000000000e0003",
             "id": "msg_gone0seq0003",
-            "sender": "nova",
+            "sender": "example-scout",
             "seq": 3,
             "type": "text"
           }
@@ -370,7 +371,7 @@
             "conversation_id": "conv_direct0first01",
             "created_at": "2026-11-04T23:01:00.000Z",
             "id": "msg_first0seq001",
-            "sender": "nova",
+            "sender": "example-scout",
             "seq": 1,
             "type": "text"
           }
@@ -384,7 +385,7 @@
             "conversation_id": "conv_direct0first01",
             "created_at": "2026-11-04T23:03:00.000Z",
             "id": "msg_first0seq003",
-            "sender": "nova",
+            "sender": "example-scout",
             "seq": 3,
             "type": "text"
           }
@@ -398,7 +399,7 @@
             "conversation_id": "conv_direct0first01",
             "created_at": "2026-11-04T23:01:00.000Z",
             "id": "msg_first0seq001",
-            "sender": "nova",
+            "sender": "example-scout",
             "seq": 1,
             "type": "text"
           }
@@ -412,7 +413,7 @@
             "conversation_id": "conv_direct0first01",
             "created_at": "2026-11-04T23:02:00.000Z",
             "id": "msg_first0seq002",
-            "sender": "nova",
+            "sender": "example-scout",
             "seq": 2,
             "type": "text"
           }
@@ -467,7 +468,7 @@
             "conversation_id": "conv_group0ops00001",
             "created_at": "2026-11-04T23:01:00.000Z",
             "id": "msg_ops0seq00001",
-            "sender": "nova",
+            "sender": "example-scout",
             "seq": 1,
             "type": "text"
           }
@@ -481,7 +482,7 @@
             "conversation_id": "conv_group0ops00001",
             "created_at": "2026-11-04T23:03:00.000Z",
             "id": "msg_ops0seq00003",
-            "sender": "nova",
+            "sender": "example-scout",
             "seq": 3,
             "type": "text"
           }
@@ -498,7 +499,7 @@
             "conversation_id": "conv_group0ops00001",
             "created_at": "2026-11-04T23:02:00.000Z",
             "id": "msg_ops0seq00002",
-            "sender": "nova",
+            "sender": "example-scout",
             "seq": 2,
             "type": "text"
           }
@@ -514,7 +515,7 @@
             "created_at": "2026-11-04T23:01:00.000Z",
             "delivery_id": "del_000000000000000000000000000b0001",
             "id": "msg_ops0seq00001",
-            "sender": "nova",
+            "sender": "example-scout",
             "seq": 1,
             "type": "text"
           }
@@ -564,7 +565,7 @@
             "conversation_id": "conv_group0ops00001",
             "created_at": "2026-11-04T23:01:00.000Z",
             "id": "msg_ops0slow00001",
-            "sender": "nova",
+            "sender": "example-scout",
             "seq": 1,
             "type": "text"
           }
@@ -578,7 +579,7 @@
             "conversation_id": "conv_group0ops00001",
             "created_at": "2026-11-04T23:02:00.000Z",
             "id": "msg_ops0slow00002",
-            "sender": "nova",
+            "sender": "example-scout",
             "seq": 2,
             "type": "text"
           }
@@ -601,7 +602,7 @@
             "created_at": "2026-11-04T23:02:00.000Z",
             "delivery_id": "del_000000000000000000000000000d0002",
             "id": "msg_ops0slow00002",
-            "sender": "nova",
+            "sender": "example-scout",
             "seq": 2,
             "type": "text"
           }
@@ -647,7 +648,7 @@
             "conversation_id": "conv_group0crew0001",
             "created_at": "2026-11-04T23:01:00.000Z",
             "id": "msg_crew0slow0001",
-            "sender": "nova",
+            "sender": "example-scout",
             "seq": 1,
             "type": "text"
           }
@@ -670,7 +671,7 @@
             "created_at": "2026-11-04T23:01:00.000Z",
             "delivery_id": "del_00000000000000000000000000090001",
             "id": "msg_crew0slow0001",
-            "sender": "nova",
+            "sender": "example-scout",
             "seq": 1,
             "type": "text"
           }
@@ -705,8 +706,8 @@
           ],
           "ws_acks": [
             "msg_gone0wait0001",
-            "msg_gone0wait0004",
             "msg_gone0wait0003",
+            "msg_gone0wait0004",
             "msg_gone0wait0006"
           ]
         }
@@ -728,7 +729,7 @@
             "conversation_id": "conv_group0gone0001",
             "created_at": "2026-11-04T23:01:00.000Z",
             "id": "msg_gone0wait0001",
-            "sender": "nova",
+            "sender": "example-scout",
             "seq": 1,
             "type": "text"
           }
@@ -742,7 +743,7 @@
             "conversation_id": "conv_group0gone0001",
             "created_at": "2026-11-04T23:03:00.000Z",
             "id": "msg_gone0wait0003",
-            "sender": "nova",
+            "sender": "example-scout",
             "seq": 3,
             "type": "text"
           }
@@ -763,7 +764,7 @@
             "conversation_id": "conv_group0gone0001",
             "created_at": "2026-11-04T23:04:00.000Z",
             "id": "msg_gone0wait0004",
-            "sender": "nova",
+            "sender": "example-scout",
             "seq": 4,
             "type": "text"
           }
@@ -777,7 +778,7 @@
             "conversation_id": "conv_group0gone0001",
             "created_at": "2026-11-04T23:06:00.000Z",
             "id": "msg_gone0wait0006",
-            "sender": "nova",
+            "sender": "example-scout",
             "seq": 6,
             "type": "text"
           }
@@ -790,7 +791,7 @@
           "op": "gap_window_lapses"
         }
       ],
-      "why": "Seq 3 waits on a gap that is never filled. When the gap window lapses, seq 3 is handed over and its handler is slow. Meanwhile seq 4 arrives in order and seq 6 behind a new hole. Both must reach the handler (under ack_on_receipt they were acked at receipt, so a client that clears them with the buffer loses them): seq 4 at once, seq 6 after a gap window of its own."
+      "why": "Seq 3 waits on a gap that is never filled. When the gap window lapses, seq 3 is handed over and its handler is slow. Meanwhile seq 4 arrives in order and seq 6 behind a new hole. Both must reach the handler (under ack_on_receipt they were acked at receipt, so a client that clears them with the buffer loses them): seq 4 as soon as the handler has finished seq 3 (one message at a time per conversation), seq 6 after a gap window of its own."
     },
     {
       "expect": {
@@ -905,7 +906,7 @@
             "created_at": "2026-11-08T09:00:03.000Z",
             "delivery_id": "del_000000000000000000000000000d0003",
             "id": "msg_none0drain00003",
-            "sender": "nova",
+            "sender": "example-scout",
             "seq": 3,
             "type": "text"
           }

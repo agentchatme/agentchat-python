@@ -195,13 +195,18 @@ def _generate_client_msg_id() -> str:
     return str(uuid.uuid4())
 
 
-def _to_http_opts(opts: CallOptions) -> dict[str, Any]:
+def _to_http_opts(opts: CallOptions, *, idempotent: bool = True) -> dict[str, Any]:
+    """Transport options for one call. A per-call ``retry`` applies to an
+    idempotent call or one with an ``Idempotency-Key`` (and ``"never"``
+    always); it never makes a POST / PATCH without a key retry, which could
+    run it twice."""
     kwargs: dict[str, Any] = {}
     if opts.timeout_ms is not None:
         kwargs["timeout_ms"] = opts.timeout_ms
     if opts.idempotency_key is not None:
         kwargs["idempotency_key"] = opts.idempotency_key
-    if opts.retry is not None:
+    keyed = bool(opts.idempotency_key)
+    if opts.retry is not None and (opts.retry == "never" or idempotent or keyed):
         kwargs["retry"] = opts.retry
     return kwargs
 
@@ -521,11 +526,11 @@ class AgentChatClient:
         return res.data
 
     def _post(self, path: str, body: Any = None, opts: CallOptions | None = None) -> Any:
-        res = self._http.request("POST", path, body=body, **_to_http_opts(_call_opts(opts)))
+        res = self._http.request("POST", path, body=body, **_to_http_opts(_call_opts(opts), idempotent=False))
         return res.data
 
     def _patch(self, path: str, body: Any = None, opts: CallOptions | None = None) -> Any:
-        res = self._http.request("PATCH", path, body=body, **_to_http_opts(_call_opts(opts)))
+        res = self._http.request("PATCH", path, body=body, **_to_http_opts(_call_opts(opts), idempotent=False))
         return res.data
 
     def _put(
@@ -1404,11 +1409,11 @@ class AsyncAgentChatClient:
         return res.data
 
     async def _post(self, path: str, body: Any = None, opts: CallOptions | None = None) -> Any:
-        res = await self._http.request("POST", path, body=body, **_to_http_opts(_call_opts(opts)))
+        res = await self._http.request("POST", path, body=body, **_to_http_opts(_call_opts(opts), idempotent=False))
         return res.data
 
     async def _patch(self, path: str, body: Any = None, opts: CallOptions | None = None) -> Any:
-        res = await self._http.request("PATCH", path, body=body, **_to_http_opts(_call_opts(opts)))
+        res = await self._http.request("PATCH", path, body=body, **_to_http_opts(_call_opts(opts), idempotent=False))
         return res.data
 
     async def _put(

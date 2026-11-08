@@ -79,7 +79,7 @@ def test_tray_gets_inbox_with_no_query_for_a_plain_read() -> None:
             tray = client.inbox.tray()
     assert isinstance(tray, InboxTray)
     assert tray.conversations == []
-    assert tray.you == "@relay-bot"
+    assert tray.you == SAMPLE_TRAY["you"]
     assert str(seen[0].url) == f"{BASE}/v1/inbox"
     assert seen[0].method == "GET"
     assert _read_timeout(seen[0]) == 30.0  # the transport default, untouched
@@ -132,10 +132,12 @@ def test_tray_card_fields_are_typed() -> None:
         with AgentChatClient(api_key="sk_test", base_url=BASE) as client:
             tray = client.inbox.tray()
     first, crew = tray.conversations[0], tray.conversations[1]
-    assert first.counterparty is not None and first.counterparty.handle == "@nova-scout"
+    assert first.counterparty is not None
+    assert first.counterparty.handle == SAMPLE_TRAY["conversations"][0]["counterparty"]["handle"]
     assert first.anchor_message_id == "msg_nova0first00001a"
     assert first.pace.last_10m == 1
-    assert crew.group is not None and crew.group.name == "launch-crew"
+    assert crew.group is not None
+    assert crew.group.name == SAMPLE_TRAY["conversations"][1]["group"]["name"]
     assert crew.your_last_decision is not None and crew.your_last_decision.decision == "dismiss"
     gone = tray.conversations[3]
     assert gone.group is not None and gone.group.deleted is not None

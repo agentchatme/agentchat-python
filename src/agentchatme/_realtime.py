@@ -586,6 +586,8 @@ class _Job:
     next_index: int = 0
     awaiting: Any = None
     ok: bool = True
+    # The task finishing this job's handlers once the lane reached it.
+    run: asyncio.Future[None] | None = None
 
 
 @dataclass
@@ -739,6 +741,11 @@ class RealtimeClient:
         # server).
         self._negotiated: frozenset[str] = frozenset()
         self._offered_this_hello: frozenset[str] = frozenset()
+        # HELLO went out on the current socket; and the close in progress is
+        # the one quiet reconnect that renegotiates ack (see
+        # _maybe_renegotiate_ack).
+        self._hello_sent = False
+        self._renegotiating = False
         # Set when the server's last close or upgrade answer was the connect
         # budget (D8): the delay it asked for, until the next hello.ok.
         self._rate_limited_ms: int | None = None
@@ -895,6 +902,7 @@ class RealtimeClient:
         self._ack_negotiated = False
         self._negotiated = frozenset()
         self._close_initiated_locally = False
+        self._hello_sent = False
 
         try:
             await ws.send(
@@ -916,6 +924,7 @@ class RealtimeClient:
                     }
                 )
             )
+            self._hello_sent = True
         except Exception as err:
             # A socket we cannot write HELLO to is useless; drop it as our
             # own close and take the normal backoff rather than sit on it.
@@ -929,6 +938,29 @@ class RealtimeClient:
 
         self._handshake_task = asyncio.create_task(self._handshake_watchdog(ws))
         self._recv_task = asyncio.create_task(self._recv_loop())
+
+    def _maybe_renegotiate_ack(self) -> None:
+        """The first ``message.new`` handler was attached after this
+        socket's HELLO went out without ``ack``: reconnect once, quietly (no
+        error, no backoff step), so the next HELLO negotiates delivery acks.
+        Frames parked on a seq gap are handed to the handlers first."""
+        if self._disposed or self._ws is None or not self._hello_sent:
+            return
+        if "ack" in self._offered_this_hello:
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        ws = self._ws
+
+        def renegotiate() -> None:
+            if self._ws is not ws or self._disposed or not self._has_message_handler():
+                return
+            self._renegotiating = True
+            self._spawn(self._close_socket(ws, 1000, "client reconnects to negotiate delivery acks"))
+
+        loop.call_soon(renegotiate)
 
     def _advertised_capabilities(self) -> list[str]:
         """What this HELLO offers. ``ack`` only while a ``message.new``
@@ -1276,6 +1308,9 @@ class RealtimeClient:
             ours = self._close_initiated_locally
             self._close_initiated_locally = False
             handshake_done = self._authenticated
+            renegotiating = self._renegotiating
+            self._renegotiating = False
+            self._hello_sent = False
 
             if self._handshake_task is not None:
                 self._handshake_task.cancel()
@@ -1285,7 +1320,8 @@ class RealtimeClient:
             # young must not clear the backoff counter, which is the whole
             # point of the stability window.
             self._cancel_stability_timer()
-            self._note_connection_ended()
+            if not renegotiating:
+                self._note_connection_ended()
             self._authenticated = False
             self._ack_negotiated = False
             self._negotiated = frozenset()
@@ -1331,11 +1367,17 @@ class RealtimeClient:
             # parked frames to the handlers now, in seq order, before the
             # state goes. Default mode skips this: its parked frames are
             # unacked and come back in order on the next drain.
-            if self._opts.ack_on_receipt:
+            # The quiet reconnect that renegotiates ack: this socket was
+            # marked on send, so nothing would re-offer a parked frame either.
+            if self._opts.ack_on_receipt or renegotiating:
                 await self._flush_parked_frames("connection_closed")
             self._reset_order_states()
             self._generation += 1
-            if not self._disposed:
+            if renegotiating and not self._disposed:
+                # At once, no backoff step, no error: the socket was fine.
+                with contextlib.suppress(Exception):
+                    await self.connect()
+            elif not self._disposed:
                 _log.debug(
                     "realtime socket closed (code=%s reason=%r ours=%s handshake_done=%s)",
                     close_code,
@@ -1710,8 +1752,11 @@ class RealtimeClient:
             :meth:`disconnect` ran; receives ``{"type": "stopped"}``. The
             last event this instance ever raises.
         """
+        first_message_handler = event == "message.new" and not self._handlers.get(event)
         handlers = self._handlers.setdefault(event, set())
         handlers.add(handler)
+        if first_message_handler:
+            self._maybe_renegotiate_ack()
 
         def off() -> None:
             hs = self._handlers.get(event)
@@ -1971,6 +2016,7 @@ class RealtimeClient:
             try:
                 await awaiting
             except asyncio.CancelledError:
+                _discard_awaitable(awaiting)
                 raise
             except Exception:
                 job.ok = False
@@ -1989,15 +2035,33 @@ class RealtimeClient:
                 _log.warning("realtime handler raised", exc_info=True)
 
     async def _lane_worker(self, key: str, lane: _Lane) -> None:
+        """Run the lane's jobs one at a time. A job holds the lane until its
+        handlers finished, or ``in_flight_adopt_ms`` at most: a handler that
+        never finishes keeps running, but no longer holds its conversation's
+        next message back."""
+        bound_s = max(0.0, self._opts.in_flight_adopt_ms / 1000.0)
         try:
             while lane.jobs:
                 job = lane.jobs[0]
-                await self._run_job(job)
+                run: asyncio.Future[None] = asyncio.ensure_future(self._finish_job(job))
+                job.run = run
+                self._dispatch_tasks.add(run)
+                run.add_done_callback(self._dispatch_tasks.discard)
+                run.add_done_callback(_consume_future)
+                done, _ = await asyncio.wait({run}, timeout=bound_s)
                 lane.jobs.popleft()
-                await self._settle_job(job, ok=job.ok)
+                if not done:
+                    _log.warning(
+                        "realtime: a message.new handler has run past %.0fs; its"
+                        " conversation's next message goes on (the handler keeps running)",
+                        bound_s,
+                    )
         except asyncio.CancelledError:
-            # disconnect() released the lane: what it held was not handled.
+            # disconnect() released the lane: what never started was not
+            # handled (a job already running is its own task's to settle).
             for job in lane.jobs:
+                if job.run is not None:
+                    continue
                 _discard_awaitable(job.awaiting)
                 job.awaiting = None
                 await self._settle_job(job, ok=False, ack=False)
@@ -2007,6 +2071,14 @@ class RealtimeClient:
             lane.worker = None
             if not lane.jobs and self._lanes.get(key) is lane:
                 del self._lanes[key]
+
+    async def _finish_job(self, job: _Job) -> None:
+        try:
+            await self._run_job(job)
+        except asyncio.CancelledError:
+            await self._settle_job(job, ok=False, ack=False)
+            raise
+        await self._settle_job(job, ok=job.ok)
 
     async def _settle_job(self, job: _Job, *, ok: bool, ack: bool = True) -> None:
         if not job.message_new:

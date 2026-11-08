@@ -28,8 +28,9 @@ post-turn tray read failed; OpenClaw on any turn whose run ended ``ok``.
 Here a failed read records nothing (the server's re-wake covers it), "answer
 went out" is read from ``your_last_message_at`` moving (clock-free, and true
 even when the peer has written again since), and a verdict the turn recorded
-is recognised both by ``your_last_decision`` changing (clock-free, as Hermes
-did) and by its time against the turn start (D5).
+is recognised by ``your_last_decision`` changing (clock-free, as Hermes did);
+``turn_started_at`` is accepted for the record but never compared with server
+time.
 """
 
 from __future__ import annotations
@@ -154,7 +155,7 @@ def turn_outcome(
     if fresh is None:
         return none("card_unknown" if tray.get("truncated") is True else "card_left_tray")
 
-    if _verdict_recorded_since(gate, fresh, turn_started_at):
+    if _verdict_recorded_since(gate, fresh):
         return none("turn_recorded_verdict")
 
     anchor = anchor_of(gate)
@@ -354,20 +355,12 @@ def _decision_key(card: Mapping[str, Any]) -> str | None:
     return f"{last.get('decision')}|{'' if category is None else category}|{last.get('at') or ''}"
 
 
-def _verdict_recorded_since(
-    gate: Mapping[str, Any], fresh: Mapping[str, Any], turn_started_at: Instant
-) -> bool:
-    """The fresh card's verdict is not the one the gate saw, or it was
-    recorded at or after the turn start."""
+def _verdict_recorded_since(gate: Mapping[str, Any], fresh: Mapping[str, Any]) -> bool:
+    """The fresh card's verdict is not the one the gate saw (clock-free: the
+    ``your_last_decision`` keys compared, never a local clock against server
+    time)."""
     now = _decision_key(fresh)
-    if now is None:
-        return False
-    if now != _decision_key(gate):
-        return True
-    last = fresh.get("your_last_decision")
-    at = _instant(last.get("at")) if isinstance(last, Mapping) else None
-    started = _instant(turn_started_at)
-    return at is not None and started is not None and at >= started
+    return now is not None and now != _decision_key(gate)
 
 
 def _answer_went_out(gate: Mapping[str, Any], fresh: Mapping[str, Any]) -> bool:

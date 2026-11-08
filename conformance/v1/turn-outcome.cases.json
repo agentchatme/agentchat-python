@@ -16,7 +16,7 @@
               "preview": {
                 "at": "2026-11-08T09:05:00.000Z",
                 "message_id": "msg_nova0first00001a",
-                "sender": "@nova-scout",
+                "sender": "@example-scout",
                 "text": "Can you share the retry window?"
               },
               "you_owe_reply": true,
@@ -32,7 +32,7 @@
           "preview": {
             "at": "2026-11-08T09:05:00.000Z",
             "message_id": "msg_nova0first00001a",
-            "sender": "@nova-scout",
+            "sender": "@example-scout",
             "text": "Can you share the retry window?"
           },
           "you_owe_reply": true,
@@ -64,7 +64,7 @@
               "preview": {
                 "at": "2026-11-08T09:05:00.000Z",
                 "message_id": "msg_nova0first00001a",
-                "sender": "@nova-scout",
+                "sender": "@example-scout",
                 "text": "Can you share the retry window?"
               },
               "you_owe_reply": false,
@@ -80,7 +80,7 @@
           "preview": {
             "at": "2026-11-08T09:05:00.000Z",
             "message_id": "msg_nova0first00001a",
-            "sender": "@nova-scout",
+            "sender": "@example-scout",
             "text": "Can you share the retry window?"
           },
           "you_owe_reply": true,
@@ -115,7 +115,7 @@
               "preview": {
                 "at": "2026-11-08T09:05:00.000Z",
                 "message_id": "msg_nova0first00001a",
-                "sender": "@nova-scout",
+                "sender": "@example-scout",
                 "text": "Can you share the retry window?"
               },
               "you_owe_reply": true,
@@ -131,7 +131,7 @@
           "preview": {
             "at": "2026-11-08T09:05:00.000Z",
             "message_id": "msg_nova0first00001a",
-            "sender": "@nova-scout",
+            "sender": "@example-scout",
             "text": "Can you share the retry window?"
           },
           "you_owe_reply": true,
@@ -162,7 +162,7 @@
           "preview": {
             "at": "2026-11-08T09:05:00.000Z",
             "message_id": "msg_nova0first00001a",
-            "sender": "@nova-scout",
+            "sender": "@example-scout",
             "text": "Can you share the retry window?"
           },
           "you_owe_reply": true,
@@ -199,7 +199,7 @@
           "preview": {
             "at": "2026-11-08T09:05:00.000Z",
             "message_id": "msg_nova0first00001a",
-            "sender": "@nova-scout",
+            "sender": "@example-scout",
             "text": "Can you share the retry window?"
           },
           "you_owe_reply": true,
@@ -236,7 +236,7 @@
           "preview": {
             "at": "2026-11-08T09:05:00.000Z",
             "message_id": "msg_nova0first00001a",
-            "sender": "@nova-scout",
+            "sender": "@example-scout",
             "text": "Can you share the retry window?"
           },
           "you_owe_reply": true,
@@ -271,7 +271,7 @@
               "preview": {
                 "at": "2026-11-08T09:05:00.000Z",
                 "message_id": "msg_nova0first00001a",
-                "sender": "@nova-scout",
+                "sender": "@example-scout",
                 "text": "Can you share the retry window?"
               },
               "you_owe_reply": true,
@@ -291,7 +291,7 @@
           "preview": {
             "at": "2026-11-08T09:05:00.000Z",
             "message_id": "msg_nova0first00001a",
-            "sender": "@nova-scout",
+            "sender": "@example-scout",
             "text": "Can you share the retry window?"
           },
           "you_owe_reply": true,
@@ -326,7 +326,7 @@
               "preview": {
                 "at": "2026-11-08T09:05:00.000Z",
                 "message_id": "msg_nova0first00001a",
-                "sender": "@nova-scout",
+                "sender": "@example-scout",
                 "text": "Can you share the retry window?"
               },
               "you_owe_reply": true,
@@ -346,7 +346,7 @@
           "preview": {
             "at": "2026-11-08T09:05:00.000Z",
             "message_id": "msg_nova0first00001a",
-            "sender": "@nova-scout",
+            "sender": "@example-scout",
             "text": "Can you share the retry window?"
           },
           "you_owe_reply": true,
@@ -364,7 +364,7 @@
         "turn_started_at": "2026-11-08T09:10:00.000Z"
       },
       "name": "turn-recorded-defer-itself",
-      "why": "A verdict at or after the turn start is the turn's own."
+      "why": "A verdict the card the gate saw did not have is the turn's own."
     },
     {
       "expect": {
@@ -381,7 +381,7 @@
               "preview": {
                 "at": "2026-11-08T09:05:00.000Z",
                 "message_id": "msg_nova0first00001a",
-                "sender": "@nova-scout",
+                "sender": "@example-scout",
                 "text": "Can you share the retry window?"
               },
               "you_owe_reply": true,
@@ -401,7 +401,7 @@
           "preview": {
             "at": "2026-11-08T09:05:00.000Z",
             "message_id": "msg_nova0first00001a",
-            "sender": "@nova-scout",
+            "sender": "@example-scout",
             "text": "Can you share the retry window?"
           },
           "you_owe_reply": true,
@@ -423,7 +423,7 @@
         "turn_started_at": "2026-11-08T09:10:00.000Z"
       },
       "name": "verdict-changed-with-the-local-clock-ahead",
-      "why": "The verdict time is before the local turn start (clock skew), but it differs from the card the gate saw: still the turn's own."
+      "why": "The verdict time is before the local turn start (clock skew); it differs from the card the gate saw, and that alone decides: the turn's own."
     },
     {
       "expect": {
@@ -442,7 +442,7 @@
               "preview": {
                 "at": "2026-11-08T09:05:00.000Z",
                 "message_id": "msg_nova0first00001a",
-                "sender": "@nova-scout",
+                "sender": "@example-scout",
                 "text": "Can you share the retry window?"
               },
               "you_owe_reply": false,
@@ -458,7 +458,7 @@
           "preview": {
             "at": "2026-11-08T09:05:00.000Z",
             "message_id": "msg_nova0first00001a",
-            "sender": "@nova-scout",
+            "sender": "@example-scout",
             "text": "Can you share the retry window?"
           },
           "you_owe_reply": true,
@@ -495,7 +495,7 @@
               "preview": {
                 "at": "2026-11-08T09:12:10.000Z",
                 "message_id": "msg_nova0second0002a",
-                "sender": "@nova-scout",
+                "sender": "@example-scout",
                 "text": "Thanks, one more thing."
               },
               "you_owe_reply": true,
@@ -511,7 +511,7 @@
           "preview": {
             "at": "2026-11-08T09:05:00.000Z",
             "message_id": "msg_nova0first00001a",
-            "sender": "@nova-scout",
+            "sender": "@example-scout",
             "text": "Can you share the retry window?"
           },
           "you_owe_reply": true,
@@ -548,7 +548,7 @@
               "preview": {
                 "at": "2026-11-08T09:05:00.000Z",
                 "message_id": "msg_nova0first00001a",
-                "sender": "@nova-scout",
+                "sender": "@example-scout",
                 "text": "Can you share the retry window?"
               },
               "you_owe_reply": false,
@@ -564,7 +564,7 @@
           "preview": {
             "at": "2026-11-08T09:05:00.000Z",
             "message_id": "msg_nova0first00001a",
-            "sender": "@nova-scout",
+            "sender": "@example-scout",
             "text": "Can you share the retry window?"
           },
           "you_owe_reply": true,
@@ -596,7 +596,7 @@
               "preview": {
                 "at": "2026-11-08T09:05:00.000Z",
                 "message_id": "msg_nova0first00001a",
-                "sender": "@nova-scout",
+                "sender": "@example-scout",
                 "text": "Can you share the retry window?"
               },
               "you_owe_reply": false,
@@ -612,7 +612,7 @@
           "preview": {
             "at": "2026-11-08T09:05:00.000Z",
             "message_id": "msg_nova0first00001a",
-            "sender": "@nova-scout",
+            "sender": "@example-scout",
             "text": "Can you share the retry window?"
           },
           "you_owe_reply": false,
@@ -649,7 +649,7 @@
               "preview": {
                 "at": "2026-11-08T09:05:00.000Z",
                 "message_id": "msg_nova0first00001a",
-                "sender": "@nova-scout",
+                "sender": "@example-scout",
                 "text": "Can you share the retry window?"
               },
               "you_owe_reply": false,
@@ -665,7 +665,7 @@
           "preview": {
             "at": "2026-11-08T09:05:00.000Z",
             "message_id": "msg_nova0first00001a",
-            "sender": "@nova-scout",
+            "sender": "@example-scout",
             "text": "Can you share the retry window?"
           },
           "you_owe_reply": true,
@@ -700,7 +700,7 @@
               "preview": {
                 "at": "2026-11-08T09:05:00.000Z",
                 "message_id": "msg_nova0first00001a",
-                "sender": "@nova-scout",
+                "sender": "@example-scout",
                 "text": "Can you share the retry window?"
               },
               "you_owe_reply": true,
@@ -716,7 +716,7 @@
           "preview": {
             "at": "2026-11-08T09:05:00.000Z",
             "message_id": "msg_nova0first00001a",
-            "sender": "@nova-scout",
+            "sender": "@example-scout",
             "text": "Can you share the retry window?"
           },
           "you_owe_reply": true,
@@ -751,7 +751,7 @@
               "preview": {
                 "at": "2026-11-08T09:05:00.000Z",
                 "message_id": "msg_nova0first00001a",
-                "sender": "@nova-scout",
+                "sender": "@example-scout",
                 "text": "Can you share the retry window?"
               },
               "you_owe_reply": true,
@@ -767,7 +767,7 @@
           "preview": {
             "at": "2026-11-08T09:05:00.000Z",
             "message_id": "msg_nova0first00001a",
-            "sender": "@nova-scout",
+            "sender": "@example-scout",
             "text": "Can you share the retry window?"
           },
           "you_owe_reply": true,
@@ -802,7 +802,7 @@
               "preview": {
                 "at": "2026-11-08T09:05:00.000Z",
                 "message_id": "msg_nova0first00001a",
-                "sender": "@nova-scout",
+                "sender": "@example-scout",
                 "text": "Can you share the retry window?"
               },
               "you_owe_reply": true,
@@ -818,7 +818,7 @@
           "preview": {
             "at": "2026-11-08T09:05:00.000Z",
             "message_id": "msg_nova0first00001a",
-            "sender": "@nova-scout",
+            "sender": "@example-scout",
             "text": "Can you share the retry window?"
           },
           "you_owe_reply": true,
@@ -853,7 +853,7 @@
               "preview": {
                 "at": "2026-11-08T09:05:00.000Z",
                 "message_id": "msg_nova0first00001a",
-                "sender": "@nova-scout",
+                "sender": "@example-scout",
                 "text": "Can you share the retry window?"
               },
               "you_owe_reply": true,
@@ -869,7 +869,7 @@
           "preview": {
             "at": "2026-11-08T09:05:00.000Z",
             "message_id": "msg_nova0first00001a",
-            "sender": "@nova-scout",
+            "sender": "@example-scout",
             "text": "Can you share the retry window?"
           },
           "you_owe_reply": true,
@@ -903,7 +903,7 @@
               "preview": {
                 "at": "2026-11-08T09:05:00.000Z",
                 "message_id": "msg_nova0first00001a",
-                "sender": "@nova-scout",
+                "sender": "@example-scout",
                 "text": "Can you share the retry window?"
               },
               "you_owe_reply": true,
@@ -919,7 +919,7 @@
           "preview": {
             "at": "2026-11-08T09:05:00.000Z",
             "message_id": "msg_nova0first00001a",
-            "sender": "@nova-scout",
+            "sender": "@example-scout",
             "text": "Can you share the retry window?"
           },
           "you_owe_reply": true,
@@ -956,7 +956,7 @@
               "preview": {
                 "at": "2026-11-08T09:05:00.000Z",
                 "message_id": "msg_nova0first00001a",
-                "sender": "@nova-scout",
+                "sender": "@example-scout",
                 "text": "Can you share the retry window?"
               },
               "you_owe_reply": true,
@@ -972,7 +972,7 @@
           "preview": {
             "at": "2026-11-08T09:05:00.000Z",
             "message_id": "msg_nova0first00001a",
-            "sender": "@nova-scout",
+            "sender": "@example-scout",
             "text": "Can you share the retry window?"
           },
           "you_owe_reply": true,
@@ -1004,7 +1004,7 @@
               "preview": {
                 "at": "2026-11-08T09:05:00.000Z",
                 "message_id": "msg_nova0first00001a",
-                "sender": "@nova-scout",
+                "sender": "@example-scout",
                 "text": "Can you share the retry window?"
               },
               "you_owe_reply": true,
@@ -1020,7 +1020,7 @@
           "preview": {
             "at": "2026-11-08T09:05:00.000Z",
             "message_id": "msg_nova0first00001a",
-            "sender": "@nova-scout",
+            "sender": "@example-scout",
             "text": "Can you share the retry window?"
           },
           "you_owe_reply": true,
@@ -1143,7 +1143,7 @@
               "preview": {
                 "at": "2026-11-08T09:05:00.000Z",
                 "message_id": "msg_nova0first00001a",
-                "sender": "@nova-scout",
+                "sender": "@example-scout",
                 "text": "Can you share the retry window?"
               },
               "you_owe_reply": false,
@@ -1159,7 +1159,7 @@
           "preview": {
             "at": "2026-11-08T09:05:00.000Z",
             "message_id": "msg_nova0first00001a",
-            "sender": "@nova-scout",
+            "sender": "@example-scout",
             "text": "Can you share the retry window?"
           },
           "you_owe_reply": true,
@@ -1198,7 +1198,7 @@
                 "name": "launch-crew-2"
               },
               "invite_id": "gri_0launch0crew0002",
-              "invited_by": "@quill"
+              "invited_by": "@example-quill"
             }
           ],
           "invites_truncated": false,
@@ -1212,7 +1212,7 @@
             "name": "launch-crew-2"
           },
           "invite_id": "gri_0launch0crew0002",
-          "invited_by": "@quill"
+          "invited_by": "@example-quill"
         },
         "silent_before": 0,
         "turn": {
@@ -1241,7 +1241,7 @@
                 "name": "launch-crew-2"
               },
               "invite_id": "gri_0launch0crew0002",
-              "invited_by": "@quill"
+              "invited_by": "@example-quill"
             }
           ],
           "invites_truncated": false,
@@ -1255,7 +1255,7 @@
             "name": "launch-crew-2"
           },
           "invite_id": "gri_0launch0crew0002",
-          "invited_by": "@quill"
+          "invited_by": "@example-quill"
         },
         "silent_before": 0,
         "turn": {
@@ -1282,7 +1282,7 @@
             "name": "launch-crew-2"
           },
           "invite_id": "gri_0launch0crew0002",
-          "invited_by": "@quill"
+          "invited_by": "@example-quill"
         },
         "silent_before": 0,
         "turn": {
@@ -1317,7 +1317,7 @@
             "name": "launch-crew-2"
           },
           "invite_id": "gri_0launch0crew0002",
-          "invited_by": "@quill"
+          "invited_by": "@example-quill"
         },
         "silent_before": 0,
         "turn": {
@@ -1352,7 +1352,7 @@
             "name": "launch-crew-2"
           },
           "invite_id": "gri_0launch0crew0002",
-          "invited_by": "@quill"
+          "invited_by": "@example-quill"
         },
         "silent_before": 0,
         "turn": {
@@ -1384,7 +1384,7 @@
                 "name": "launch-crew-2"
               },
               "invite_id": "gri_0launch0crew0002",
-              "invited_by": "@quill"
+              "invited_by": "@example-quill"
             }
           ],
           "invites_truncated": false,
@@ -1398,7 +1398,7 @@
             "name": "launch-crew-2"
           },
           "invite_id": "gri_0launch0crew0002",
-          "invited_by": "@quill"
+          "invited_by": "@example-quill"
         },
         "silent_before": 0,
         "turn": {
@@ -1430,7 +1430,7 @@
                 "name": "launch-crew-2"
               },
               "invite_id": "gri_0launch0crew0002",
-              "invited_by": "@quill"
+              "invited_by": "@example-quill"
             }
           ],
           "invites_truncated": false,
@@ -1444,7 +1444,7 @@
             "name": "launch-crew-2"
           },
           "invite_id": "gri_0launch0crew0002",
-          "invited_by": "@quill"
+          "invited_by": "@example-quill"
         },
         "silent_before": 0,
         "turn": {
@@ -1477,7 +1477,7 @@
                 "name": "launch-crew-2"
               },
               "invite_id": "gri_0launch0crew0002",
-              "invited_by": "@quill"
+              "invited_by": "@example-quill"
             }
           ],
           "invites_truncated": false,
@@ -1491,7 +1491,7 @@
             "name": "launch-crew-2"
           },
           "invite_id": "gri_0launch0crew0002",
-          "invited_by": "@quill"
+          "invited_by": "@example-quill"
         },
         "silent_before": 1,
         "turn": {
@@ -1508,7 +1508,7 @@
     "turn.status is not completed → none (turn_failed; still_running → turn_running).",
     "fresh_tray is null → none (card_unknown / invite_unknown).",
     "the card is not on fresh_tray → none: card_left_tray, or card_unknown when fresh_tray.truncated. Invites: invite_answered, or invite_unknown when fresh_tray.invites_truncated.",
-    "your_last_decision on the fresh card differs from the gate card's, or its at is at or after turn_started_at → none (turn_recorded_verdict).",
+    "your_last_decision on the fresh card differs from the gate card's (the same server field; no clock is compared) → none (turn_recorded_verdict).",
     "the answer went out — your_last_message_at is later than on the gate card (or newly set), or you_owe_reply went from true to false → record_reply through the gate card's anchor (preview.message_id, else last_message_id, else null) with the gate's category.",
     "agentchat_calls is known and made is 0 or every call failed → none (could_not_look).",
     "otherwise the turn looked and did nothing: silent_before 0 → none (silent_first); else record_dismiss with category no_action_needed through the gate card's anchor (silent_again). Invites: dismiss_invite."
@@ -1533,7 +1533,7 @@
           "name": "launch-crew-2"
         },
         "invite_id": "gri_0launch0crew0002",
-        "invited_by": "@quill"
+        "invited_by": "@example-quill"
       },
       "name": "run-ignores-an-invite-twice",
       "runs": [
@@ -1548,7 +1548,7 @@
                   "name": "launch-crew-2"
                 },
                 "invite_id": "gri_0launch0crew0002",
-                "invited_by": "@quill"
+                "invited_by": "@example-quill"
               }
             ],
             "invites_truncated": false
@@ -1566,7 +1566,7 @@
                   "name": "launch-crew-2"
                 },
                 "invite_id": "gri_0launch0crew0002",
-                "invited_by": "@quill"
+                "invited_by": "@example-quill"
               }
             ],
             "invites_truncated": false
@@ -1603,7 +1603,7 @@
           "name": "launch-crew-2"
         },
         "invite_id": "gri_0launch0crew0002",
-        "invited_by": "@quill"
+        "invited_by": "@example-quill"
       },
       "name": "runs-that-did-not-complete-do-not-count",
       "runs": [
@@ -1622,7 +1622,7 @@
                   "name": "launch-crew-2"
                 },
                 "invite_id": "gri_0launch0crew0002",
-                "invited_by": "@quill"
+                "invited_by": "@example-quill"
               }
             ],
             "invites_truncated": false
@@ -1644,7 +1644,7 @@
                   "name": "launch-crew-2"
                 },
                 "invite_id": "gri_0launch0crew0002",
-                "invited_by": "@quill"
+                "invited_by": "@example-quill"
               }
             ],
             "invites_truncated": false
@@ -1673,7 +1673,7 @@
           "name": "launch-crew-2"
         },
         "invite_id": "gri_0launch0crew0002",
-        "invited_by": "@quill"
+        "invited_by": "@example-quill"
       },
       "name": "run-answers-the-invite",
       "runs": [
@@ -1688,7 +1688,7 @@
                   "name": "launch-crew-2"
                 },
                 "invite_id": "gri_0launch0crew0002",
-                "invited_by": "@quill"
+                "invited_by": "@example-quill"
               }
             ],
             "invites_truncated": false
@@ -1728,7 +1728,7 @@
           "name": "launch-crew-2"
         },
         "invite_id": "gri_0launch0crew0002",
-        "invited_by": "@quill"
+        "invited_by": "@example-quill"
       },
       "name": "a-failed-re-read-does-not-count",
       "runs": [
@@ -1747,7 +1747,7 @@
                   "name": "launch-crew-2"
                 },
                 "invite_id": "gri_0launch0crew0002",
-                "invited_by": "@quill"
+                "invited_by": "@example-quill"
               }
             ],
             "invites_truncated": false
@@ -1765,7 +1765,7 @@
                   "name": "launch-crew-2"
                 },
                 "invite_id": "gri_0launch0crew0002",
-                "invited_by": "@quill"
+                "invited_by": "@example-quill"
               }
             ],
             "invites_truncated": false
@@ -1794,7 +1794,7 @@
           "name": "launch-crew-2"
         },
         "invite_id": "gri_0launch0crew0002",
-        "invited_by": "@quill"
+        "invited_by": "@example-quill"
       },
       "name": "missing-from-a-truncated-list",
       "runs": [
@@ -1816,7 +1816,7 @@
                   "name": "launch-crew-2"
                 },
                 "invite_id": "gri_0launch0crew0002",
-                "invited_by": "@quill"
+                "invited_by": "@example-quill"
               }
             ],
             "invites_truncated": false

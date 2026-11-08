@@ -35,7 +35,13 @@ OPS = [
     "wait_handler",
 ]
 EXPECTATIONS = ["cursor_acks", "dispatched", "dispatched_includes", "ws_acks"]
-INVARIANTS = ["acked_was_handled", "acks_follow_handling", "dispatched_once", "seq_order"]
+INVARIANTS = [
+    "acked_was_handled",
+    "acks_follow_handling",
+    "dispatched_once",
+    "seq_order",
+    "serial_per_conversation",
+]
 
 
 def _connector(sock: MockWebSocket) -> Any:
@@ -104,12 +110,16 @@ async def _run(scenario: dict[str, Any], mode: str) -> _Outcome:
     async def handler(message: dict[str, Any]) -> None:
         payload = message["payload"]
         out.dispatched.append(payload)
-        hold = holds.get(payload["id"])
-        if hold is not None:
-            await hold.wait()
-        if payload["id"] in failing:
-            raise RuntimeError(f"scenario handler fails {payload['id']}")
-        out.events.append(("handled", payload["id"]))
+        out.events.append(("entered", payload["id"]))
+        try:
+            hold = holds.get(payload["id"])
+            if hold is not None:
+                await hold.wait()
+            if payload["id"] in failing:
+                raise RuntimeError(f"scenario handler fails {payload['id']}")
+            out.events.append(("handled", payload["id"]))
+        finally:
+            out.events.append(("left", payload["id"]))
 
     rt: RealtimeClient | None = None
     ws: _RecordingSocket | None = None
@@ -207,6 +217,20 @@ def _check_invariants(out: _Outcome, mode: str) -> None:
     ids = [p["id"] for p in out.dispatched]
     assert len(set(ids)) == len(ids), f"a message reached the handler twice: {ids}"
 
+    # serial_per_conversation: never entered for a message of a conversation
+    # while still running for another one of it.
+    conversation = {p["id"]: p["conversation_id"] for p in out.dispatched}
+    running: dict[str, str] = {}
+    for kind, value in out.events:
+        cid = conversation.get(value)
+        if cid is None:
+            continue
+        if kind == "entered":
+            assert cid not in running, f"{cid}: {value} entered while {running.get(cid)} runs"
+            running[cid] = value
+        elif kind == "left" and running.get(cid) == value:
+            del running[cid]
+
     # seq_order
     last: dict[str, int] = {}
     for p in out.dispatched:
@@ -214,37 +238,6 @@ def _check_invariants(out: _Outcome, mode: str) -> None:
         if previous is not None:
             assert p["seq"] > previous, f"{p['conversation_id']}: seq {p['seq']} after {previous}"
         last[p["conversation_id"]] = p["seq"]
-
-
-# Expectations the shared fixture still encodes for concurrent dispatch
-# within a conversation. Lead decision (2026-11-08): the SDKs run at most one
-# handler per conversation, so a frame waits for the previous frame's
-# handler. The TypeScript SDK adopts the same rule and the fixture is then
-# regenerated; until then these overrides apply, and a test below fails as
-# soon as the fixture changes, so they are removed then.
-_PENDING_FIXTURE_UPDATES: dict[tuple[str, str], dict[str, Any]] = {
-    ("frames-arrive-while-a-lapsed-gap-is-handled", "default"): {
-        # seq 4 is acked after seq 3's handler, not before it
-        "was": {"ws_acks": ["msg_gone0wait0001", "msg_gone0wait0004", "msg_gone0wait0003", "msg_gone0wait0006"]},
-        "now": {"ws_acks": ["msg_gone0wait0001", "msg_gone0wait0003", "msg_gone0wait0004", "msg_gone0wait0006"]},
-    },
-}
-
-
-def _expected(scenario: dict[str, Any], mode: str) -> dict[str, Any]:
-    expected = dict(scenario["expect"][mode])
-    pending = _PENDING_FIXTURE_UPDATES.get((scenario["name"], mode))
-    if pending is not None:
-        expected.update(pending["now"])
-    return expected
-
-
-def test_pending_fixture_updates_are_still_pending() -> None:
-    by_name = {s["name"]: s for s in DOC["scenarios"]}
-    for (name, mode), pending in _PENDING_FIXTURE_UPDATES.items():
-        current = by_name[name]["expect"][mode]
-        for key, value in pending["was"].items():
-            assert current[key] == value, f"{name}/{mode}: the fixture changed — drop the override"
 
 
 def _check_expectations(out: _Outcome, expected: dict[str, Any]) -> None:
@@ -287,4 +280,4 @@ def test_scenario_names_are_unique() -> None:
 async def test_engine_scenario(scenario: dict[str, Any], mode: str) -> None:
     out = await _run(scenario, mode)
     _check_invariants(out, mode)
-    _check_expectations(out, _expected(scenario, mode))
+    _check_expectations(out, scenario["expect"][mode])

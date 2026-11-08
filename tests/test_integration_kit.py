@@ -544,7 +544,7 @@ async def _cycle(loop: ReceiveLoop) -> None:
     loop.wake()
     for _ in range(3):
         await asyncio.sleep(0.01)
-        await loop.settled()
+        await loop.idle()
 
 
 def _loop(client: _LoopClient, **kwargs: Any) -> ReceiveLoop:
@@ -628,7 +628,7 @@ async def test_a_running_turn_holds_its_card_and_a_wait_timeout_starts_no_second
     reads = client.inbox.reads
     next_end.set_result(TurnEnd(status="failed"))
     await asyncio.sleep(0.05)
-    await loop.settled()
+    await loop.idle()
     # The turn ended: the held card is read again (and gated again).
     assert client.inbox.reads > reads
     await loop.stop()
@@ -776,6 +776,94 @@ async def test_stop_tells_running_turns_and_an_outcome_after_stop_is_still_recor
     assert client.decisions.recorded == [
         {"conversation_id": "c1", "decision": "reply", "through_message_id": "m1"}
     ]
+
+
+# ─────────────── a truncated tray never spins ───────────────
+
+
+class _Timers:
+    def __init__(self) -> None:
+        self.delays: list[float] = []
+        self.fns: list[Any] = []
+
+    def __call__(self, delay_ms: float, fn: Any) -> Any:
+        if delay_ms > 0:  # the coalescer's own 0 ms windows run for real
+            self.delays.append(delay_ms)
+            self.fns.append(fn)
+
+            class _Handle:
+                def cancel(self) -> None:
+                    return None
+
+            return _Handle()
+        return asyncio.get_running_loop().call_later(0, fn)
+
+
+@pytest.mark.asyncio
+async def test_a_truncated_tray_without_progress_reads_again_after_a_growing_backoff() -> None:
+    truncated = _tray([_card("c1", "m1")], truncated=True)
+    client = _LoopClient([truncated])
+    timers = _Timers()
+    # The gate decides reply, but every turn is refused: no verdict recorded,
+    # no turn started — no progress.
+
+    async def refuse(_request: TurnRequest) -> TurnAdmission:
+        return TurnAdmission(started=False, error="runtime busy")
+
+    loop = _loop(client, call_model=lambda _p: _answer(("c1", "reply")), start_turn=refuse, set_timer=timers)
+    await loop.start()
+    await _cycle(loop)
+    assert timers.delays == [1000]
+    timers.fns.pop(0)()  # the backoff fires: another cycle
+    await asyncio.sleep(0.02)
+    await loop.idle()
+    assert timers.delays == [1000, 2000]
+    await loop.stop()
+
+
+@pytest.mark.asyncio
+async def test_a_truncated_tray_after_progress_is_read_again_at_once() -> None:
+    truncated = _tray([_card("c1", "m1")], truncated=True)
+    client = _LoopClient([truncated, _tray([])])
+    timers = _Timers()
+    loop = _loop(client, call_model=lambda _p: _answer(("c1", "dismiss")), start_turn=_Turns(), set_timer=timers)
+    await loop.start()
+    await _cycle(loop)
+    await asyncio.sleep(0.02)
+    await loop.idle()
+    assert timers.delays == [] and client.inbox.reads >= 2
+    await loop.stop()
+
+
+@pytest.mark.asyncio
+async def test_a_turn_released_while_its_outcome_is_read_records_nothing() -> None:
+    sent = _tray([_card("c1", "m1", you_owe_reply=False)])
+    client = _LoopClient([_tray([_card("c1", "m1")]), sent])
+    turns = _Turns()
+    loop = _loop(client, call_model=lambda _p: _answer(("c1", "reply")), start_turn=turns)
+    await loop.start()
+    await _cycle(loop)
+    original = client.inbox.tray
+
+    async def read_then_release(**kwargs: Any) -> Any:
+        tray = await original(**kwargs)
+        loop.release_turn("conversation:c1")  # an operator lets go meanwhile
+        return tray
+
+    client.inbox.tray = read_then_release  # type: ignore[method-assign]
+    turns.ends[0].set_result(TurnEnd(status="completed"))
+    await asyncio.sleep(0.02)
+    assert client.decisions.recorded == []
+    await loop.stop()
+
+
+def test_status_marks_a_turn_running_past_thirty_minutes_overdue() -> None:
+    clock = {"now": 0.0}
+    loop = _loop(_LoopClient([_tray([])]), call_model=lambda _p: "", start_turn=_Turns(), now=lambda: clock["now"])
+    loop._tracker.begin(TrackedTurn.reply("c1"))
+    assert [t.overdue for t in loop.status().turns] == [False]
+    clock["now"] = 31 * 60_000
+    assert [t.overdue for t in loop.status().turns] == [True]
 
 
 # ─────────────── max_concurrent_turns ───────────────
@@ -1033,7 +1121,7 @@ async def test_the_socket_wakes_echoes_do_not_and_the_handle_is_learned() -> Non
     assert hello["capabilities"] == ["ack", "heartbeat", "rewake"]
     await ws.push({"type": "hello.ok", "capabilities": ["ack", "heartbeat", "rewake"]})
     await asyncio.sleep(0.02)
-    await loop.settled()
+    await loop.idle()
     assert loop.status().handle == "nova"  # learned from the tray's you
     await ws.push({"type": "message.new", "payload": {"id": "m1", "conversation_id": "c1", "sender": "nova", "seq": 1}})
     await ws.push({"type": "message.new", "payload": {"id": "m2", "conversation_id": "c1", "sender": "peer", "seq": 2}})

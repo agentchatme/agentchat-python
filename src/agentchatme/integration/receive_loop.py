@@ -62,7 +62,7 @@ import logging
 import time
 from collections import OrderedDict, deque
 from collections.abc import Awaitable, Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from typing import Any, Callable, Literal
 
@@ -71,7 +71,7 @@ from .._client_identity import AgentChatClientIdentity
 from .._realtime import RealtimeClient
 from ..types.texts import Texts
 from .anchor import normalize_handle
-from .coalescer import SetTimer, WakeCoalescer
+from .coalescer import SetTimer, TimerHandle, WakeCoalescer, _loop_timer
 from .outcome import (
     TurnEnd,
     apply_invite_outcome_async,
@@ -85,6 +85,10 @@ _log = logging.getLogger("agentchat.integration")
 
 TRAY_LIMIT = 50
 """Largest tray the server builds: the loop always reads all of it."""
+TURN_OVERDUE_MS = 30 * 60_000
+"""A running turn older than this is shown as overdue in ``status()``."""
+_NO_PROGRESS_BACKOFF_MS = 1_000
+_NO_PROGRESS_BACKOFF_MAX_MS = 60_000
 PACE_MS = 60_000
 """D5 pacing: how long a silent turn's card (or an invite after its turn) is
 not gated again at the same anchor."""
@@ -389,6 +393,9 @@ class ReceiveLoop:
             coalescer_options["quiet_ms"] = quiet_ms
         if max_ms is not None:
             coalescer_options["max_ms"] = max_ms
+        self._set_timer: SetTimer = set_timer or _loop_timer
+        self._no_progress_streak = 0
+        self._more_timer: TimerHandle | None = None
         self._coalescer = WakeCoalescer(
             self._cycle,
             on_error=self._fail,
@@ -494,6 +501,7 @@ class ReceiveLoop:
             return
         self._stopped = True
         self._coalescer.stop()
+        self._clear_more_timer()
         self._stopping.set()
         # Turns that never got a slot never start; their cards stay on the tray.
         while self._waiting:
@@ -506,13 +514,13 @@ class ReceiveLoop:
         if self._realtime is not None:
             with contextlib.suppress(Exception):
                 await self._realtime.disconnect()
-        await self._coalescer.settled()
+        await self._coalescer.idle()
         if self._pending_work:
             await asyncio.gather(*list(self._pending_work), return_exceptions=True)
 
-    async def settled(self) -> None:
+    async def idle(self) -> None:
         """Return when the running cycle has finished (tests, graceful stops)."""
-        await self._coalescer.settled()
+        await self._coalescer.idle()
 
     def release_turn(self, key: str) -> bool:
         """Let go of a turn whose end the runtime will never confirm (an
@@ -553,7 +561,10 @@ class ReceiveLoop:
                 "last_error": getattr(self._texts, "last_error", None),
             },
             last_cycle=self._last_cycle,
-            turns=self._tracker.running(),
+            turns=[
+                replace(turn, overdue=self._now() - turn.started_at > TURN_OVERDUE_MS)
+                for turn in self._tracker.running()
+            ],
             counters={
                 **self._counts,
                 "turns_active": self._active_turns,
@@ -720,6 +731,7 @@ class ReceiveLoop:
         }
         outcome: CycleOutcome = "invites_only"
         failure: str | None = None
+        recorded = 0
         if owed_cards:
             gated = len(gate_cards)
             result = await _gate.run_async(
@@ -733,6 +745,7 @@ class ReceiveLoop:
                 tally[verdict.decision] += 1
             tally["undecided"] = len(result.undecided)
             tally["record_failures"] = len(result.record_failures)
+            recorded = result.recorded
             if result.outcome == "fail_closed":
                 outcome = "fail_closed"
                 failure = result.failure
@@ -746,9 +759,11 @@ class ReceiveLoop:
             if self._stopped:
                 break
             tally[f"turns_{await self._start_invite_turn_for(invite, texts)}"] += 1
-        # More conversations wait than one tray shows: read again for the rest.
+        # More conversations wait than one tray shows: read again for the
+        # rest — at once after a cycle that made progress, else after a
+        # backoff, so a cycle that cannot progress never spins.
         if tray.get("truncated") is True and outcome == "decided":
-            self._wake_from("more")
+            self._read_the_rest(recorded > 0 or tally["turns_started"] > 0)
         return self._summary(outcome, gated=gated, failure=failure, **base, **tally)
 
     async def _single_run_cycle(self) -> CycleSummary:
@@ -885,7 +900,7 @@ class ReceiveLoop:
     ) -> None:
         try:
             end = await self._tracker.confirmed_end(handle, done)
-            if end is None:
+            if end is None or not self._tracker.holds(handle):
                 return  # released: nothing recorded
             # Recorded also when the turn ends after stop(): what it did is
             # a fact either way.
@@ -899,6 +914,8 @@ class ReceiveLoop:
         self, handle: TurnHandle, card: dict[str, Any], category: str | None, end: TurnEnd
     ) -> None:
         fresh = await self._read_tray()
+        if not self._tracker.holds(handle):
+            return  # released while the tray was read: nothing recorded
         conversation_id = str(card.get("conversation_id"))
         key = f"{conversation_id}|{_gate.anchor_of(card) or ''}"
         silent_before = self._silent.get(key, 0)
@@ -963,9 +980,9 @@ class ReceiveLoop:
     ) -> None:
         try:
             end = await self._tracker.confirmed_end(handle, done)
-            if end is None:
-                return
-            await self._track(self._record_invite_outcome(invite, end))
+            if end is None or not self._tracker.holds(handle):
+                return  # released: nothing recorded
+            await self._track(self._record_invite_outcome(invite, end, handle))
             # D5 pacing: no second invite turn for it for a while (an
             # answered invite has left the tray anyway).
             self._pacer.hold(f"invite:{invite['invite_id']}", None)
@@ -985,8 +1002,13 @@ class ReceiveLoop:
         for invite in invites:
             await self._settle_invite(invite, turn, fresh)
 
-    async def _record_invite_outcome(self, invite: dict[str, Any], end: TurnEnd) -> None:
-        await self._settle_invite(invite, end, await self._read_tray())
+    async def _record_invite_outcome(
+        self, invite: dict[str, Any], end: TurnEnd, handle: TurnHandle
+    ) -> None:
+        fresh = await self._read_tray()
+        if not self._tracker.holds(handle):
+            return  # released while the tray was read: nothing recorded
+        await self._settle_invite(invite, end, fresh)
 
     async def _settle_invite(
         self, invite: dict[str, Any], end: TurnEnd, fresh: dict[str, Any] | None
@@ -1041,6 +1063,33 @@ class ReceiveLoop:
             done = end.done
             return await done if inspect.isawaitable(done) else done
         return TurnEnd(status="failed", detail=f"start_turn returned {type(end).__name__}")
+
+    def _read_the_rest(self, progressed: bool) -> None:
+        """A truncated tray: read again at once after progress (a verdict
+        recorded, a turn started); otherwise after 1 s, doubling to 60 s."""
+        if progressed:
+            self._no_progress_streak = 0
+            self._clear_more_timer()
+            self._wake_from("more")
+            return
+        self._no_progress_streak += 1
+        if self._more_timer is not None:
+            return
+        delay = min(
+            _NO_PROGRESS_BACKOFF_MAX_MS,
+            _NO_PROGRESS_BACKOFF_MS * 2 ** min(self._no_progress_streak - 1, 16),
+        )
+
+        def fire() -> None:
+            self._more_timer = None
+            self._wake_from("more")
+
+        self._more_timer = self._set_timer(delay, fire)
+
+    def _clear_more_timer(self) -> None:
+        if self._more_timer is not None:
+            self._more_timer.cancel()
+            self._more_timer = None
 
     def _after_turn_ended(self) -> None:
         """A turn's end: cards a cycle left out meanwhile are read again."""

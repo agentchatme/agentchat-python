@@ -658,9 +658,9 @@ async def test_a_cancelled_first_copy_counts_as_not_handled() -> None:
         settlement = await rt._deliver_message_new(frame, ws_ack=True)
         await entered.wait()
         assert rt._adopt_in_flight(dict(frame), ws_ack=True) is not None
-        worker = rt._lanes["conversation:c"].worker
-        assert worker is not None
-        worker.cancel()  # what disconnect() does after its grace
+        run = rt._lanes["conversation:c"].jobs[0].run
+        assert run is not None
+        run.cancel()  # what disconnect() does after its grace
         await _settle()
         assert settlement.done() and settlement.result() is False
         assert _ack_frames(ws) == []

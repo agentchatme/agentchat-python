@@ -125,12 +125,30 @@ def test_retry_never_makes_one_attempt_on_an_idempotent_get() -> None:
 
 @respx.mock
 def test_a_retry_policy_of_its_own_applies_to_one_call() -> None:
-    route = respx.post(f"{BASE}/v1/contacts").mock(
+    route = respx.get(f"{BASE}/v1/agents/me").mock(
         side_effect=[httpx.Response(503, json={}), httpx.Response(200, json={"ok": True})]
     )
     policy = RetryPolicy(max_retries=1, base_delay_ms=1, max_delay_ms=1)
-    assert _client().add_contact("@peer", CallOptions(retry=policy)) == {"ok": True}
+    assert _client().get_me(CallOptions(retry=policy)) == {"ok": True}
     assert route.call_count == 2
+
+
+@pytest.mark.parametrize(("key", "calls"), [(None, 1), ("k1", 2)])
+def test_a_per_call_retry_never_retries_a_post_without_an_idempotency_key(
+    key: str | None, calls: int
+) -> None:
+    policy = RetryPolicy(max_retries=1, base_delay_ms=1, max_delay_ms=1)
+    with respx.mock:
+        route = respx.post(f"{BASE}/v1/contacts").mock(
+            side_effect=[httpx.Response(503, json={}), httpx.Response(200, json={"ok": True})]
+        )
+        options = CallOptions(retry=policy, idempotency_key=key)
+        if key is None:
+            with pytest.raises(ServerError):
+                _client().add_contact("@example-peer", options)  # it could have run twice
+        else:
+            assert _client().add_contact("@example-peer", options) == {"ok": True}
+        assert route.call_count == calls
 
 
 # ─────────────── decisions.record on any 2xx ───────────────

@@ -164,7 +164,7 @@ class WakeCoalescer:
         self._pending_first_at = None
         self._pending_last_at = None
 
-    async def settled(self) -> None:
+    async def idle(self) -> None:
         """Return once the running cycle (if any) has ended."""
         current = self._current
         if current is not None and not current.done():
