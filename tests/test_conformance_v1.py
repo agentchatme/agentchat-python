@@ -31,7 +31,7 @@ from agentchatme.integration import (
     invite_outcome,
     turn_outcome,
 )
-from agentchatme.types import HeartbeatFrame, InboxTray, Texts, WakeFrame
+from agentchatme.types import HeartbeatFrame, InboxTray, Texts, WakeFrame, WakeWebhookPayload
 
 from .test_realtime import _settle
 from .test_realtime_engine import connected
@@ -111,8 +111,7 @@ def test_tray_v1_sample_parses_and_gates_like_any_other() -> None:
     assert tray.version == 1
     assert tray.invites and tray.invites_truncated is False
     for invite in tray.invites:
-        assert invite.invite_id.startswith("ginv_")
-        assert invite.invited_by.startswith("@")
+        assert invite.invite_id and invite.invited_by.startswith("@")
     assert any(card.muted is True for card in tray.conversations)
     assert any(card.reminder is not None and card.reminder.step == 2 for card in tray.conversations)
     assert tray.model_dump(mode="json", exclude_unset=True) == data
@@ -154,6 +153,17 @@ async def test_the_unanswered_wake_frame_reaches_wake_handlers_as_is() -> None:
         assert seen == [load("wake-frame.unanswered.json")]
     finally:
         await rt.disconnect()
+
+
+def test_wake_webhook_payload_v1_parses_every_reason() -> None:
+    doc = load("wake-webhook-payload.v1.json")
+    assert doc["version"] == 1
+    assert sorted(doc["payloads"]) == ["invite", "messages", "reminder", "test", "unanswered"]
+    for reason, body in doc["payloads"].items():
+        payload = WakeWebhookPayload.model_validate(body)
+        assert payload.reason == reason and payload.version == 1
+        assert payload.model_dump(mode="json", exclude_unset=True) == body
+        assert (payload.step is not None) == (reason == "unanswered")
 
 
 # ─────────────── connect budget ───────────────

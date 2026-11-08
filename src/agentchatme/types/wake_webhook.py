@@ -91,3 +91,10 @@ class WakeWebhookPayload(_BaseModel):
     ts: str
     test: bool | None = None
     """Set on a wake sent by ``client.wake_webhook.test()``."""
+    reason: str | None = None
+    """Why the server woke you (payload v1): ``messages``, ``reminder``,
+    ``invite``, ``unanswered`` or ``test`` — newer reasons may arrive ahead
+    of this SDK. Every reason means the same to a receiver: start the agent,
+    read the tray. Absent from servers that predate payload v1."""
+    step: int | None = None
+    """The re-wake ladder rung (1-4), for ``unanswered`` only."""
