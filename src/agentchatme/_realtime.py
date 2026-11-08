@@ -9,7 +9,14 @@ Mirrors the TypeScript ``RealtimeClient`` behavior:
 - Bounded message-id dedup across the live and offline-drain paths
 - Per-conversation seq ordering with out-of-order buffering
 - Gap detection with optional ``AsyncAgentChatClient``-backed recovery
-- ``wake`` frames (a signal with no message text: read the tray)
+- ``wake`` frames (a signal with no message text: read the tray), including
+  the server's unanswered re-wake (``rewake`` capability, opt-in)
+- ``heartbeat`` frames (capability ``heartbeat``): the server's 45 s timer as
+  an inbound frame, so the idle watchdog works on any transport
+- Handlers run off the receive loop: a slow handler never holds up frame
+  reads, acks of other frames, or the transport's pongs
+- A connect budget answer (HTTP 429 before the upgrade, close 1013 after
+  HELLO) is backoff with the server's delay, never ``blocked``
 - Jittered exponential reconnect that never gives up, a ``blocked`` state
   with a slow retry after an auth rejection, handshake + liveness watchdogs,
   disposed flag, offline ``/sync`` drain speaking the bare-array wire
@@ -53,6 +60,7 @@ import inspect
 import json
 import logging
 import random
+import re
 import time
 import warnings
 from collections import OrderedDict
@@ -66,12 +74,10 @@ from typing import (
     Union,
 )
 
-from pydantic import ValidationError
-
 from ._client import last_sync_delivery_id
 from ._client_identity import DEFAULT_CLIENT_IDENTITY, AgentChatClientIdentity
+from ._http_retry_after import parse_retry_after
 from .errors import ConnectionError as _RealtimeConnectionError
-from .types.ws import WakePayload
 
 if TYPE_CHECKING:
     from ._client import AsyncAgentChatClient, SyncRow
@@ -258,6 +264,15 @@ class RealtimeOptions:
     default mode keeps ordering because unacked frames come back in order
     on the next drain. Such a flush fires ``on_sequence_gap`` with
     ``reason="connection_closed"``."""
+    rewake: bool = False
+    """Advertise the ``rewake`` capability: the server then sends its
+    unanswered re-wake (``{"type": "wake", "payload": {"reason":
+    "unanswered", "conversation_ids": [...], "step": 1..4, "at": ...}}``) to
+    this socket, and a live ``rewake`` socket stops the same re-wake going
+    to the agent's wake webhook. Turn it on only when an ``on("wake")``
+    handler reads the tray on every wake; a socket that negotiates it and
+    ignores wakes swallows them. The integration kit's receive loop turns it
+    on. Default ``False``."""
 
 
 # ───────────────────────── Internal constants ─────────────────────────
@@ -325,7 +340,35 @@ _SYNC_PAGE_SIZE = 100
 # Capability strings advertised in the HELLO frame. The server echoes the
 # subset it accepted on ``hello.ok``; anything not echoed stays disabled
 # locally (a ``hello.ok`` without ``capabilities`` means legacy server).
-_CLIENT_CAPABILITIES = ("ack",)
+# ``ack``: per-message delivery acks. ``heartbeat``: the server sends a
+# ``heartbeat`` frame on its 45 s timer (no reply expected), which the idle
+# watchdog counts like any inbound frame. ``rewake`` is opt-in
+# (``RealtimeOptions.rewake``) and appended after these.
+_CLIENT_CAPABILITIES = ("ack", "heartbeat")
+_REWAKE_CAPABILITY = "rewake"
+
+# A ready socket whose server negotiated ``heartbeat`` gets a frame at least
+# every 45 s, so the idle watchdog is armed on it even when the transport
+# exposes no ping(); this deadline is two missed heartbeats plus margin.
+_HEARTBEAT_LIVENESS_TIMEOUT_MS = 100_000
+
+# Connect budget (per agent on /v1/ws). Over budget the server answers HTTP
+# 429 with ``Retry-After`` before the upgrade, or closes 1013 (Try Again
+# Later) with a retry hint in the reason after HELLO. Both are backoff with
+# the server's delay, never ``blocked``. Without a usable hint the client
+# waits this long (the per-minute budget's window); a hint is honoured up to
+# _RATE_LIMIT_MAX_DELAY_MS (the per-hour budget's window), never longer.
+_RATE_LIMIT_CLOSE_CODE = 1013
+_RATE_LIMIT_DEFAULT_DELAY_MS = 60_000
+_RATE_LIMIT_MAX_DELAY_MS = 60 * 60_000
+# Spread a fleet told the same delay: up to 10 % ABOVE the server's delay,
+# never below it.
+_RATE_LIMIT_JITTER = 0.1
+
+# disconnect(): how long dispatches still running get to finish before they
+# are cancelled. Handlers run off the receive loop, so this is the one place
+# they are waited for.
+_DISPOSE_GRACE_S = 1.0
 
 # After this many consecutive failed attempts (about half an hour at the
 # default 30 s cap) the outage is long: one error line is logged for the
@@ -391,6 +434,93 @@ def _jittered_below_ms(ms: int, ratio: float) -> int:
     return max(0, int(ms * factor))
 
 
+def _jittered_above_ms(ms: int, ratio: float) -> int:
+    """``ms`` scaled by a uniform factor in ``[1, 1 + ratio]``: ``ms`` stays
+    a true floor (a delay the server asked for)."""
+    factor = 1.0 + random.random() * ratio
+    return max(0, int(ms * factor))
+
+
+_RETRY_HINT_PATTERNS: tuple[tuple[re.Pattern[str], float], ...] = (
+    # retry_after_ms=1500, retry-after-ms: 1500
+    (re.compile(r"retry[\s_-]*after[\s_-]*ms\s*[=:]?\s*(\d+(?:\.\d+)?)", re.IGNORECASE), 1.0),
+    # retry_after=30, Retry-After: 30, retry after 30s
+    (
+        re.compile(r"retry[\s_-]*after\s*[=:]?\s*(\d+(?:\.\d+)?)\s*(?:s\b|sec|seconds?\b)?", re.IGNORECASE),
+        1000.0,
+    ),
+    # retry in 30s / retry in 1500ms / retry in 2m
+    (re.compile(r"retry\s+in\s+(\d+(?:\.\d+)?)\s*ms\b", re.IGNORECASE), 1.0),
+    (re.compile(r"retry\s+in\s+(\d+(?:\.\d+)?)\s*m(?:in(?:utes?)?)?\b", re.IGNORECASE), 60_000.0),
+    (re.compile(r"retry\s+in\s+(\d+(?:\.\d+)?)\s*(?:s\b|sec|seconds?\b)?", re.IGNORECASE), 1000.0),
+)
+
+
+def _retry_hint_ms(reason: str) -> int | None:
+    """The delay a 1013 close reason asks for, in ms, or ``None``.
+
+    Tolerant of the shapes a close reason can carry in its 123 bytes: a JSON
+    object (``retry_after_ms`` / ``retry_after_s`` / ``retry_after`` in
+    seconds) or text (``retry_after_ms=…``, ``retry_after=…`` seconds,
+    ``retry in 30s``). Pure."""
+    text = reason.strip()
+    if not text:
+        return None
+    if text.startswith("{"):
+        try:
+            data = json.loads(text)
+        except ValueError:
+            data = None
+        if isinstance(data, dict):
+            for key, scale in (
+                ("retry_after_ms", 1.0),
+                ("retry_after_s", 1000.0),
+                ("retry_after", 1000.0),
+            ):
+                value = data.get(key)
+                if isinstance(value, (int, float)) and not isinstance(value, bool) and value >= 0:
+                    return int(value * scale)
+    for pattern, scale in _RETRY_HINT_PATTERNS:
+        match = pattern.search(text)
+        if match:
+            return int(float(match.group(1)) * scale)
+    return None
+
+
+def _rate_limit_delay_ms(hint_ms: int | None) -> int:
+    """The delay before the next attempt after a connect-budget answer."""
+    base = _RATE_LIMIT_DEFAULT_DELAY_MS if hint_ms is None else hint_ms
+    return _jittered_above_ms(min(max(0, base), _RATE_LIMIT_MAX_DELAY_MS), _RATE_LIMIT_JITTER)
+
+
+def _upgrade_rejection(err: BaseException) -> tuple[int, str | None] | None:
+    """``(status, Retry-After)`` when opening the socket failed because the
+    server answered the upgrade with an HTTP status, else ``None``.
+
+    Duck-typed across ``websockets`` releases: the asyncio client raises
+    ``InvalidStatus`` (``err.response.status_code`` / ``.headers``), the
+    legacy one ``InvalidStatusCode`` (``err.status_code`` / ``err.headers``).
+    """
+    response = getattr(err, "response", None)
+    status = getattr(response, "status_code", None) if response is not None else None
+    headers = getattr(response, "headers", None) if response is not None else None
+    if not isinstance(status, int):
+        status = getattr(err, "status_code", None)
+        headers = getattr(err, "headers", None)
+    if not isinstance(status, int) or isinstance(status, bool):
+        return None
+    retry_after: str | None = None
+    if headers is not None:
+        getter = getattr(headers, "get", None)
+        if callable(getter):
+            value = getter("Retry-After")
+            if value is None:
+                value = getter("retry-after")
+            if isinstance(value, str):
+                retry_after = value
+    return status, retry_after
+
+
 async def _default_sleep(delay_s: float) -> None:
     await asyncio.sleep(delay_s)
 
@@ -401,7 +531,7 @@ def _consume_future(future: asyncio.Future[Any]) -> None:
         future.exception()
 
 
-_Routed = Literal["delivered", "duplicate", "buffered"]
+_Routed = Literal["delivered", "buffered"]
 """Where :meth:`RealtimeClient._process_ordered_message` sent an envelope."""
 
 
@@ -462,11 +592,10 @@ class _BoundedLruSet:
 
 @dataclass
 class _InFlight:
-    """A ``message.new`` whose handlers are running: its outcome, and the
-    connection generation it was dispatched on."""
+    """A ``message.new`` whose handlers are running: the future its outcome
+    lands on (``True`` = every handler settled cleanly)."""
 
     outcome: asyncio.Future[bool]
-    generation: int
 
 
 @dataclass
@@ -522,6 +651,7 @@ class RealtimeClient:
         handshake_timeout_ms: int | None = None,
         liveness_timeout_ms: int | None = None,
         ack_on_receipt: bool | None = None,
+        rewake: bool | None = None,
         websocket_connect: Callable[..., Awaitable[Any]] | None = None,
     ) -> None:
         if options is None:
@@ -556,6 +686,7 @@ class RealtimeClient:
                 ),
                 liveness_timeout_ms=liveness_timeout_ms,
                 ack_on_receipt=bool(ack_on_receipt),
+                rewake=bool(rewake),
             )
 
         # A private copy: the client writes to its options (the auto-drain
@@ -603,6 +734,12 @@ class RealtimeClient:
         # Delivery-ack mode: on only when THIS connection's hello.ok echoed
         # the `ack` capability. Reset on every connect/close.
         self._ack_negotiated = False
+        # Every capability THIS connection's hello.ok echoed (empty between
+        # connections and against a legacy server).
+        self._negotiated: frozenset[str] = frozenset()
+        # Set when the server's last close or upgrade answer was the connect
+        # budget (D8): the delay it asked for, until the next hello.ok.
+        self._rate_limited_ms: int | None = None
         # Set by _close_socket before it closes the current socket, read and
         # cleared by the recv loop's close handling. A close this client
         # asked for says nothing about the server, whatever code travelled
@@ -625,25 +762,31 @@ class RealtimeClient:
         # Dispatches still running, by message id: resolves to the first
         # copy's outcome. A second copy that arrives meanwhile (the server's
         # reconnect backlog and the REST drain bring the same stored rows; a
-        # slow handler is still on the first) is not handed to the handlers
-        # again. An entry lives exactly as long as its handlers run, so the
-        # map is bounded by the dispatches in flight. Off with the dedup
-        # cache (``dedup_cache_size=0``).
+        # slow handler is still on the first; a reconnect re-offers a frame
+        # whose handler has not finished) is not handed to the handlers
+        # again, on this connection or a later one: it takes the first
+        # copy's outcome without waiting for it. An entry lives exactly as
+        # long as its handlers run, so the map is bounded by the dispatches
+        # in flight. Off with the dedup cache (``dedup_cache_size=0``).
         self._inflight: dict[str, _InFlight] = {}
-        # Bumped on every socket close. A copy adopts an in-flight first copy
-        # only on the same connection; a re-offer on a later one is
-        # dispatched afresh even if the first copy is still running (a
-        # handler that never finishes must not swallow every re-offer).
-        self._generation = 0
+        # Async handler tasks, running off the receive loop; disconnect()
+        # gives them a short grace, then cancels them.
+        self._dispatch_tasks: set[asyncio.Future[Any]] = set()
+        # The tasks that wait for a message.new's async handlers and then
+        # settle it (dedup, in-flight map, ack), with the handler tasks each
+        # waits on. They end on their own once those handlers have ended.
+        self._settle_tasks: dict[asyncio.Future[bool], list[asyncio.Future[Any]]] = {}
         # One REST drain at a time: the server-side ack pointer only moves
         # forward, so a second concurrent drain adds nothing but races.
         self._drain_in_flight = False
         # Per-row dispatch settlement for the page the drain is working on,
         # keyed by the envelope's identity: ``None`` until the envelope is
-        # handed to handlers, then ``True`` (every handler settled cleanly,
-        # or a dedup hit) or ``False`` (a handler raised). The drain reads it
-        # before moving the ack cursor — see :meth:`drain_offline_envelopes`.
-        self._drain_settlements: dict[int, bool | None] = {}
+        # handed to handlers, then a future that resolves ``True`` (every
+        # handler settled cleanly, or a dedup hit) or ``False`` (a handler
+        # raised, or no ``message.new`` handler was attached). The drain
+        # awaits it before moving the ack cursor — see
+        # :meth:`drain_offline_envelopes`.
+        self._drain_settlements: dict[int, asyncio.Future[bool] | None] = {}
         # Drain rows of the current page that adopted an in-flight first copy
         # instead of being dispatched, by envelope identity: the cursor reads
         # that copy's outcome without ever waiting for it.
@@ -711,9 +854,20 @@ class RealtimeClient:
             ws = await connect_fn(url, **_keepalive_kwargs(connect_fn))
         except Exception as err:
             self._connecting = False
+            min_delay_ms: int | None = None
+            rejection = _upgrade_rejection(err)
+            if rejection is not None and rejection[0] == 429:
+                # The connect budget, before the upgrade: backoff with the
+                # server's delay, never blocked.
+                min_delay_ms = _rate_limit_delay_ms(parse_retry_after(rejection[1]))
+                self._rate_limited_ms = min_delay_ms
+                _log.warning(
+                    "AgentChat realtime: connect budget exceeded (HTTP 429); next attempt in %.0fs",
+                    min_delay_ms / 1000.0,
+                )
             error = _RealtimeConnectionError(f"WebSocket connection failed: {err}")
             await self._emit_error(error)
-            await self._schedule_reconnect()
+            await self._schedule_reconnect(min_delay_ms=min_delay_ms)
             raise error from err
         finally:
             self._connecting = False
@@ -727,6 +881,7 @@ class RealtimeClient:
         self._ws = ws
         self._authenticated = False
         self._ack_negotiated = False
+        self._negotiated = frozenset()
         self._close_initiated_locally = False
 
         try:
@@ -737,7 +892,7 @@ class RealtimeClient:
                         "api_key": self._opts.api_key,
                         # Advertised capabilities; the server ignores unknown
                         # strings and echoes the accepted subset on hello.ok.
-                        "capabilities": list(_CLIENT_CAPABILITIES),
+                        "capabilities": self._advertised_capabilities(),
                         "client": self._opts.client_identity.name,
                         **(
                             {
@@ -762,6 +917,12 @@ class RealtimeClient:
 
         self._handshake_task = asyncio.create_task(self._handshake_watchdog(ws))
         self._recv_task = asyncio.create_task(self._recv_loop())
+
+    def _advertised_capabilities(self) -> list[str]:
+        caps = list(_CLIENT_CAPABILITIES)
+        if self._opts.rewake:
+            caps.append(_REWAKE_CAPABILITY)
+        return caps
 
     def _resolve_connect_fn(self) -> Callable[..., Awaitable[Any]]:
         if self._websocket_connect is not None:
@@ -882,6 +1043,10 @@ class RealtimeClient:
             return max(0, configured)
         if callable(getattr(ws, "ping", None)):
             return _DEFAULT_LIVENESS_TIMEOUT_MS
+        if "heartbeat" in self._negotiated:
+            # The server sends a frame at least every 45 s: frames alone are
+            # the evidence, ping or not.
+            return _HEARTBEAT_LIVENESS_TIMEOUT_MS
         # Nothing to probe with: inbound frames alone cannot separate a quiet
         # conversation from a dead peer, so do not guess.
         _log.debug("liveness watchdog not armed: the socket exposes no ping()")
@@ -962,7 +1127,7 @@ class RealtimeClient:
         _log.debug("realtime state %s -> %s", previous, state)
         self._state = state
         if self._handlers.get("state"):
-            await self._dispatch({"type": "state", "state": state, "previous": previous})
+            await self._dispatch_local({"type": "state", "state": state, "previous": previous})
 
     async def _recv_loop(self) -> None:
         ws = self._ws
@@ -992,7 +1157,11 @@ class RealtimeClient:
                         # capabilities list is a legacy server → stay in
                         # mark-on-send semantics and send no ack frames.
                         caps = message.get("capabilities")
-                        self._ack_negotiated = isinstance(caps, list) and "ack" in caps
+                        self._negotiated = frozenset(
+                            cap for cap in caps if isinstance(cap, str)
+                        ) if isinstance(caps, list) else frozenset()
+                        self._ack_negotiated = "ack" in self._negotiated
+                        self._rate_limited_ms = None
                         if self._handshake_task is not None:
                             self._handshake_task.cancel()
                             self._handshake_task = None
@@ -1007,7 +1176,7 @@ class RealtimeClient:
                         self._blocked_announced = False
                         await self._set_state("ready")
                         self._start_liveness_watchdog(ws)
-                        await self._emit_connect()
+                        self._emit_connect()
                         if (
                             self._opts.auto_drain_on_connect
                             and self._opts.client is not None
@@ -1025,10 +1194,14 @@ class RealtimeClient:
 
                 frame_type = message.get("type")
                 if frame_type == "message.new":
-                    if self._opts.ack_on_receipt:
+                    if self._opts.ack_on_receipt and self._has_message_handler():
                         # Delivered = this machine received it. Ack now, then
                         # route through ordering/dedup with the ack already
-                        # spent so dispatch never acks a second time.
+                        # spent so dispatch never acks a second time. With
+                        # no message.new handler attached nothing here will
+                        # ever see the frame, so it is not acked at all: it
+                        # takes the default path below, which acks only
+                        # after a handler took it.
                         message_id = _extract_message_id(message)
                         if message_id is not None:
                             await self._send_delivery_ack(message_id)
@@ -1052,7 +1225,10 @@ class RealtimeClient:
                     _log.debug("dropping server frame typed like a local event: %s", frame_type)
                     continue
 
-                await self._dispatch(message)
+                # Everything else, ``heartbeat`` included (its arrival already
+                # fed the idle watchdog above), goes to its handlers without
+                # holding up the next read.
+                self._dispatch_frame(message)
         except asyncio.CancelledError:
             raise
         except Exception as err:
@@ -1086,21 +1262,37 @@ class RealtimeClient:
             self._note_connection_ended()
             self._authenticated = False
             self._ack_negotiated = False
+            self._negotiated = frozenset()
             if self._ws is ws:
                 self._ws = None
 
-            await self._emit_disconnect(
-                {
-                    "code": close_code,
-                    "reason": close_reason,
-                    "was_clean": close_code == 1000,
-                    # Who ended the socket. "client" is this client's own
-                    # watchdog or stop: such a close says nothing about the
-                    # server. "server" arrived on the wire: the server, a
-                    # proxy, or the network.
-                    "initiator": "client" if ours else "server",
-                }
-            )
+            # The connect budget (D8): the server closed with 1013 and,
+            # usually, the delay it wants. Backoff with that delay; never an
+            # auth verdict, whenever it arrives.
+            rate_limited_ms: int | None = None
+            if not ours and close_code == _RATE_LIMIT_CLOSE_CODE:
+                rate_limited_ms = _rate_limit_delay_ms(_retry_hint_ms(close_reason))
+                self._rate_limited_ms = rate_limited_ms
+                _log.warning(
+                    "AgentChat realtime: connect budget exceeded (close 1013 %r);"
+                    " next attempt in %.0fs",
+                    close_reason,
+                    rate_limited_ms / 1000.0,
+                )
+
+            info: dict[str, Any] = {
+                "code": close_code,
+                "reason": close_reason,
+                "was_clean": close_code == 1000,
+                # Who ended the socket. "client" is this client's own
+                # watchdog or stop: such a close says nothing about the
+                # server. "server" arrived on the wire: the server, a
+                # proxy, or the network.
+                "initiator": "client" if ours else "server",
+            }
+            if rate_limited_ms is not None:
+                info["retry_after_ms"] = rate_limited_ms
+            await self._emit_disconnect(info)
 
             # Ack-on-receipt: every frame parked on a seq gap was acknowledged
             # at parse, so the server has it `delivered` and will never
@@ -1112,7 +1304,6 @@ class RealtimeClient:
             if self._opts.ack_on_receipt:
                 await self._flush_parked_frames("connection_closed")
             self._reset_order_states()
-            self._generation += 1
             if not self._disposed:
                 _log.debug(
                     "realtime socket closed (code=%s reason=%r ours=%s handshake_done=%s)",
@@ -1132,9 +1323,10 @@ class RealtimeClient:
                     await self._enter_blocked(close_code, close_reason)
                 else:
                     # Our own close, a transport drop, a slow handshake the
-                    # server timed out, or an eviction after hello.ok: the
-                    # next HELLO is the evidence (rules 2 and 3).
-                    await self._schedule_reconnect()
+                    # server timed out, an eviction after hello.ok, or the
+                    # connect budget: the next HELLO is the evidence (rules 2
+                    # and 3), after the server's delay when it gave one.
+                    await self._schedule_reconnect(min_delay_ms=rate_limited_ms)
 
     # ─── Offline drain ───────────────────────────────────────────────
 
@@ -1165,9 +1357,12 @@ class RealtimeClient:
           already-acked message, and an acked message is never re-offered.
           Reading continues so the in-session gap-fill still resolves; the
           frozen tail comes back on the next drain and dedups.
-        - A row the ordering layer dropped as a below-anchor duplicate is
-          covered only when this session dispatched it (dedup cache hit);
-          otherwise nothing ever showed it to the application.
+        - A row below this connection's seq anchor (a live frame anchored the
+          conversation first) is handed to the handlers late, out of order,
+          unless this session already handled it (dedup hit): never lost
+          beats strictly ordered. It is covered like any other row.
+        - With no ``message.new`` handler attached, nothing is covered: no
+          handler saw the rows, so the server keeps them.
         - A row whose message another copy is still handling on this
           connection (the server's reconnect backlog brings the same rows) is
           not dispatched again, and the drain never waits for that copy: the
@@ -1235,13 +1430,18 @@ class RealtimeClient:
             if not acks_frozen and not self._disposed:
                 cursor: str | None = None
                 for row, envelope, outcome in zip(prefix, envelopes, routed):
-                    if not self._drain_row_ackable(envelope, outcome):
+                    if not await self._drain_row_ackable(envelope):
                         acks_frozen = True
                         _log.debug(
-                            "sync drain: ack cursor frozen before %s (%s, not handed to the app yet)",
+                            "sync drain: ack cursor frozen before %s (%s, not handled cleanly)",
                             row.get("id"),
                             outcome,
                         )
+                        break
+                    if self._disposed:
+                        # disconnect() began while a handler settled: the
+                        # handler map is gone, commit nothing more.
+                        acks_frozen = True
                         break
                     # Positional cursor: batch order is authoritative; ids
                     # are opaque. A null delivery_id is covered by the next
@@ -1288,7 +1488,7 @@ class RealtimeClient:
                 return
             after = next_after
 
-    def _drain_row_ackable(self, envelope: dict[str, Any], outcome: _Routed) -> bool:
+    async def _drain_row_ackable(self, envelope: dict[str, Any]) -> bool:
         """May the sync/ack cursor cover this drain row? See :meth:`drain_offline_envelopes`."""
         adopted = self._drain_adopted.get(id(envelope))
         if adopted is not None:
@@ -1297,25 +1497,28 @@ class RealtimeClient:
             # Otherwise the cursor stops and the next drain re-offers the row,
             # a dedup hit by then.
             return adopted.done() and not adopted.cancelled() and adopted.result()
-        settled = self._drain_settlements.get(id(envelope))
-        if settled is not None:
-            # Handed to handlers during this page (possibly after a stint in
-            # the buffer): covered iff every handler settled cleanly.
-            return settled
-        if outcome == "duplicate":
-            # Below this connection's seq anchor, so the ordering layer
-            # dropped it. Covered only if this session dispatched it.
-            message_id = _extract_message_id(envelope)
-            return message_id is not None and self._dedup.hit(message_id)
-        # Still parked on a seq gap, or cleared from the buffer by a reset
-        # without dispatch. No handler saw it: the cursor stops here.
-        return False
+        settlement = self._drain_settlements.get(id(envelope))
+        if settlement is None:
+            # Still parked on a seq gap, or cleared from the buffer by a reset
+            # without dispatch. No handler saw it: the cursor stops here.
+            return False
+        # Handed to handlers during this page (possibly after a stint in the
+        # buffer): covered iff every handler settled cleanly. The handlers
+        # run off the receive loop; the drain is the one that waits for them
+        # (shielded: the drain being cancelled must not cancel a handler).
+        try:
+            return bool(await asyncio.shield(settlement))
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            return False
 
     # ─── Reconnect ───────────────────────────────────────────────────
 
-    async def _schedule_reconnect(self) -> None:
+    async def _schedule_reconnect(self, *, min_delay_ms: int | None = None) -> None:
         """Arm the normal backoff. No attempt cap: the client never gives up
-        on its own (rule 1)."""
+        on its own (rule 1). ``min_delay_ms`` is a delay the server asked for
+        (the connect budget): the next attempt waits at least that long."""
         if self._disposed:
             return
         if self._connecting or self._ws is not None:
@@ -1345,7 +1548,10 @@ class RealtimeClient:
                 _LONG_OUTAGE_AFTER_ATTEMPTS,
                 max(self._opts.max_reconnect_interval_ms, _LONG_OUTAGE_MAX_INTERVAL_MS) / 1000.0,
             )
-        delay_s = self._compute_reconnect_delay_ms(attempt) / 1000.0
+        delay_ms = self._compute_reconnect_delay_ms(attempt)
+        if min_delay_ms is not None:
+            delay_ms = max(delay_ms, min_delay_ms)
+        delay_s = delay_ms / 1000.0
         _log.debug("realtime reconnect %d scheduled in %.1fs", attempt, delay_s)
         await self._set_state("backoff")
         if self._disposed or self._connecting or self._ws is not None:
@@ -1391,7 +1597,7 @@ class RealtimeClient:
                 )
             )
         # The server's reason as sent (empty when it sent none).
-        await self._dispatch(
+        await self._dispatch_local(
             {"type": "blocked", "code": code, "reason": reason, "retry_in_ms": retry_ms}
         )
         if self._disposed or retry_ms is None or self._connecting or self._ws is not None:
@@ -1438,6 +1644,20 @@ class RealtimeClient:
         ``on("wake", handler)`` receives a validated ``wake`` frame
         (``payload`` parses as :class:`~agentchatme.types.WakePayload`):
         a content-free "check AgentChat" signal that is never acknowledged.
+        ``on("heartbeat", handler)`` receives the server's heartbeat frames
+        when the ``heartbeat`` capability was negotiated (informational: the
+        idle watchdog already counts them).
+
+        Server-frame handlers (``message.new``, ``wake``, everything the
+        server sends) run off the receive loop: a sync handler runs at once,
+        an async one is started at once and runs as its own task, so a slow
+        handler never holds up the next frame, another frame's ack, or the
+        transport's pongs. Handlers are started in arrival order (per
+        conversation: seq order); an async handler that needs the previous
+        message's handler finished first serialises itself. A ``message.new``
+        is acknowledged once every handler for it settled cleanly (unless
+        ``ack_on_receipt``), and never when no ``message.new`` handler is
+        attached.
 
         Three events are raised by the client itself, in the same shape (a
         server frame carrying one of these types is dropped, never dispatched):
@@ -1510,6 +1730,20 @@ class RealtimeClient:
         return self._blocked_reason
 
     @property
+    def capabilities(self) -> frozenset[str]:
+        """The capabilities the current connection's ``hello.ok`` echoed
+        (``ack``, ``heartbeat``, ``rewake``, …). Empty between connections
+        and against a legacy server."""
+        return self._negotiated
+
+    @property
+    def rate_limited_ms(self) -> int | None:
+        """The delay the server's connect budget asked for on the last
+        refused attempt (HTTP 429 or close 1013), until the next
+        ``hello.ok``; ``None`` otherwise."""
+        return self._rate_limited_ms
+
+    @property
     def ack_negotiated(self) -> bool:
         """True while the current connection's ``hello.ok`` echoed the
         ``ack`` capability: the server keeps envelopes ``stored`` until this
@@ -1534,7 +1768,7 @@ class RealtimeClient:
         await self._set_state("stopped")
 
         current = asyncio.current_task()
-        owned: list[asyncio.Task[Any]] = []
+        owned: list[asyncio.Future[Any]] = []
         for task in (
             self._reconnect_task,
             self._handshake_task,
@@ -1556,6 +1790,12 @@ class RealtimeClient:
 
         await self._flush_parked_frames("gap_fill_unavailable")
 
+        # Handlers run off the receive loop; the frames just flushed and any
+        # still running get a short grace to finish, then are cancelled.
+        # (A handler may be the one calling disconnect(): it is skipped, and
+        # so is the settlement waiting on it.)
+        await self._release_dispatches(current)
+
         ws = self._ws
         self._ws = None
         if ws is not None:
@@ -1572,13 +1812,33 @@ class RealtimeClient:
 
         self._authenticated = False
         self._ack_negotiated = False
-        await self._dispatch({"type": "stopped"})
+        self._negotiated = frozenset()
+        await self._dispatch_local({"type": "stopped"})
         self._handlers.clear()
         self._error_handlers.clear()
         self._connect_handlers.clear()
         self._disconnect_handlers.clear()
 
     # ─── Dispatch ────────────────────────────────────────────────────
+
+    async def _release_dispatches(self, current: asyncio.Future[Any] | None) -> None:
+        """disconnect(): let running handlers finish within the grace, cancel
+        the rest, then wait for their settlements (which then record the
+        cancelled ones as not handled, so nothing is acked for them)."""
+        handlers = [t for t in self._dispatch_tasks if t is not current and not t.done()]
+        if handlers:
+            with contextlib.suppress(Exception):
+                await asyncio.wait(handlers, timeout=_DISPOSE_GRACE_S)
+        await _release_tasks(handlers, current)
+        settlements = [
+            task
+            for task, waits_on in list(self._settle_tasks.items())
+            if not task.done() and current not in waits_on
+        ]
+        if settlements:
+            with contextlib.suppress(Exception):
+                await asyncio.wait(settlements, timeout=_DISPOSE_GRACE_S)
+        self._dispatch_tasks.clear()
 
     async def _emit_error(self, error: BaseException) -> None:
         # ``_invoke`` isolates each handler: a raising ``on_error`` must never
@@ -1588,9 +1848,11 @@ class RealtimeClient:
         for h in list(self._error_handlers):
             await _invoke(h, error)
 
-    async def _emit_connect(self) -> None:
+    def _emit_connect(self) -> None:
+        """Start every ``on_connect`` handler; none of them holds up the
+        receive loop (the server's reconnect backlog follows hello.ok)."""
         for h in list(self._connect_handlers):
-            await _invoke0(h)
+            self._start_handler(h, (), fire_and_forget=True)
 
     async def _emit_disconnect(self, info: dict[str, Any]) -> None:
         for h in list(self._disconnect_handlers):
@@ -1602,135 +1864,242 @@ class RealtimeClient:
         A frame the server sent malformed is surfaced through ``on_error``
         rather than handed to handlers as something it is not.
         """
-        try:
-            WakePayload.model_validate(message.get("payload"), strict=True)
-        except ValidationError as err:
-            problems = "; ".join(
-                f"{'.'.join(str(part) for part in e['loc']) or 'payload'}: {e['msg']}"
-                for e in err.errors()
-            )
+        problem = wake_payload_problem(message.get("payload"))
+        if problem is not None:
             await self._emit_error(
-                _RealtimeConnectionError(f"wake frame failed validation: {problems}")
+                _RealtimeConnectionError(f"wake frame failed validation: {problem}")
             )
             return
-        await self._dispatch(message)
+        self._dispatch_frame(message)
 
-    async def _dispatch(self, message: dict[str, Any]) -> bool:
-        """Fan a frame out to its registered handlers.
-
-        Returns ``True`` when every handler completed without raising —
-        the precondition for a delivery ack. Handler exceptions never
-        propagate (they are logged and the remaining handlers still run),
-        but any of them marks the dispatch failed so ack-mode withholds
-        the ack and the server redelivers. Zero registered handlers count
-        as a clean dispatch: the frame was consumed, exactly as the
-        legacy mark-on-send semantics treated it.
-        """
+    async def _dispatch_local(self, message: dict[str, Any]) -> None:
+        """Run the handlers of an event this client raises itself (``state``,
+        ``blocked``, ``stopped``), awaiting each: they belong to the control
+        flow that raised them. Handler exceptions are logged, never raised."""
         event = message.get("type")
         if not isinstance(event, str):
+            return
+        for h in list(self._handlers.get(event, ())):
+            await _invoke(h, message)
+
+    def _dispatch_frame(self, message: dict[str, Any]) -> None:
+        """Hand a server frame (not ``message.new``) to its handlers without
+        waiting for them: sync handlers run now, async ones start now and run
+        as their own tasks. Failures are logged."""
+        event = message.get("type")
+        if not isinstance(event, str):
+            return
+        for h in list(self._handlers.get(event, ())):
+            self._start_handler(h, (message,), fire_and_forget=True)
+
+    def _has_message_handler(self) -> bool:
+        return bool(self._handlers.get("message.new"))
+
+    def _start_handler(
+        self, handler: Any, args: tuple[Any, ...], *, fire_and_forget: bool
+    ) -> asyncio.Future[Any] | bool:
+        """Call one user handler now.
+
+        A sync handler runs to completion here: ``True`` when it returned,
+        ``False`` when it raised (logged). An async handler is started as its
+        own task, owned by this client, and the task is returned; with
+        ``fire_and_forget`` its failure is logged when it ends.
+        """
+        try:
+            result = handler(*args)
+        except Exception:
+            _log.warning("realtime handler raised", exc_info=True)
             return False
-        handlers = self._handlers.get(event)
-        if not handlers:
+        if not inspect.isawaitable(result):
             return True
-        ok = True
-        for h in list(handlers):
-            if not await _invoke(h, message):
-                ok = False
-        return ok
+        task: asyncio.Future[Any] = asyncio.ensure_future(result)
+        self._dispatch_tasks.add(task)
+        task.add_done_callback(self._dispatch_tasks.discard)
+        if fire_and_forget:
+            task.add_done_callback(_log_handler_failure)
+        return task
 
     async def _deliver_message_new(
         self, message: dict[str, Any], *, ws_ack: bool
-    ) -> bool:
+    ) -> asyncio.Future[bool]:
         """Single delivery choke point for ``message.new`` envelopes.
 
         Every path that hands an envelope to handlers — live in-order,
         buffered drain, gap resolution, REST drain injection, shutdown
         flush — funnels through here so dedup and delivery acks behave
-        identically everywhere:
+        identically everywhere. Returns a future for the envelope's
+        settlement without waiting for the handlers:
 
         - **Dedup** (bounded LRU on ``message_id``, live + drain): a hit
           skips dispatch but still acks — the prior successful dispatch is
-          the proof of processing.
+          the proof of processing. Settles ``True`` at once.
+        - **No handler attached**: nothing will ever see the frame, so it is
+          neither acked nor remembered. Settles ``False`` at once (the drain
+          cursor stops; the server keeps the envelope).
+        - **In flight**: a copy whose first copy is still with the handlers
+          — on this connection or an earlier one — is not dispatched again;
+          it takes the first copy's outcome (acked once that finished
+          cleanly), never waiting for it.
         - **Ack-after-dispatch**: with the ``ack`` capability negotiated,
           confirm ``{"type": "ack", "message_id": ...}`` only after every
-          handler (async ones awaited) completed without raising. A
-          handler exception ⇒ no ack ⇒ the envelope stays ``stored``
-          server-side and re-arrives via drain/redelivery.
+          handler (async ones run as their own tasks) completed without
+          raising. A handler exception ⇒ no ack ⇒ the envelope stays
+          ``stored`` server-side and re-arrives via drain/redelivery.
 
-        Returns ``True`` when the envelope is safe to acknowledge (clean
-        dispatch or dedup hit), ``False`` when a handler raised. The REST
-        drain reads the same answer through :attr:`_drain_settlements`
-        before it moves the sync/ack cursor.
+        The future resolves ``True`` when the envelope is safe to
+        acknowledge (clean dispatch or dedup hit), ``False`` otherwise. The
+        REST drain reads it through :attr:`_drain_settlements` before it
+        moves the sync/ack cursor.
         """
+        loop = asyncio.get_running_loop()
         message_id = _extract_message_id(message)
+        # The socket this copy is acknowledged on, whenever it settles.
+        via = self._ws
 
         if message_id is not None and self._dedup.hit(message_id):
             if ws_ack:
                 await self._send_delivery_ack(message_id)
-            return self._settle_drain_row(message, True)
+            return self._settle_drain_row(message, _resolved(loop, True))
 
-        if self._adopt_in_flight(message, ws_ack=ws_ack):
-            return False
+        handlers = list(self._handlers.get("message.new", ()))
+        if not handlers:
+            return self._settle_drain_row(message, _resolved(loop, False))
+
+        adopted = self._adopt_in_flight(message, ws_ack=ws_ack)
+        if adopted is not None:
+            return adopted
 
         own: _InFlight | None = None
         if message_id is not None and self._dedup.enabled:
-            own = _InFlight(asyncio.get_running_loop().create_future(), self._generation)
+            own = _InFlight(loop.create_future())
             self._inflight[message_id] = own
-        dispatched_cleanly = False
-        try:
-            dispatched_cleanly = await self._dispatch(message)
-            if dispatched_cleanly and message_id is not None:
-                self._dedup.add(message_id)
-        finally:
-            # In the same step the outcome is known (and, on success, the id
-            # is in the dedup cache): a later copy finds one or the other,
-            # never neither. A cancelled dispatch counts as not handled.
-            if own is not None and message_id is not None:
-                if self._inflight.get(message_id) is own:
-                    del self._inflight[message_id]
-                if not own.outcome.done():
-                    own.outcome.set_result(dispatched_cleanly)
-        if not dispatched_cleanly:
-            return self._settle_drain_row(message, False)
-        if message_id is not None and ws_ack:
-            await self._send_delivery_ack(message_id)
-        return self._settle_drain_row(message, True)
 
-    def _adopt_in_flight(self, message: dict[str, Any], *, ws_ack: bool) -> bool:
+        started: list[asyncio.Future[Any]] = []
+        ok = True
+        for handler in handlers:
+            outcome = self._start_handler(handler, (message,), fire_and_forget=False)
+            if outcome is False:
+                ok = False
+            elif outcome is not True:
+                started.append(outcome)
+
+        if not started:
+            # Every handler was sync and has run: settle in this step, so the
+            # ack goes out in arrival order exactly as before.
+            self._finish_dispatch_sync(message_id, own, ok=ok)
+            if ok and ws_ack and message_id is not None:
+                await self._send_delivery_ack(message_id, via=via)
+            return self._settle_drain_row(message, _resolved(loop, ok))
+
+        settlement = self._settle_later(
+            message_id, own, started, ok=ok, ack_via=via if ws_ack else None
+        )
+        return self._settle_drain_row(message, settlement)
+
+    def _settle_later(
+        self,
+        message_id: str | None,
+        own: _InFlight | None,
+        started: list[asyncio.Future[Any]],
+        *,
+        ok: bool,
+        ack_via: Any,
+    ) -> asyncio.Future[bool]:
+        """Wait for the async handlers off the receive loop, then settle;
+        acknowledge on ``ack_via`` (the socket the copy came in on) when it
+        is set and every handler settled cleanly."""
+
+        async def settle() -> bool:
+            try:
+                results = await asyncio.gather(*started, return_exceptions=True)
+            except asyncio.CancelledError:
+                # disconnect() released the dispatch before its handlers
+                # finished: not handled, so not acked.
+                self._finish_dispatch_sync(message_id, own, ok=False)
+                raise
+            clean = ok
+            for result in results:
+                if isinstance(result, BaseException):
+                    clean = False
+                    if not isinstance(result, asyncio.CancelledError):
+                        _log.warning(
+                            "realtime handler raised",
+                            exc_info=(type(result), result, result.__traceback__),
+                        )
+            self._finish_dispatch_sync(message_id, own, ok=clean)
+            if clean and ack_via is not None and message_id is not None and not self._disposed:
+                await self._send_delivery_ack(message_id, via=ack_via)
+            return clean
+
+        task: asyncio.Future[bool] = asyncio.ensure_future(settle())
+        self._settle_tasks[task] = started
+        task.add_done_callback(lambda done: self._settle_tasks.pop(done, None))
+        task.add_done_callback(_consume_future)
+        return task
+
+    def _finish_dispatch_sync(
+        self, message_id: str | None, own: _InFlight | None, *, ok: bool
+    ) -> None:
+        """Record a dispatch's outcome. In one step: the id enters the dedup
+        cache (on success) and leaves the in-flight map, so a later copy finds
+        one or the other, never neither."""
+        if ok and message_id is not None:
+            self._dedup.add(message_id)
+        if own is not None and message_id is not None:
+            if self._inflight.get(message_id) is own:
+                del self._inflight[message_id]
+            if not own.outcome.done():
+                own.outcome.set_result(ok)
+
+    def _adopt_in_flight(
+        self, message: dict[str, Any], *, ws_ack: bool
+    ) -> asyncio.Future[bool] | None:
         """Take the outcome of a copy of this message whose handlers are still
-        running on this connection, instead of dispatching it again.
+        running, instead of dispatching it again — whichever connection the
+        first copy came in on (a reconnect re-offers an unacked frame while
+        its first handler may still run).
 
         Never waits: progress beats dedup. A live copy is acknowledged once
         the first copy finished cleanly (``ws_ack``), never if it failed; a
         drain row's cursor reads that outcome when it is computed and stops
-        if the first copy has not finished. Returns ``True`` when adopted.
+        if the first copy has not finished. Returns the first copy's outcome
+        when adopted, ``None`` otherwise.
         """
         message_id = _extract_message_id(message)
         if message_id is None:
-            return False
+            return None
         first = self._inflight.get(message_id)
-        if first is None or first.generation != self._generation:
-            return False
+        if first is None:
+            return None
         if id(message) in self._drain_settlements:
             self._drain_adopted[id(message)] = first.outcome
         if ws_ack:
+            via = self._ws
 
             def ack_if_handled(outcome: asyncio.Future[bool]) -> None:
                 if outcome.cancelled() or not outcome.result() or self._disposed:
                     return
-                self._spawn(self._send_delivery_ack(message_id))
+                self._spawn(self._send_delivery_ack(message_id, via=via))
 
             first.outcome.add_done_callback(ack_if_handled)
-        return True
+        return first.outcome
 
-    def _settle_drain_row(self, message: dict[str, Any], ok: bool) -> bool:
+    def _settle_drain_row(
+        self, message: dict[str, Any], settlement: asyncio.Future[bool]
+    ) -> asyncio.Future[bool]:
         key = id(message)
         if key in self._drain_settlements:
-            self._drain_settlements[key] = ok
-        return ok
+            self._drain_settlements[key] = settlement
+        return settlement
 
-    async def _send_delivery_ack(self, message_id: str) -> None:
+    async def _send_delivery_ack(self, message_id: str, *, via: Any = None) -> None:
         """Send a delivery-ack frame if this connection negotiated ack-mode.
+
+        ``via`` is the socket the copy being acknowledged arrived on: the
+        ack goes out only while that socket is still the current one. A
+        settlement that ends after a reconnect sends nothing — the server
+        re-offers the frame on the new connection, where that copy (adopted
+        or a dedup hit) is acknowledged on its own socket, once.
 
         Best-effort by design: a lost ack (socket died mid-send) leaves
         the envelope ``stored`` server-side; it re-arrives on the next
@@ -1740,7 +2109,7 @@ class RealtimeClient:
         if not self._ack_negotiated:
             return
         ws = self._ws
-        if ws is None:
+        if ws is None or (via is not None and via is not ws):
             return
         try:
             await ws.send(json.dumps({"type": "ack", "message_id": message_id}))
@@ -1773,16 +2142,14 @@ class RealtimeClient:
         injection) and follows it through the buffer — see
         :class:`_PendingEnvelope`. ``ack_spent`` says the frame was already
         acknowledged at parse (``ack_on_receipt``): the server has it
-        `delivered` and will never re-offer it, so it may only be dropped
-        when this session has dispatched it before.
+        `delivered` and will never re-offer it, so a shutdown or close flush
+        must hand it over rather than drop it.
 
         Returns where the envelope went: ``"delivered"`` (handed to
-        :meth:`_deliver_message_new` now), ``"duplicate"`` (below this
-        connection's seq anchor, dropped; a live frame this session already
-        dispatched is acknowledged again), or ``"buffered"`` (parked on a
+        :meth:`_deliver_message_new` now — in order, or late when it is
+        below this connection's seq anchor) or ``"buffered"`` (parked on a
         seq gap; dispatched later by the gap machinery or the shutdown
-        flush). The REST drain uses this to decide what its ack cursor may
-        cover.
+        flush). The handlers themselves run off this call.
         """
         payload = message.get("payload")
         if not isinstance(payload, dict):
@@ -1810,29 +2177,21 @@ class RealtimeClient:
             return "delivered"
 
         if seq < state.next_expected_seq:
-            # Below this connection's anchor: a drain↔live race or a server
-            # double-publish. The server registers the socket before it
-            # starts the reconnect drain, so a fresh live frame (seq 5) can
-            # anchor a conversation before the drain pushes older stored
-            # rows (seq 3, 4). Unacked, those come back in order later and
-            # are safe to drop here; acked at parse, dropping them would lose
-            # them — deliver on a dedup miss, out of order but not lost.
-            message_id = _extract_message_id(message)
-            seen = message_id is not None and self._dedup.hit(message_id)
-            if not ack_spent:
-                if seen and ws_ack and message_id is not None:
-                    # A repeat of a message this session already handled:
-                    # the earlier dispatch is the proof, so acknowledge it
-                    # again, as the dedup path does for every other repeat.
-                    await self._send_delivery_ack(message_id)
-                else:
-                    # A repeat of a message whose first copy is still with
-                    # the handlers takes that outcome, without waiting.
-                    self._adopt_in_flight(message, ws_ack=ws_ack)
-                return "duplicate"
-            if seen:
-                return "duplicate"
-            await self._deliver_message_new(message, ws_ack=False)
+            # Below this connection's anchor. With a first-arrival anchor that
+            # means "older than the first frame this connection saw", NOT
+            # "already dispatched": the server registers the socket before it
+            # drains the stored backlog, so a live frame can anchor a
+            # conversation at seq 5 and the drain then brings stored seqs 3
+            # and 4 that no handler has seen. Dropping them would stall them:
+            # unacked, they come back on the next drain, behind a fresh live
+            # anchor again, and the drain cursor could never pass them; acked
+            # at parse, they would be lost. The same holds for a seq a failed
+            # gap fill skipped that arrives late. So hand the frame over and
+            # let the dedup cache — the only evidence of a prior dispatch —
+            # decide: a hit skips the handlers (and acks again), a copy still
+            # with the handlers is adopted, a miss is dispatched late, out of
+            # order but never lost (the TypeScript SDK's rule).
+            await self._deliver_message_new(message, ws_ack=ws_ack)
             return "delivered"
 
         if seq == state.next_expected_seq:
@@ -1960,14 +2319,17 @@ class RealtimeClient:
             # and spend it. Either way the server's envelope (if any) is
             # settled here instead of waiting for a later drain.
             envelope: dict[str, Any] = {"type": "message.new", "payload": row}
-            if self._opts.ack_on_receipt:
+            # No handler attached: nothing would see the row, so no receipt
+            # either; it rides the ack-after-dispatch path instead.
+            receipt = self._opts.ack_on_receipt and self._has_message_handler()
+            if receipt:
                 fetched_id = _extract_message_id(envelope)
                 if fetched_id is not None:
                     await self._send_delivery_ack(fetched_id)
             state.buffer[row_seq] = _PendingEnvelope(
                 message=envelope,
-                ws_ack=not self._opts.ack_on_receipt,
-                acked=self._opts.ack_on_receipt,
+                ws_ack=not receipt,
+                acked=receipt,
             )
 
         drained = await self._drain_consecutive(conversation_id, state)
@@ -2207,17 +2569,69 @@ async def _invoke(handler: Any, arg: Any) -> bool:
     return True
 
 
-async def _invoke0(handler: Any) -> None:
-    try:
-        result = handler()
-        if inspect.isawaitable(result):
-            await result
-    except Exception:
-        _log.warning("realtime handler raised", exc_info=True)
+def _resolved(loop: asyncio.AbstractEventLoop, value: bool) -> asyncio.Future[bool]:
+    future: asyncio.Future[bool] = loop.create_future()
+    future.set_result(value)
+    return future
+
+
+def _log_handler_failure(task: asyncio.Future[Any]) -> None:
+    """Done-callback for a handler started without anyone awaiting it."""
+    if task.cancelled():
+        return
+    error = task.exception()
+    if error is not None:
+        _log.warning(
+            "realtime handler raised", exc_info=(type(error), error, error.__traceback__)
+        )
+
+
+_WAKE_CONVERSATION_IDS_MAX = 50
+
+
+def wake_payload_problem(payload: Any) -> str | None:
+    """Why a ``wake`` frame's payload is not one, or ``None`` when it is.
+
+    Minimal on purpose: a newer reason may arrive ahead of this SDK, and any
+    wake means the same thing (read the tray). Required: ``reason``, a
+    non-empty string. The fields each known reason carries are required for
+    it (``reminder``: ``conversation_id``, ``anchor_message_id``, ``step``,
+    ``at``; ``unanswered``: ``conversation_ids`` (≤ 50), ``step``, ``at``),
+    and any of them present on another reason must be well-typed. Pure.
+    """
+    if not isinstance(payload, dict):
+        return "payload is not an object"
+    reason = payload.get("reason")
+    if not isinstance(reason, str) or not reason:
+        return "reason is not a non-empty string"
+    required: tuple[str, ...] = ()
+    if reason == "reminder":
+        required = ("conversation_id", "anchor_message_id", "step", "at")
+    elif reason == "unanswered":
+        required = ("conversation_ids", "step", "at")
+    for key in required:
+        if key not in payload:
+            return f"{key} is missing"
+    for key in ("conversation_id", "anchor_message_id", "at"):
+        if key in payload and (not isinstance(payload[key], str) or not payload[key]):
+            return f"{key} is not a non-empty string"
+    if "step" in payload:
+        step = payload["step"]
+        if not isinstance(step, int) or isinstance(step, bool):
+            return "step is not an integer"
+    if "conversation_ids" in payload:
+        ids = payload["conversation_ids"]
+        if (
+            not isinstance(ids, list)
+            or len(ids) > _WAKE_CONVERSATION_IDS_MAX
+            or not all(isinstance(item, str) and item for item in ids)
+        ):
+            return "conversation_ids is not a list of at most 50 non-empty strings"
+    return None
 
 
 async def _release_tasks(
-    tasks: list[asyncio.Task[Any]], current: asyncio.Task[Any] | None
+    tasks: list[asyncio.Future[Any]], current: asyncio.Future[Any] | None
 ) -> None:
     """Cancel ``tasks`` and wait for them to finish, so a closed client
     leaves nothing behind in the loop. The calling task is skipped: a

@@ -1,0 +1,460 @@
+"""Socket rules added for contract v1: handlers off the receive loop, no ack
+without a handler, in-flight dedupe across reconnects, the ``heartbeat`` and
+``rewake`` capabilities, the unanswered wake, and the connect budget (HTTP
+429 / close 1013) as backoff with the server's delay."""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import time
+from typing import Any
+
+import pytest
+
+from agentchatme import RealtimeClient, _realtime
+from agentchatme._realtime import _retry_hint_ms, _upgrade_rejection, wake_payload_problem
+
+from .test_realtime import MockWebSocket, _ack_frames, _make_client, _settle
+from .test_realtime_engine import connected, message_new
+from .test_realtime_resilience import ControlledSleep, _client_with_sockets, _until
+
+# ─────────────── handlers never hold up the receive loop ───────────────
+
+
+@pytest.mark.asyncio
+async def test_a_slow_handler_never_holds_up_the_next_frame_or_its_ack() -> None:
+    rt, ws = await connected(capabilities=["ack"])
+    release = asyncio.Event()
+    calls: list[str] = []
+
+    async def handler(m: dict[str, Any]) -> None:
+        calls.append(m["payload"]["id"])
+        if m["payload"]["id"] == "msg_1":
+            await release.wait()
+
+    presence: list[str] = []
+    rt.on("message.new", handler)
+    rt.on("presence.update", lambda m: presence.append(m["payload"]["handle"]))
+    try:
+        await ws.push(message_new("a", 1))
+        await ws.push(message_new("b", 1, id="msg_b1"))
+        await ws.push({"type": "presence.update", "payload": {"handle": "nova"}})
+        await _settle()
+        # The slow handler is still running; the receive loop went on.
+        assert calls == ["msg_1", "msg_b1"]
+        assert presence == ["nova"]
+        assert _ack_frames(ws) == ["msg_b1"]
+        release.set()
+        await _settle()
+        assert _ack_frames(ws) == ["msg_b1", "msg_1"]
+    finally:
+        release.set()
+        await rt.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_a_slow_async_handler_of_any_server_event_never_blocks_reads() -> None:
+    rt, ws = await connected(capabilities=["ack"])
+    gate = asyncio.Event()
+    seen: list[str] = []
+
+    async def slow_typing(_m: dict[str, Any]) -> None:
+        await gate.wait()
+
+    rt.on("typing.start", slow_typing)
+    rt.on("message.new", lambda m: seen.append(m["payload"]["id"]))
+    try:
+        await ws.push({"type": "typing.start", "payload": {"conversation_id": "a"}})
+        await ws.push(message_new("a", 1))
+        await _settle()
+        assert seen == ["msg_1"]
+    finally:
+        gate.set()
+        await rt.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_handlers_of_one_conversation_start_in_seq_order() -> None:
+    rt, ws = await connected(capabilities=["ack"])
+    started: list[int] = []
+
+    async def handler(m: dict[str, Any]) -> None:
+        started.append(m["payload"]["seq"])
+        await asyncio.sleep(0)
+
+    rt.on("message.new", handler)
+    try:
+        await ws.push(message_new("c", 1))
+        await ws.push(message_new("c", 3))
+        await ws.push(message_new("c", 2))
+        await _settle()
+        assert started == [1, 2, 3]
+    finally:
+        await rt.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_an_async_on_connect_handler_never_holds_up_the_backlog() -> None:
+    rt, ws = _make_client()
+    gate = asyncio.Event()
+    seen: list[str] = []
+
+    async def on_connect() -> None:
+        await gate.wait()
+
+    rt.on_connect(on_connect)
+    rt.on("message.new", lambda m: seen.append(m["payload"]["id"]))
+    try:
+        await rt.connect()
+        await _settle()
+        await ws.push({"type": "hello.ok", "capabilities": ["ack"]})
+        await ws.push(message_new("c", 1))
+        await _settle()
+        assert seen == ["msg_1"]
+    finally:
+        gate.set()
+        await rt.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_disconnect_releases_a_handler_that_never_returns() -> None:
+    rt, ws = await connected(capabilities=["ack"])
+
+    async def hangs(_m: dict[str, Any]) -> None:
+        await asyncio.Event().wait()
+
+    rt.on("message.new", hangs)
+    await ws.push(message_new("c", 1))
+    await _settle()
+    started = time.monotonic()
+    await rt.disconnect()
+    assert time.monotonic() - started < _realtime._DISPOSE_GRACE_S + 1.0
+    assert rt._dispatch_tasks == set()
+    await _settle()
+    assert rt._settle_tasks == {}
+    assert rt._inflight == {}
+    assert _ack_frames(ws) == []
+
+
+# ─────────────── never ack without a handler ───────────────
+
+
+@pytest.mark.parametrize("ack_on_receipt", [False, True])
+@pytest.mark.asyncio
+async def test_a_frame_is_never_acked_while_no_message_handler_is_attached(
+    ack_on_receipt: bool,
+) -> None:
+    rt, ws = await connected(capabilities=["ack"], ack_on_receipt=ack_on_receipt)
+    try:
+        await ws.push(message_new("c", 1))
+        await _settle()
+        assert _ack_frames(ws) == []
+        # Nothing remembers it either: once a handler is attached, the
+        # server's re-offer is handled and acked.
+        seen: list[str] = []
+        rt.on("message.new", lambda m: seen.append(m["payload"]["id"]))
+        await ws.push(message_new("c", 1))
+        await _settle()
+        assert seen == ["msg_1"]
+        assert _ack_frames(ws) == ["msg_1"]
+    finally:
+        await rt.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_a_wake_handler_alone_does_not_make_message_frames_ackable() -> None:
+    rt, ws = await connected(capabilities=["ack"], ack_on_receipt=True)
+    rt.on("wake", lambda _m: None)
+    try:
+        await ws.push(message_new("c", 1))
+        await _settle()
+        assert _ack_frames(ws) == []
+    finally:
+        await rt.disconnect()
+
+
+# ─────────────── capabilities: heartbeat, rewake ───────────────
+
+
+@pytest.mark.parametrize(("rewake", "caps"), [(False, ["ack", "heartbeat"]), (True, ["ack", "heartbeat", "rewake"])])
+@pytest.mark.asyncio
+async def test_hello_advertises_heartbeat_and_rewake_only_when_asked(
+    rewake: bool, caps: list[str]
+) -> None:
+    rt, ws = _make_client(rewake=rewake)
+    try:
+        await rt.connect()
+        await _settle()
+        assert json.loads(ws.sent[0])["capabilities"] == caps
+    finally:
+        await rt.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_negotiated_capabilities_are_exposed_and_cleared_on_close() -> None:
+    rt, ws = await connected(capabilities=["ack", "heartbeat", "rewake"], rewake=True)
+    try:
+        assert rt.capabilities == frozenset({"ack", "heartbeat", "rewake"})
+        await ws.close(code=1006)
+        await _settle()
+        assert rt.capabilities == frozenset()
+    finally:
+        await rt.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_arms_the_idle_watchdog_on_a_socket_without_ping() -> None:
+    # MockWebSocket has no ping(): without heartbeat there is no watchdog;
+    # with it, frames are the evidence.
+    rt, _ws = await connected(capabilities=["ack"])
+    try:
+        assert rt._liveness_task is None
+    finally:
+        await rt.disconnect()
+    rt, _ws = await connected(capabilities=["ack", "heartbeat"])
+    try:
+        assert rt._liveness_task is not None
+        assert rt._liveness_timeout_ms(_ws) == _realtime._HEARTBEAT_LIVENESS_TIMEOUT_MS
+    finally:
+        await rt.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_frames_keep_a_quiet_socket_alive_and_their_absence_trips_it() -> None:
+    errors: list[BaseException] = []
+    rt, ws = await connected(capabilities=["ack", "heartbeat"], liveness_timeout_ms=150)
+    rt.on_error(errors.append)
+    beats: list[str] = []
+    rt.on("heartbeat", lambda m: beats.append(m["payload"]["at"]))
+    try:
+        for i in range(4):
+            await asyncio.sleep(0.06)
+            await ws.push({"type": "heartbeat", "payload": {"at": f"t{i}"}})
+        await _settle()
+        assert not ws.closed
+        assert beats == ["t0", "t1", "t2", "t3"]
+        await asyncio.sleep(0.35)  # the heartbeats stop
+        await _settle()
+        assert ws.closed
+        assert ws.close_code == 4000
+        assert any("liveness timeout" in str(e) for e in errors)
+    finally:
+        await rt.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_an_unanswered_wake_reaches_wake_handlers() -> None:
+    rt, ws = await connected(capabilities=["ack", "heartbeat", "rewake"], rewake=True)
+    wakes: list[dict[str, Any]] = []
+    rt.on("wake", lambda m: wakes.append(m["payload"]))
+    payload = {
+        "reason": "unanswered",
+        "conversation_ids": ["conv_a", "conv_b"],
+        "step": 2,
+        "at": "2026-11-08T00:05:00.000Z",
+    }
+    try:
+        await ws.push({"type": "wake", "payload": payload})
+        await _settle()
+        assert wakes == [payload]
+        assert _ack_frames(ws) == []
+    finally:
+        await rt.disconnect()
+
+
+@pytest.mark.parametrize(
+    ("payload", "problem"),
+    [
+        ({"reason": "unanswered", "conversation_ids": ["a"], "step": 1, "at": "t"}, None),
+        ({"reason": "reminder", "conversation_id": "c", "anchor_message_id": "m", "step": 1, "at": "t"}, None),
+        ({"reason": "something_new"}, None),
+        ({"reason": "something_new", "conversation_ids": ["a"], "step": 3}, None),
+        ({"reason": "unanswered", "step": 1, "at": "t"}, "conversation_ids is missing"),
+        ({"reason": "unanswered", "conversation_ids": "a", "step": 1, "at": "t"}, "conversation_ids"),
+        ({"reason": "unanswered", "conversation_ids": ["a"] * 51, "step": 1, "at": "t"}, "conversation_ids"),
+        ({"reason": "unanswered", "conversation_ids": [""], "step": 1, "at": "t"}, "conversation_ids"),
+        ({"reason": "unanswered", "conversation_ids": ["a"], "step": "1", "at": "t"}, "step"),
+        ({"reason": "reminder", "conversation_id": "c", "step": 1, "at": "t"}, "anchor_message_id is missing"),
+        ({"reason": ""}, "reason"),
+        ({}, "reason"),
+        ([], "payload is not an object"),
+    ],
+)
+def test_wake_payload_problem(payload: Any, problem: str | None) -> None:
+    got = wake_payload_problem(payload)
+    if problem is None:
+        assert got is None
+    else:
+        assert got is not None and problem in got
+
+
+# ─────────────── the connect budget ───────────────
+
+
+@pytest.mark.parametrize(
+    ("reason", "ms"),
+    [
+        ('{"retry_after_ms": 1500}', 1500),
+        ('{"retry_after": 30}', 30_000),
+        ('{"retry_after_s": 2.5}', 2500),
+        ("retry_after_ms=1500", 1500),
+        ("rate limited; retry_after=45", 45_000),
+        ("Retry-After: 12", 12_000),
+        ("too many connections, retry in 30s", 30_000),
+        ("retry in 1500ms", 1500),
+        ("retry in 2m", 120_000),
+        ("connect budget exceeded", None),
+        ("", None),
+    ],
+)
+def test_retry_hint_ms(reason: str, ms: int | None) -> None:
+    assert _retry_hint_ms(reason) == ms
+
+
+@pytest.mark.asyncio
+async def test_a_1013_close_backs_off_with_the_servers_delay_and_never_blocks() -> None:
+    first, second = MockWebSocket(), MockWebSocket()
+    rt, handed = _client_with_sockets([first, second])
+    sleep = ControlledSleep(hold=True)
+    rt._sleep = sleep
+    disconnects: list[dict[str, Any]] = []
+    rt.on_disconnect(disconnects.append)
+    try:
+        await rt.connect()
+        await _settle()
+        await first.push({"type": "hello.ok", "capabilities": ["ack"]})
+        await _settle()
+        # The server's budget closes the socket after HELLO with a hint.
+        first.close_code = 1013
+        first.close_reason = "retry_after=30"
+        await first._inbox.put(None)
+        await _until(lambda: bool(sleep.delays))
+        assert rt.state == "backoff"
+        assert rt.blocked_reason is None
+        assert 30.0 <= sleep.delays[0] <= 33.0
+        assert disconnects[-1]["retry_after_ms"] >= 30_000
+        assert rt.rate_limited_ms is not None and rt.rate_limited_ms >= 30_000
+        sleep.release()
+        await _until(lambda: len(handed) == 2)
+        await second.push({"type": "hello.ok", "capabilities": ["ack"]})
+        await _until(lambda: rt.state == "ready")
+        assert rt.rate_limited_ms is None
+    finally:
+        sleep.release()
+        await rt.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_a_1013_close_during_the_handshake_is_not_an_auth_rejection() -> None:
+    sock = MockWebSocket()
+    rt, _handed = _client_with_sockets([sock])
+    sleep = ControlledSleep(hold=True)
+    rt._sleep = sleep
+    try:
+        await rt.connect()
+        await _settle()
+        sock.close_code = 1013
+        sock.close_reason = ""
+        await sock._inbox.put(None)
+        await _until(lambda: bool(sleep.delays))
+        assert rt.state == "backoff"
+        # No hint: the per-minute budget's window.
+        assert 60.0 <= sleep.delays[0] <= 66.0
+    finally:
+        sleep.release()
+        await rt.disconnect()
+
+
+class _Headers:
+    def __init__(self, values: dict[str, str]) -> None:
+        self._values = values
+
+    def get(self, key: str) -> str | None:
+        return self._values.get(key)
+
+
+class _Response:
+    def __init__(self, status: int, headers: dict[str, str]) -> None:
+        self.status_code = status
+        self.headers = _Headers(headers)
+
+
+class _InvalidStatus(Exception):
+    """The shape of websockets' asyncio-client ``InvalidStatus``."""
+
+    def __init__(self, status: int, headers: dict[str, str]) -> None:
+        super().__init__(f"server rejected WebSocket connection: HTTP {status}")
+        self.response = _Response(status, headers)
+
+
+class _InvalidStatusCode(Exception):
+    """The shape of websockets' legacy ``InvalidStatusCode``."""
+
+    def __init__(self, status: int, headers: dict[str, str]) -> None:
+        super().__init__(f"server rejected WebSocket connection: HTTP {status}")
+        self.status_code = status
+        self.headers = _Headers(headers)
+
+
+def test_upgrade_rejection_reads_both_websockets_shapes() -> None:
+    assert _upgrade_rejection(_InvalidStatus(429, {"Retry-After": "7"})) == (429, "7")
+    assert _upgrade_rejection(_InvalidStatusCode(429, {"retry-after": "9"})) == (429, "9")
+    assert _upgrade_rejection(_InvalidStatus(503, {})) == (503, None)
+    assert _upgrade_rejection(OSError("connection refused")) is None
+
+
+@pytest.mark.parametrize("exc_type", [_InvalidStatus, _InvalidStatusCode])
+@pytest.mark.asyncio
+async def test_a_429_upgrade_backs_off_with_retry_after_and_never_blocks(exc_type: Any) -> None:
+    attempts = 0
+    ok = MockWebSocket()
+
+    async def connect(_url: str, **_kw: Any) -> MockWebSocket:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise exc_type(429, {"Retry-After": "20"})
+        return ok
+
+    rt = RealtimeClient(api_key="sk_test", reconnect=True, websocket_connect=connect)
+    sleep = ControlledSleep(hold=True)
+    rt._sleep = sleep
+    try:
+        with pytest.raises(Exception, match="HTTP 429"):
+            await rt.connect()
+        assert rt.state == "backoff"
+        await _until(lambda: bool(sleep.delays))
+        assert 20.0 <= sleep.delays[0] <= 22.0
+        sleep.release()
+        await _until(lambda: attempts == 2)
+        await ok.push({"type": "hello.ok"})
+        await _until(lambda: rt.state == "ready")
+    finally:
+        sleep.release()
+        await rt.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_a_429_without_retry_after_waits_the_default_window() -> None:
+    async def connect(_url: str, **_kw: Any) -> MockWebSocket:
+        raise _InvalidStatus(429, {})
+
+    rt = RealtimeClient(api_key="sk_test", reconnect=True, websocket_connect=connect)
+    sleep = ControlledSleep(hold=True)
+    rt._sleep = sleep
+    try:
+        with pytest.raises(Exception, match="HTTP 429"):
+            await rt.connect()
+        await _until(lambda: bool(sleep.delays))
+        assert 60.0 <= sleep.delays[0] <= 66.0
+    finally:
+        sleep.release()
+        await rt.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_a_server_hint_is_capped_at_an_hour() -> None:
+    assert _realtime._rate_limit_delay_ms(10 * 60 * 60_000) <= int(
+        _realtime._RATE_LIMIT_MAX_DELAY_MS * 1.1
+    )

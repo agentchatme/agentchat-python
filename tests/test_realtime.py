@@ -184,11 +184,12 @@ async def test_connect_sends_hello_frame() -> None:
         assert len(ws.sent) == 1
         sent = json.loads(ws.sent[0])
         # HELLO authenticates over the wire and advertises the delivery-ack
-        # capability; the server ignores unknown capability strings.
+        # and heartbeat capabilities (rewake is opt-in); the server ignores
+        # unknown capability strings.
         assert sent == {
             "type": "hello",
             "api_key": "sk_test",
-            "capabilities": ["ack"],
+            "capabilities": ["ack", "heartbeat"],
             "client": "python_sdk",
             "client_version": VERSION,
         }
@@ -277,27 +278,29 @@ async def test_message_new_dispatches_in_order() -> None:
 
 @pytest.mark.asyncio
 async def test_duplicate_seq_is_dropped_while_state_active() -> None:
-    # Dedup only applies while the per-conversation state is live — i.e. a
-    # later-seq message is buffered and waiting. Once the buffer drains
-    # and the state is cleaned up, a reappearing seq looks like a first
-    # arrival on a fresh anchor (and is rare in practice because the
-    # server de-dups upstream).
+    # A repeat below the anchor is decided by the dedup cache (the message
+    # id), never by its seq alone: a hit is not handed over again.
     rt, ws = _make_client()
     seqs: list[int] = []
     rt.on("message.new", lambda m: seqs.append(m["payload"]["seq"]))
+
+    def frame(seq: int) -> dict[str, Any]:
+        payload = {"id": f"m_{seq}", "conversation_id": "c1", "seq": seq}
+        return {"type": "message.new", "payload": payload}
+
     try:
         await rt.connect()
         await _settle()
         await ws.push({"type": "hello.ok"})
         await _settle()
         # Anchor at 1 → next_expected_seq = 2.
-        await ws.push({"type": "message.new", "payload": {"conversation_id": "c1", "seq": 1}})
+        await ws.push(frame(1))
         # Buffer 3 — state stays live waiting on the missing 2.
-        await ws.push({"type": "message.new", "payload": {"conversation_id": "c1", "seq": 3}})
-        # Duplicate of 1 — seq < next_expected_seq, must be dropped.
-        await ws.push({"type": "message.new", "payload": {"conversation_id": "c1", "seq": 1}})
+        await ws.push(frame(3))
+        # Repeat of 1 — below the anchor and a dedup hit: not handed over again.
+        await ws.push(frame(1))
         # Now 2 arrives → drain 2, 3 in order.
-        await ws.push({"type": "message.new", "payload": {"conversation_id": "c1", "seq": 2}})
+        await ws.push(frame(2))
         await _settle()
         assert seqs == [1, 2, 3]
     finally:
@@ -1273,10 +1276,12 @@ async def test_drain_acks_a_below_anchor_duplicate_only_if_this_session_dispatch
 
 
 @pytest.mark.asyncio
-async def test_drain_never_acks_a_below_anchor_row_nobody_dispatched() -> None:
+async def test_drain_delivers_below_anchor_rows_nobody_saw_late_and_covers_them() -> None:
     # A fresh live message (seq 5) anchors the conversation before the drain
-    # delivers the older stored rows 3 and 4. The ordering layer drops them
-    # as duplicates, but no handler ever saw them: the cursor must not move.
+    # delivers the older stored rows 3 and 4. No handler has seen them, so
+    # they are handed over late (out of order, never lost) and, once
+    # handled, the cursor covers them. Dropping them stalled the drain: the
+    # cursor could never pass a row nobody handled.
     page = [
         _sync_row("m_3", delivery_id="del_3", seq=3),
         _sync_row("m_4", delivery_id="del_4", seq=4),
@@ -1293,7 +1298,24 @@ async def test_drain_never_acks_a_below_anchor_row_nobody_dispatched() -> None:
         await ws.push({"type": "message.new", "payload": {"id": "m_5", "conversation_id": "c1", "seq": 5}})
         await _settle()
         await rt.drain_offline_envelopes()
-        assert handled == ["m_5"]
+        assert handled == ["m_5", "m_3", "m_4"]
+        assert mock_api.sync_ack_calls == ["del_4"]
+    finally:
+        await rt.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_drain_covers_nothing_while_no_message_handler_is_attached() -> None:
+    # Nothing would ever see the rows: the server keeps them.
+    page = [_sync_row("m_1", delivery_id="del_1", seq=1)]
+    mock_api = MockAsyncClient(sync_pages=[page])
+    rt, ws = _make_client(client=mock_api, auto_drain_on_connect=False)
+    try:
+        await rt.connect()
+        await _settle()
+        await ws.push({"type": "hello.ok", "capabilities": ["ack"]})
+        await _settle()
+        await rt.drain_offline_envelopes()
         assert mock_api.sync_ack_calls == []
     finally:
         await rt.disconnect()
@@ -1305,10 +1327,10 @@ async def test_drain_cursor_covers_only_handled_rows_when_the_socket_drops_mid_h
     ack_on_receipt: bool,
 ) -> None:
     # Page [g1, g3, h1]: g3 parks on the gap (the agent's own message is g's
-    # seq 2) and h1's handler, a LATER row, is slow. This drain routes rows
-    # one at a time, so the socket drop during h1 clears the parked g3 before
-    # the cursor is computed: g3 is then neither parked nor dispatched, and
-    # the cursor must stop before it unless a handler finished it.
+    # seq 2) and h1's handler, a LATER row, is slow. The socket drops while
+    # h1's handler runs and clears (default mode) or flushes (ack_on_receipt)
+    # the parked g3: the cursor must never cover g3 unless a handler
+    # finished it before the cursor reached it.
     page = [
         _sync_row("g_1", conversation_id="g", delivery_id="del_g1", seq=1),
         _sync_row("g_3", conversation_id="g", delivery_id="del_g3", seq=3),
@@ -1338,14 +1360,18 @@ async def test_drain_cursor_covers_only_handled_rows_when_the_socket_drops_mid_h
         await _settle()
         release.set()
         await asyncio.wait_for(drain, timeout=1.0)
+        await _settle()  # handlers run as their own tasks
 
+        # The drain routes the page without waiting for handlers, so the
+        # cursor is computed while g3 is still parked: it stops before g3 in
+        # both modes, and the next drain re-offers g3 and h1 (dedup hits by
+        # then, where handled).
+        assert mock_api.sync_ack_calls == ["del_g1"]
         if ack_on_receipt:
-            # The close handed the parked g3 to the handler first.
+            # The close handed the parked g3 to the handler.
             assert sorted(finished) == ["g_1", "g_3", "h_1"]
-            assert mock_api.sync_ack_calls == ["del_h1"]
         else:
             assert finished == ["g_1", "h_1"]
-            assert mock_api.sync_ack_calls == ["del_g1"]
     finally:
         await rt.disconnect()
 

@@ -50,6 +50,13 @@ async def connected(
     return rt, ws
 
 
+def _connector(sock: MockWebSocket) -> Any:
+    async def connect(_url: str, **_kw: Any) -> MockWebSocket:
+        return sock
+
+    return connect
+
+
 def other_tasks() -> set[asyncio.Task[Any]]:
     current = asyncio.current_task()
     return {t for t in asyncio.all_tasks() if t is not current}
@@ -323,9 +330,10 @@ async def test_default_mode_acks_a_below_anchor_repeat_it_already_handled() -> N
 
 
 @pytest.mark.asyncio
-async def test_default_mode_never_acks_a_below_anchor_frame_nobody_handled() -> None:
+async def test_default_mode_delivers_a_below_anchor_frame_nobody_handled_late() -> None:
     # Live seq 5 anchors before the server's reconnect backlog brings the
-    # stored seq 3. Unseen and unacked, it stays `stored` for the next drain.
+    # stored seq 3. Nobody has seen it: handed over late (out of order, never
+    # stalled) and acked once handled.
     rt, ws = await connected(capabilities=["ack"])
     handled: list[str] = []
     rt.on("message.new", lambda m: handled.append(m["payload"]["id"]))
@@ -335,8 +343,8 @@ async def test_default_mode_never_acks_a_below_anchor_frame_nobody_handled() -> 
         await _settle()
         await ws.push(message_new("c", 3))
         await _settle()
-        assert handled == ["msg_5"]
-        assert _ack_frames(ws) == ["msg_5"]
+        assert handled == ["msg_5", "msg_3"]
+        assert _ack_frames(ws) == ["msg_5", "msg_3"]
     finally:
         await rt.disconnect()
 
@@ -458,6 +466,7 @@ async def test_a_drain_repeat_of_a_running_message_is_not_dispatched_and_never_w
         await ws.push(message_new("c", 2))  # in order; its handler is slow
         await _settle()
         await asyncio.wait_for(rt.drain_offline_envelopes(), timeout=1.0)
+        await _settle()  # the other row's handler runs as its own task
         assert calls == ["msg_1", "msg_2", "msg_d1"]
         assert api.sync_ack_calls == []
 
@@ -502,32 +511,40 @@ async def test_a_live_repeat_of_a_first_copy_that_failed_is_never_acked() -> Non
 
 
 @pytest.mark.asyncio
-async def test_a_copy_on_a_later_connection_is_dispatched_afresh_while_the_first_runs() -> None:
-    # Adoption is per connection: a handler that never finishes must not
-    # swallow every re-offer of its message.
-    rt, _ws = await connected(capabilities=["ack"])
-    entered = asyncio.Event()
+async def test_a_copy_on_a_later_connection_adopts_the_first_copy_still_running() -> None:
+    # In-flight dedupe holds across reconnects: the server re-offers an
+    # unacked frame on the next connection while its first handler may still
+    # run. The re-offer is not dispatched again; it takes the first copy's
+    # outcome without waiting, and is acked once that copy finished cleanly.
+    rt, ws = await connected(capabilities=["ack"])
+    release = asyncio.Event()
     calls: list[str] = []
 
-    async def first_hangs(m: dict[str, Any]) -> None:
+    async def slow(m: dict[str, Any]) -> None:
         calls.append(m["payload"]["id"])
-        if len(calls) == 1:
-            entered.set()
-            await asyncio.Event().wait()
+        await release.wait()
 
-    rt.on("message.new", first_hangs)
-    first = asyncio.create_task(rt._deliver_message_new(message_new("c", 1), ws_ack=False))
+    rt.on("message.new", slow)
     try:
-        await entered.wait()
-        repeat = rt._deliver_message_new(message_new("c", 1), ws_ack=False)
-        assert await asyncio.wait_for(repeat, timeout=1.0) is False
-        assert calls == ["msg_1"]  # same connection: adopted, not waited for
-        rt._generation += 1  # what a socket close does
-        later = rt._deliver_message_new(message_new("c", 1), ws_ack=False)
-        assert await asyncio.wait_for(later, timeout=1.0) is True
-        assert calls == ["msg_1", "msg_1"]
+        await ws.push(message_new("c", 1))
+        await _settle()
+        assert calls == ["msg_1"]
+        await ws.close(code=1006, reason="dropped")  # the first handler still runs
+        await _settle()
+        ws2 = MockWebSocket()
+        rt._websocket_connect = _connector(ws2)
+        await rt.connect()
+        await ws2.push({"type": "hello.ok", "capabilities": ["ack"]})
+        await ws2.push(message_new("c", 1))  # the server's re-offer
+        await _settle()
+        assert calls == ["msg_1"]
+        assert _ack_frames(ws2) == []
+        release.set()
+        await _settle()
+        assert calls == ["msg_1"]
+        assert _ack_frames(ws2) == ["msg_1"]
     finally:
-        first.cancel()
+        release.set()
         await rt.disconnect()
 
 
@@ -619,10 +636,10 @@ async def test_a_cancelled_first_copy_counts_as_not_handled() -> None:
     rt.on("message.new", hangs)
     try:
         frame = message_new("c", 1)
-        first = asyncio.create_task(rt._deliver_message_new(frame, ws_ack=True))
+        settlement = await rt._deliver_message_new(frame, ws_ack=True)
         await entered.wait()
-        assert rt._adopt_in_flight(dict(frame), ws_ack=True) is True
-        first.cancel()
+        assert rt._adopt_in_flight(dict(frame), ws_ack=True) is not None
+        settlement.cancel()
         await _settle()
         assert _ack_frames(ws) == []
         assert rt._inflight == {}
@@ -849,6 +866,9 @@ async def test_a_handler_that_disconnects_while_a_repeat_of_its_message_arrives_
     go.set()
     await asyncio.wait_for(returned.wait(), timeout=2.0)
     assert rt.state == "stopped"
+    # The handler's own dispatch settles once it returns (it ran off the
+    # receive loop; disconnect() skipped the task calling it).
+    await _settle()
     assert rt._inflight == {}
 
 
