@@ -113,9 +113,13 @@ changes under **Types**.
   fails closed for those cards, nothing recorded) and a cycle watchdog,
   `cycle_timeout_ms` (10 min, not counting time spent starting turns or
   runs; past it the cycle is abandoned, logged and summarised as
-  `abandoned`, and wakes are taken again). `status().recent_cycles` keeps
-  the last 20 cycle summaries. `gate.run_async(..., timeout_ms=)` bounds the
-  model call.
+  `abandoned`, and wakes are taken again; an abandoned cycle starts no turn
+  and records nothing more). A `call_model` that takes a `cancel` keyword
+  gets a cancel handle set when its answer is no longer wanted (an
+  `asyncio.Event` for a coroutine function, a `threading.Event` for a plain
+  one, which the cycle simply stops waiting for). `status().recent_cycles`
+  keeps the last 20 cycle summaries, newest last. `gate.run_async(...,
+  timeout_ms=)` bounds the model call.
 - `inbox.tray(include_invites=True)` sends `invites=1`: a pending invite then
   also ends a held read (default off, as before).
 - `register`, `verify`, `recover` and `recover_verify` take `timeout_ms` and

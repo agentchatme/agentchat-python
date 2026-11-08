@@ -66,8 +66,10 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import functools
 import inspect
 import logging
+import threading
 import time
 from collections import OrderedDict, deque
 from collections.abc import Awaitable, Iterator, Mapping
@@ -367,7 +369,7 @@ class ReceiveLoop:
         texts: Any,
         mode: ReceiveLoopMode,
         *,
-        call_model: Callable[[str], Any] | None = None,
+        call_model: Callable[..., Any] | None = None,
         start_turn: TurnStarter | None = None,
         start_invite_turn: TurnStarter | None = None,
         start_run: RunStarter | None = None,
@@ -441,6 +443,11 @@ class ReceiveLoop:
         self._held_while_running = False
         self._last_cycle: CycleSummary | None = None
         self._recent: deque[CycleSummary] = deque(maxlen=RECENT_CYCLES)
+        # The running cycle's identity: an abandoned cycle goes stale and
+        # acts no more; its cancel handles tell a pending model call.
+        self._cycle_token = 0
+        self._cycle_cancel = asyncio.Event()
+        self._cycle_cancel_thread = threading.Event()
         self._gate_call_timeout_ms = gate_call_timeout_ms
         self._cycle_timeout_s = max(0.0, cycle_timeout_ms / 1000.0)
         # Time spent starting turns / runs (excluded from the cycle watchdog).
@@ -672,8 +679,12 @@ class ReceiveLoop:
     async def _cycle(self) -> None:
         if self._stopped:
             return
+        self._cycle_token += 1
+        token = self._cycle_token
+        self._cycle_cancel = asyncio.Event()
+        self._cycle_cancel_thread = threading.Event()
         body: asyncio.Future[CycleSummary] = asyncio.ensure_future(
-            self._gate_call_cycle() if self._mode == "gate_call" else self._single_run_cycle()
+            self._gate_call_cycle(token) if self._mode == "gate_call" else self._single_run_cycle(token)
         )
         summary = await self._watch(body)
         self._last_cycle = summary
@@ -705,6 +716,11 @@ class ReceiveLoop:
         except asyncio.CancelledError:
             body.cancel()
             raise
+        # Abandoned: the cycle goes stale (every step checks it), its pending
+        # model call is told, and the coalescer takes wakes again.
+        self._cycle_token += 1
+        self._cycle_cancel.set()
+        self._cycle_cancel_thread.set()
         body.cancel()
         with contextlib.suppress(BaseException):
             await body
@@ -715,6 +731,9 @@ class ReceiveLoop:
         )
         _log.error("receive loop: %s", failure)
         return self._summary("abandoned", failure=failure)
+
+    def _stale(self, token: int) -> bool:
+        return token != self._cycle_token or self._stopped
 
     def _turn_seconds(self) -> float:
         extra = time.monotonic() - self._turn_since if self._turn_depth > 0 else 0.0
@@ -772,8 +791,10 @@ class ReceiveLoop:
         )
         return str(reason or "not ready")
 
-    async def _gate_call_cycle(self) -> CycleSummary:
+    async def _gate_call_cycle(self, token: int) -> CycleSummary:
         tray = await self._read_tray()
+        if self._stale(token):
+            return self._summary("abandoned")
         if tray is None:
             return self._summary("tray_failed", failure=self._last_error)
         cards = _gate.cards_of(tray)
@@ -804,9 +825,13 @@ class ReceiveLoop:
             return self._summary("nothing_owed", **base)
 
         texts = await self._texts.ensure()
+        if self._stale(token):
+            return self._summary("abandoned", **base)
         if texts is None:
             return self._summary("texts_missing", failure="the served texts are not available", **base)
         unready = await self._check_ready()
+        if self._stale(token):
+            return self._summary("abandoned", **base)
         if unready is not None:
             return self._summary("tools_unavailable", failure=unready, **base)
 
@@ -832,8 +857,9 @@ class ReceiveLoop:
                 self._client,
                 tool_namer=self._tool_namer,
                 texts=texts,
-                timeout_ms=self._gate_call_timeout_ms if self._gate_call_timeout_ms > 0 else None,
             )
+            if self._stale(token):
+                return self._summary("abandoned", **base)
             for verdict in result.verdicts:
                 tally[verdict.decision] += 1
             tally["undecided"] = len(result.undecided)
@@ -845,13 +871,15 @@ class ReceiveLoop:
             else:
                 outcome = "decided"
                 for reply in result.reply:
-                    if self._stopped:
+                    if self._stale(token):
                         break
                     tally[f"turns_{await self._start_reply_turn(reply, texts)}"] += 1
         for invite in owed_invites:
-            if self._stopped:
+            if self._stale(token):
                 break
             tally[f"turns_{await self._start_invite_turn_for(invite, texts)}"] += 1
+        if self._stale(token):
+            return self._summary("abandoned", **base)
         # More conversations wait than one tray shows: read again for the
         # rest — at once after a cycle that made progress, else after a
         # backoff, so a cycle that cannot progress never spins.
@@ -859,8 +887,10 @@ class ReceiveLoop:
             self._read_the_rest(recorded > 0 or tally["turns_started"] > 0)
         return self._summary(outcome, gated=gated, failure=failure, **base, **tally)
 
-    async def _single_run_cycle(self) -> CycleSummary:
+    async def _single_run_cycle(self, token: int) -> CycleSummary:
         tray = await self._read_tray()
+        if self._stale(token):
+            return self._summary("abandoned")
         cards: int | None = None
         invites: int | None = None
         base: dict[str, Any] = {"cards": 0, "invites": 0, "held_by_turns": 0, "truncated": False}
@@ -881,9 +911,13 @@ class ReceiveLoop:
         # A tray that could not be read is not an empty tray, and the wake was
         # real: the run starts anyway.
         texts = await self._texts.ensure()
+        if self._stale(token):
+            return self._summary("abandoned", **base)
         if texts is None:
             return self._summary("texts_missing", failure="the served texts are not available", **base)
         unready = await self._check_ready()
+        if self._stale(token):
+            return self._summary("abandoned", **base)
         if unready is not None:
             return self._summary("tools_unavailable", failure=unready, **base)
 
@@ -1205,15 +1239,39 @@ class ReceiveLoop:
     # ─── small things ────────────────────────────────────────────────────
 
     def _model_call(self) -> Callable[[str], Any]:
-        call = self._call_model
-        assert call is not None
-        if _is_async(call):
-            return call
+        """The runtime's model call, bounded by ``gate_call_timeout_ms`` (and
+        by the cycle's own abandonment). A ``call_model`` that takes a
+        ``cancel`` keyword is handed a cancel handle that is set when the
+        answer is no longer wanted: an :class:`asyncio.Event` for a coroutine
+        function, a :class:`threading.Event` for a plain function (which runs
+        in a worker thread; the cycle simply stops waiting for it)."""
+        assert self._call_model is not None
+        call: Callable[..., Any] = self._call_model
+        is_async = _is_async(call)
+        takes_cancel = _accepts_keyword(call, "cancel")
+        timeout_s = self._gate_call_timeout_ms / 1000.0 if self._gate_call_timeout_ms > 0 else None
+        cancel_async = self._cycle_cancel
+        cancel_thread = self._cycle_cancel_thread
 
-        async def in_thread(prompt: str) -> Any:
-            return await asyncio.to_thread(call, prompt)
+        async def bounded(prompt: str) -> Any:
+            if is_async:
+                pending: Any = call(prompt, cancel=cancel_async) if takes_cancel else call(prompt)
+            elif takes_cancel:
+                pending = asyncio.to_thread(functools.partial(call, prompt, cancel=cancel_thread))
+            else:
+                pending = asyncio.to_thread(call, prompt)
+            try:
+                if timeout_s is None:
+                    return await pending
+                return await asyncio.wait_for(pending, timeout_s)
+            except asyncio.TimeoutError:
+                cancel_async.set()
+                cancel_thread.set()
+                raise asyncio.TimeoutError(
+                    f"no answer within {self._gate_call_timeout_ms:g} ms"
+                ) from None
 
-        return in_thread
+        return bounded
 
     async def _call(self, fn: Callable[..., Any], *args: Any) -> Any:
         if _is_async(fn):
@@ -1266,6 +1324,19 @@ class ReceiveLoop:
             self._on_event(event)
         except Exception:
             _log.debug("receive loop: on_event raised", exc_info=True)
+
+
+def _accepts_keyword(fn: Any, name: str) -> bool:
+    """Whether ``fn`` takes the keyword ``name`` (or ``**kwargs``)."""
+    try:
+        params = inspect.signature(fn).parameters.values()
+    except (TypeError, ValueError):
+        return False
+    return any(
+        p.kind is inspect.Parameter.VAR_KEYWORD
+        or (p.name == name and p.kind is not inspect.Parameter.POSITIONAL_ONLY)
+        for p in params
+    )
 
 
 def _is_async(fn: Any) -> bool:

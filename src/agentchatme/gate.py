@@ -670,12 +670,11 @@ async def run_async(
             )
         else:
             text = result
-    except asyncio.TimeoutError:
-        return _closed(
-            "fail_closed", prepared.ids, f"model call timed out after {timeout_ms / 1000.0:g}s"
-            if timeout_ms is not None
-            else "model call timed out",
+    except asyncio.TimeoutError as err:
+        detail = str(err) or (
+            f"no answer within {timeout_ms:g} ms" if timeout_ms is not None else "no answer"
         )
+        return _closed("fail_closed", prepared.ids, f"model call timed out: {detail}")
     except Exception as err:
         return _closed("fail_closed", prepared.ids, f"model call failed: {err}")
 

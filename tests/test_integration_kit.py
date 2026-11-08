@@ -872,6 +872,79 @@ async def test_a_cycle_that_never_finishes_is_abandoned_and_wakes_are_taken_agai
 
 
 @pytest.mark.asyncio
+async def test_the_model_call_is_told_when_its_answer_is_no_longer_wanted() -> None:
+    client = _LoopClient([_tray([_card("c1", "m1")])])
+    seen: list[asyncio.Event] = []
+
+    async def call_model(_prompt: str, *, cancel: asyncio.Event) -> str:
+        seen.append(cancel)
+        await cancel.wait()  # a well-behaved runtime stops when told
+        return ""
+
+    loop = _loop(client, call_model=call_model, start_turn=_Turns(), gate_call_timeout_ms=30)
+    await loop.start()
+    await _cycle(loop)
+    await asyncio.sleep(0.05)
+    assert len(seen) == 1 and seen[0].is_set()
+    assert loop.status().last_cycle.outcome == "fail_closed"  # type: ignore[union-attr]
+    await loop.stop()
+
+
+@pytest.mark.asyncio
+async def test_a_sync_model_call_past_its_deadline_is_simply_no_longer_waited_for() -> None:
+    import threading
+
+    client = _LoopClient([_tray([_card("c1", "m1")])])
+    released = threading.Event()
+    handles: list[threading.Event] = []
+
+    def call_model(_prompt: str, cancel: threading.Event) -> str:
+        handles.append(cancel)
+        released.wait(2.0)
+        return _answer(("c1", "dismiss"))
+
+    loop = _loop(client, call_model=call_model, start_turn=_Turns(), gate_call_timeout_ms=30)
+    await loop.start()
+    await _cycle(loop)
+    await asyncio.sleep(0.05)
+    await loop.idle()
+    assert loop.status().last_cycle.outcome == "fail_closed"  # type: ignore[union-attr]
+    assert handles and handles[0].is_set()
+    released.set()
+    await asyncio.sleep(0.02)
+    assert client.decisions.recorded == []  # the late answer is not acted on
+    await loop.stop()
+
+
+@pytest.mark.asyncio
+async def test_an_abandoned_cycle_starts_no_turn_and_records_nothing_more() -> None:
+    client = _LoopClient([_tray([_card("c1", "m1")])])
+    turns = _Turns()
+    release = asyncio.Event()
+
+    async def call_model(_prompt: str) -> str:
+        await release.wait()
+        return _answer(("c1", "reply"))
+
+    loop = _loop(
+        client,
+        call_model=call_model,
+        start_turn=turns,
+        cycle_timeout_ms=40,
+        gate_call_timeout_ms=10_000,
+    )
+    await loop.start()
+    loop.wake()
+    await asyncio.sleep(0.15)
+    await loop.idle()
+    assert loop.status().last_cycle.outcome == "abandoned"  # type: ignore[union-attr]
+    release.set()
+    await asyncio.sleep(0.02)
+    assert turns.requests == [] and client.decisions.recorded == []
+    await loop.stop()
+
+
+@pytest.mark.asyncio
 async def test_time_spent_starting_a_turn_does_not_count_against_the_cycle() -> None:
     client = _LoopClient([_tray([_card("c1", "m1")])])
 
