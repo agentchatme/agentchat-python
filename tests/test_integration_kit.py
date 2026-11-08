@@ -579,6 +579,16 @@ class _Turns:
         return TurnAdmission(started=True, done=done)
 
 
+async def _eventually(predicate: Any, *, timeout: float = 5.0) -> None:
+    """Wait until ``predicate()`` holds (condition-driven: no fixed sleep
+    that a coarse timer could cut short)."""
+    deadline = asyncio.get_running_loop().time() + timeout
+    while not predicate():
+        if asyncio.get_running_loop().time() > deadline:
+            raise AssertionError("condition not met in time")
+        await asyncio.sleep(0.005)
+
+
 async def _cycle(loop: ReceiveLoop) -> None:
     loop.wake()
     for _ in range(3):
@@ -683,7 +693,8 @@ async def test_looked_and_did_nothing_is_dismissed_the_second_time_for_the_same_
     for index in range(2):
         await _cycle(loop)
         turns.ends[index].set_result(TurnEnd(status="completed", agentchat_calls=AgentChatCallCount(made=3, failed=0)))
-        await asyncio.sleep(0.02)
+        await _eventually(lambda i=index: sum(loop.status().counters["outcomes"].values()) == i + 1)
+    await _eventually(lambda: len(client.decisions.recorded) == 1)
     assert client.decisions.recorded == [
         {"conversation_id": "c1", "decision": "dismiss", "category": "no_action_needed", "through_message_id": "m1"}
     ]
@@ -739,8 +750,9 @@ async def test_with_the_calls_unknown_the_second_silent_look_records_defer_not_d
     for index in range(2):
         await _cycle(loop)
         turns.ends[index].set_result(TurnEnd(status="completed", agentchat_calls=None))
-        await asyncio.sleep(0.02)
+        await _eventually(lambda i=index: sum(loop.status().counters["outcomes"].values()) == i + 1)
     # Unread, back on the server's reminder ladder: no category, the gate's anchor.
+    await _eventually(lambda: len(client.decisions.recorded) == 1)
     assert client.decisions.recorded == [{"conversation_id": "c1", "decision": "defer", "through_message_id": "m1"}]
     assert loop.status().counters["outcomes"] == {"silent_first": 1, "silent_again": 1}
     await loop.stop()
@@ -755,7 +767,7 @@ async def test_a_turn_that_sent_and_then_failed_records_reply_and_is_not_gated_a
     await loop.start()
     await _cycle(loop)
     turns.ends[0].set_result(TurnEnd(status="failed", detail="the runtime hit its time limit after the send"))
-    await asyncio.sleep(0.05)
+    await _eventually(lambda: len(client.decisions.recorded) == 1)
     assert client.decisions.recorded == [
         {"conversation_id": "c1", "decision": "reply", "through_message_id": "m1"}
     ]
@@ -795,10 +807,15 @@ async def test_an_abandoned_cycle_records_nothing_more_and_each_conversation_onc
     loop = _loop(client, call_model=call_model, start_turn=_Turns(), cycle_timeout_ms=50)
     await loop.start()
     loop.wake()
-    await asyncio.sleep(0.06)
-    for _ in range(6):
+    await _eventually(lambda: loop.status().last_cycle is not None)
+    deadline = asyncio.get_running_loop().time() + 10.0
+    while len(recorded) < len(cards):
+        assert asyncio.get_running_loop().time() < deadline, "not every conversation was recorded"
         loop.wake()
-        await asyncio.sleep(0.12)
+        await asyncio.sleep(0.02)
+    await loop.idle()
+    loop.wake()  # one more look: nothing is gated again
+    await asyncio.sleep(0.02)
     await loop.idle()
     per: dict[str, int] = {}
     for c in calls:
@@ -822,7 +839,7 @@ async def test_a_release_from_another_thread_starts_the_waiting_turn() -> None:
     worker = threading.Thread(target=lambda: released.append(loop._tracker.release("conversation:c1")))
     worker.start()
     worker.join()
-    await asyncio.sleep(0.05)
+    await _eventually(lambda: len(turns.requests) == 2)
     assert released == [True]
     assert len(turns.requests) == 2 and loop.status().counters["turns_waiting"] == 0
     await loop.stop()
@@ -855,7 +872,7 @@ async def test_release_turn_and_wake_from_another_thread_reach_the_loop() -> Non
     worker = threading.Thread(target=other)
     worker.start()
     worker.join()
-    await asyncio.sleep(0.05)
+    await _eventually(lambda: len(turns.requests) == 2)
     await loop.idle()
     assert errors == [] and results == [True]
     sources = [e["source"] for e in events if e["type"] == "wake"]
@@ -880,27 +897,37 @@ def test_status_shows_whether_the_socket_refuses_new_messages() -> None:
 async def test_stop_mid_gate_records_no_further_verdict_and_tells_the_model_call() -> None:
     cards = [_card(f"c{i}", f"m{i}") for i in range(3)]
     calls: list[str] = []
+    finished: list[str] = []
+    c1_on_its_way = asyncio.Event()
+    release_c1 = asyncio.Event()
 
-    class SlowDecisions:
+    class HeldDecisions:
         async def record(self, conversation_id: str, **_kw: Any) -> Any:
             calls.append(conversation_id)
-            await asyncio.sleep(0.03)
+            if conversation_id == "c1":
+                c1_on_its_way.set()
+                await release_c1.wait()
+            finished.append(conversation_id)
             return {"id": "d"}
 
     client = _LoopClient([_tray(cards)])
-    client.decisions = SlowDecisions()  # type: ignore[assignment]
+    client.decisions = HeldDecisions()  # type: ignore[assignment]
     answer = json.dumps({"decisions": [{"conversation_id": c["conversation_id"], "decision": "defer"} for c in cards]})
     loop = _loop(client, call_model=lambda _p: answer, start_turn=_Turns())
     await loop.start()
     loop.wake()
-    await asyncio.sleep(0.045)  # c0 recorded, c1 on its way
-    await loop.stop()
-    await asyncio.sleep(0.05)
-    assert calls == ["c0", "c1"]  # c1 finished (never aborted), c2 never sent
+    await asyncio.wait_for(c1_on_its_way.wait(), 5.0)  # c0 recorded, c1 on its way
+    stopping = asyncio.ensure_future(loop.stop())
+    await _eventually(lambda: loop.status().stopped)
+    release_c1.set()  # the verdict on its way finishes (never aborted)
+    await asyncio.wait_for(stopping, 5.0)
+    assert calls == ["c0", "c1"] and finished == ["c0", "c1"]  # c2 never sent
 
     told: list[bool] = []
+    model_called = asyncio.Event()
 
     async def waits(_prompt: str, *, cancel: asyncio.Event) -> str:
+        model_called.set()
         await cancel.wait()
         told.append(True)
         return answer
@@ -909,8 +936,8 @@ async def test_stop_mid_gate_records_no_further_verdict_and_tells_the_model_call
     loop2 = _loop(client2, call_model=waits, start_turn=_Turns())
     await loop2.start()
     loop2.wake()
-    await asyncio.sleep(0.02)
-    await loop2.stop()
+    await asyncio.wait_for(model_called.wait(), 5.0)
+    await asyncio.wait_for(loop2.stop(), 5.0)
     assert told == [True] and client2.decisions.recorded == []
 
 
@@ -977,7 +1004,8 @@ async def test_invites_get_one_turn_each_and_are_dismissed_after_two_silent_turn
         assert turns.requests[index].kind == "invite"
         assert turns.requests[index].prompt.endswith("invite_id: ginv_1")
         turns.ends[index].set_result(TurnEnd(status="completed", agentchat_calls=AgentChatCallCount(made=2, failed=0)))
-        await asyncio.sleep(0.02)
+        await _eventually(lambda i=index: sum(loop.status().counters["outcomes"].values()) == i + 1)
+    await _eventually(lambda: len(client.groups.dismissed) == 1)
     assert calls == []  # invites are not gated
     assert client.groups.dismissed == ["ginv_1"]
     await loop.stop()
@@ -1003,7 +1031,7 @@ async def test_two_silent_invite_turns_without_confirmed_calls_dismiss_nothing(c
     for index in range(2):
         await _cycle(loop)
         turns.ends[index].set_result(TurnEnd(status="completed", agentchat_calls=calls))
-        await asyncio.sleep(0.02)
+        await _eventually(lambda i=index: sum(loop.status().counters["outcomes"].values()) == i + 1)
     assert client.groups.dismissed == []
     assert loop.status().counters["outcomes"] == {"invite_silent_first": 1, "invite_silent_unconfirmed": 1}
     await loop.stop()

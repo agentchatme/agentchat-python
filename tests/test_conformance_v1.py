@@ -41,7 +41,8 @@ FIXTURES = Path(__file__).resolve().parent.parent / "conformance" / "v1"
 
 
 def raw(name: str) -> str:
-    return (FIXTURES / name).read_text(encoding="utf-8")
+    # Bytes, decoded: no newline translation, so the text is the file's.
+    return (FIXTURES / name).read_bytes().decode("utf-8")
 
 
 def load(name: str) -> Any:

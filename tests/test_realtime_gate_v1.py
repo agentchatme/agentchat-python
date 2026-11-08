@@ -783,17 +783,20 @@ async def test_an_upgrade_answered_429_is_the_ordinary_backoff_never_blocked() -
 
 @pytest.mark.asyncio
 async def test_a_queued_message_is_adopted_across_a_reconnect_however_long_it_waited() -> None:
-    # The adoption clock starts when the lane starts the handler: msg_2 was
-    # queued 120 ms ago but has run ~40 ms (< in_flight_adopt_ms), so its
-    # re-offer on the next connection is adopted, not dispatched twice.
-    rt, ws = await connected(capabilities=["ack"], in_flight_adopt_ms=100)
+    # The adoption clock starts when the lane starts the handler. msg_2 waits
+    # 0.45 s behind msg_1, then runs 0.3 s before the socket drops: queued
+    # 0.75 s ago (> in_flight_adopt_ms) but running 0.3 s (<), so its re-offer
+    # on the next connection is adopted, not dispatched twice. Margins of
+    # 150 ms and more: a coarse timer cannot flip the outcome.
+    rt, ws = await connected(capabilities=["ack"], in_flight_adopt_ms=600)
     entered: list[str] = []
+    release_1 = asyncio.Event()
 
     async def handler(m: dict[str, Any]) -> None:
         mid = m["payload"]["id"]
         entered.append(mid)
         if mid == "msg_1":
-            await asyncio.sleep(0.08)
+            await release_1.wait()
         else:
             await asyncio.Event().wait()
 
@@ -801,7 +804,11 @@ async def test_a_queued_message_is_adopted_across_a_reconnect_however_long_it_wa
     try:
         await ws.push(message_new("c", 1))
         await ws.push(message_new("c", 2))
-        await asyncio.sleep(0.12)
+        await _flush()
+        await asyncio.sleep(0.45)
+        release_1.set()
+        await _until(lambda: entered == ["msg_1", "msg_2"])  # msg_2 has just started
+        await asyncio.sleep(0.3)
         await ws.close(code=1006)
         await _flush()
         ws2 = MockWebSocket()
@@ -813,7 +820,9 @@ async def test_a_queued_message_is_adopted_across_a_reconnect_however_long_it_wa
         await rt.connect()
         await ws2.push({"type": "hello.ok", "capabilities": ["ack"]})
         await ws2.push(message_new("c", 2))
-        await asyncio.sleep(0.15)  # past the lane bound: a second dispatch would show
+        # Past the first copy's lane bound (0.6 s from its start): a second
+        # dispatch would show by now.
+        await asyncio.sleep(0.5)
         assert entered == ["msg_1", "msg_2"]
     finally:
         await rt.disconnect()
@@ -902,7 +911,7 @@ async def test_gap_fill_rows_are_taken_in_under_backpressure(monkeypatch: pytest
         await ws.push(message_new("b", 2, id="b2"))  # the queue is full
         await _flush()
         assert rt._queue_full()
-        await asyncio.sleep(0.15)
+        await _until(lambda: len(entered) >= 4)
         # The fill fetched a2 while the queue was full: taken in, in order.
         assert entered == ["a1", "b1", "a2", "a3"]
     finally:
