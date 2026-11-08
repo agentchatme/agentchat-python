@@ -474,6 +474,8 @@ When the realtime feed sees a per-conversation seq gap (e.g. `seq=8` arrives, th
 
 Without a `client` option, gap recovery is disabled and `recovered=False` is reported whenever a gap is detected.
 
+Handlers are *started* in seq order per conversation, but two of them in one conversation can run at the same time, as in the TypeScript SDK: while a resolved gap's frames are being handed over, a frame that arrives in order is dispatched by the receive loop at once (seq 4 can start while seq 3's handler still runs), and a repeat of a message whose handler is still running moves the conversation on without waiting for it. A handler that needs one-at-a-time processing per conversation should queue its own work.
+
 ### Offline drain
 
 After every `hello.ok`, the client pages `/v1/messages/sync` (a bare array of rows), dispatches each row through the same `message.new` handlers, then acknowledges with `/v1/messages/sync/ack` using the last non-empty `delivery_id` string cursor of the rows that were actually handed to your handlers. The cursor commits everything at-or-before it, so it only ever covers rows whose fate is known: a row that fails minimal validation stops the drain at the clean prefix; a row whose handler raised freezes the cursor before it; a row parked in the out-of-order buffer (waiting on a seq gap) is not acked until it is dispatched; a row the ordering layer dropped as a duplicate is covered only when this session already dispatched it. Anything left unacked is re-offered on the next drain and absorbed by the dedup cache. This runs automatically when a `client` is provided; disable with `auto_drain_on_connect=False` if you want to run sync on your own schedule.
