@@ -24,7 +24,10 @@ it looked, sent nothing, recorded nothing                   1st time nothing; 2n
 ``turn-outcome.cases.json``); :func:`apply_outcome` makes the one recording
 call. Invites follow the same rule (:func:`invite_outcome` /
 :func:`apply_invite_outcome`): an invite still pending after two turns that
-looked is dismissed — seen, left pending, not shown again.
+looked is dismissed — seen, left pending, not shown again — when the second
+turn's AgentChat calls are known and all succeeded; otherwise nothing is
+recorded (``silent_unconfirmed``). Single-run mode, whose runs report no
+counts, passes ``require_known_calls=False``.
 
 Where the copies this replaces differed: Hermes recorded ``reply`` on any
 completed turn (zero AgentChat calls counted as success) and when the
@@ -209,8 +212,11 @@ InviteOutcomeReason = Literal[
     "invite_answered",
     "could_not_look",
     "silent_first",
+    "silent_unconfirmed",
     "silent_again",
 ]
+"""``silent_unconfirmed``: looked again, but the call count cannot confirm
+the tools worked; nothing recorded."""
 
 
 @dataclass(frozen=True)
@@ -228,13 +234,17 @@ def invite_outcome(
     invite: Mapping[str, Any] | Any,
     fresh_tray: TrayLike | Any | None,
     silent_before: int = 0,
+    require_known_calls: bool = True,
 ) -> InviteOutcome:
     """The D5 rule for a group-invite turn. Pure.
 
     ``invite`` is the tray invite the turn was started for; ``fresh_tray``
     the tray read after it (``None`` when the read failed);
     ``silent_before`` how many earlier turns for this invite looked and left
-    it pending.
+    it pending. ``require_known_calls`` (default ``True``): dismiss only
+    after a turn whose AgentChat calls are known and none failed. Single-run
+    mode passes ``False``: a run reports no counts, and its own invite rule
+    applies (``single_run_invite_cases``).
     """
     invite_id = str(_data(invite).get("invite_id", ""))
 
@@ -257,6 +267,11 @@ def invite_outcome(
         return none("could_not_look")
     if silent_before <= 0:
         return none("silent_first")
+    # As for a card: dismiss on a second look only when the turn's calls are
+    # known and all succeeded. Otherwise the invite stays on the tray; the
+    # server's re-wakes and the loop's pacing bound what that costs.
+    if require_known_calls is not False and not _calls_all_succeeded(turn.agentchat_calls):
+        return none("silent_unconfirmed")
     return InviteOutcome(action="dismiss_invite", reason="silent_again", invite_id=invite_id)
 
 

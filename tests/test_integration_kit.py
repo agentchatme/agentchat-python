@@ -809,10 +809,36 @@ async def test_invites_get_one_turn_each_and_are_dismissed_after_two_silent_turn
         await _cycle(loop)
         assert turns.requests[index].kind == "invite"
         assert turns.requests[index].prompt.endswith("invite_id: ginv_1")
-        turns.ends[index].set_result(TurnEnd(status="completed"))
+        turns.ends[index].set_result(TurnEnd(status="completed", agentchat_calls=AgentChatCallCount(made=2, failed=0)))
         await asyncio.sleep(0.02)
     assert calls == []  # invites are not gated
     assert client.groups.dismissed == ["ginv_1"]
+    await loop.stop()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "calls",
+    [None, AgentChatCallCount(made=2, failed=1)],
+    ids=["calls-unknown", "some-calls-failed"],
+)
+async def test_two_silent_invite_turns_without_confirmed_calls_dismiss_nothing(calls: AgentChatCallCount | None) -> None:
+    invite = {
+        "invite_id": "ginv_1",
+        "group": {"id": "grp_1", "name": "crew", "member_count": 3},
+        "invited_by": "@peer",
+        "at": "2026-11-08T09:00:00.000Z",
+    }
+    client = _LoopClient([_tray([], [invite])])
+    turns = _Turns()
+    loop = _loop(client, call_model=lambda _p: "", start_turn=turns, pace_ms=0)
+    await loop.start()
+    for index in range(2):
+        await _cycle(loop)
+        turns.ends[index].set_result(TurnEnd(status="completed", agentchat_calls=calls))
+        await asyncio.sleep(0.02)
+    assert client.groups.dismissed == []
+    assert loop.status().counters["outcomes"] == {"invite_silent_first": 1, "invite_silent_unconfirmed": 1}
     await loop.stop()
 
 

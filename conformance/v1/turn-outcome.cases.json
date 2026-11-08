@@ -1718,13 +1718,105 @@
         },
         "silent_before": 1,
         "turn": {
-          "agentchat_calls": null,
+          "agentchat_calls": {
+            "failed": 0,
+            "made": 2
+          },
           "status": "completed"
         },
         "turn_started_at": "2026-11-08T09:10:00.000Z"
       },
       "name": "invite-left-pending-again",
-      "why": "The second time for the same invite: dismiss it (seen, left pending, not shown again)."
+      "why": "The second time for the same invite with its AgentChat calls known and none failed: dismiss it (seen, left pending, not shown again)."
+    },
+    {
+      "expect": {
+        "action": "none",
+        "reason": "silent_unconfirmed"
+      },
+      "input": {
+        "fresh_tray": {
+          "conversations": [],
+          "invites": [
+            {
+              "at": "2026-11-08T08:50:00.000Z",
+              "group": {
+                "id": "grp_0launch0crew0002",
+                "member_count": 5,
+                "name": "launch-crew-2"
+              },
+              "invite_id": "gri_0launch0crew0002",
+              "invited_by": "@example-quill"
+            }
+          ],
+          "invites_truncated": false,
+          "truncated": false
+        },
+        "invite": {
+          "at": "2026-11-08T08:50:00.000Z",
+          "group": {
+            "id": "grp_0launch0crew0002",
+            "member_count": 5,
+            "name": "launch-crew-2"
+          },
+          "invite_id": "gri_0launch0crew0002",
+          "invited_by": "@example-quill"
+        },
+        "silent_before": 1,
+        "turn": {
+          "agentchat_calls": null,
+          "status": "completed"
+        },
+        "turn_started_at": "2026-11-08T09:10:00.000Z"
+      },
+      "name": "invite-left-pending-again-calls-unknown",
+      "why": "The second time, but the call count is unknown (the tools may have been unusable): nothing; the invite stays on the tray, and the server's re-wakes and the pacing bound the cost."
+    },
+    {
+      "expect": {
+        "action": "none",
+        "reason": "silent_unconfirmed"
+      },
+      "input": {
+        "fresh_tray": {
+          "conversations": [],
+          "invites": [
+            {
+              "at": "2026-11-08T08:50:00.000Z",
+              "group": {
+                "id": "grp_0launch0crew0002",
+                "member_count": 5,
+                "name": "launch-crew-2"
+              },
+              "invite_id": "gri_0launch0crew0002",
+              "invited_by": "@example-quill"
+            }
+          ],
+          "invites_truncated": false,
+          "truncated": false
+        },
+        "invite": {
+          "at": "2026-11-08T08:50:00.000Z",
+          "group": {
+            "id": "grp_0launch0crew0002",
+            "member_count": 5,
+            "name": "launch-crew-2"
+          },
+          "invite_id": "gri_0launch0crew0002",
+          "invited_by": "@example-quill"
+        },
+        "silent_before": 2,
+        "turn": {
+          "agentchat_calls": {
+            "failed": 1,
+            "made": 2
+          },
+          "status": "completed"
+        },
+        "turn_started_at": "2026-11-08T09:10:00.000Z"
+      },
+      "name": "invite-left-pending-again-some-calls-failed",
+      "why": "The second time, with a failed AgentChat call: nothing."
     }
   ],
   "rules": [
@@ -1735,7 +1827,7 @@
     "your_last_decision on the fresh card differs from the gate card's (the same server field; no clock is compared) → none (turn_recorded_verdict).",
     "the answer went out — your_last_message_at is later than on the gate card (or newly set), or you_owe_reply went from true to false → record_reply through the gate card's anchor (preview.message_id, else last_message_id, else null) with the gate's category.",
     "agentchat_calls is known and made is 0 or every call failed → none (could_not_look).",
-    "otherwise the turn looked and did nothing: silent_before 0 → none (silent_first); else, when agentchat_calls is known and none failed, record_dismiss with category no_action_needed through the gate card's anchor (silent_again); when the count is unknown or some calls failed, record_defer (no category) through that anchor (silent_again): the card stays unread and returns on the reminder ladder. Invites: dismiss_invite."
+    "otherwise the turn looked and did nothing: silent_before 0 → none (silent_first); else, when agentchat_calls is known and none failed, record_dismiss with category no_action_needed through the gate card's anchor (silent_again); when the count is unknown or some calls failed, record_defer (no category) through that anchor (silent_again): the card stays unread and returns on the reminder ladder. Invites: dismiss_invite (silent_again) only when agentchat_calls is known and none failed; otherwise none (silent_unconfirmed)."
   ],
   "single_run_invite_cases": [
     {
@@ -2051,5 +2143,5 @@
       "why": "Gone from a list that was cut short: unknown, not counted."
     }
   ],
-  "single_run_invite_cases_about": "Single-run mode (a run reads the tray and records its own verdicts): the loop records nothing for cards, but invites sit on the tray until answered, so a run that ignores one would cost a new run on every wake. After every run, for every invite that was on the tray the run started from, the loop applies inviteOutcome with that run (completed → status completed with agentchat_calls null; failed or not_started → status failed, no tray read) and fresh_tray = the tray read after a completed run (null when that read failed); silent_before is how many earlier runs of this process left it pending (counted on silent_first, kept in memory only). expect lists the outcome after each run."
+  "single_run_invite_cases_about": "Single-run mode (a run reads the tray and records its own verdicts): the loop records nothing for cards, but invites sit on the tray until answered, so a run that ignores one would cost a new run on every wake. After every run, for every invite that was on the tray the run started from, the loop applies inviteOutcome with that run (completed → status completed with agentchat_calls null; failed or not_started → status failed, no tray read) under the single-run rule: a run reports no call counts, so the known-calls condition for dismiss_invite does not apply here (requireKnownCalls false) and fresh_tray = the tray read after a completed run (null when that read failed); silent_before is how many earlier runs of this process left it pending (counted on silent_first, kept in memory only). expect lists the outcome after each run."
 }

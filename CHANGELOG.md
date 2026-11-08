@@ -116,7 +116,11 @@ changes under **Types**.
   and answered twice); one that recorded its own verdict records nothing.
   The second silent look records `dismiss` only when the turn's AgentChat
   calls are known and all succeeded; otherwise `defer` (`record_defer`): the
-  card stays unread and returns on the server's reminder ladder.
+  card stays unread and returns on the server's reminder ladder. An invite
+  turn likewise dismisses its invite on the second silent look only with
+  known, fully successful calls (otherwise `silent_unconfirmed`, nothing
+  recorded; `invite_outcome(require_known_calls=)`, default `True`); the
+  single-run invite rule is unchanged.
 - `ReceiveLoop` deadlines: `gate_call_timeout_ms` (60 s; past it the cycle
   fails closed for those cards, nothing recorded) and a cycle watchdog,
   `cycle_timeout_ms` (10 min, not counting time spent starting turns or

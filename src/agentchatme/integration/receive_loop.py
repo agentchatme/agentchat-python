@@ -1146,7 +1146,8 @@ class ReceiveLoop:
             else TurnEnd(status="failed", detail=end.detail)
         )
         for invite in invites:
-            await self._finish_invite(invite, turn, fresh)
+            # A run reports no call counts: the single-run invite rule applies.
+            await self._finish_invite(invite, turn, fresh, require_known_calls=False)
 
     async def _record_invite_outcome(
         self, invite: dict[str, Any], end: TurnEnd, handle: TurnHandle
@@ -1157,13 +1158,24 @@ class ReceiveLoop:
         await self._finish_invite(invite, end, fresh)
 
     async def _finish_invite(
-        self, invite: dict[str, Any], end: TurnEnd, fresh: dict[str, Any] | None
+        self,
+        invite: dict[str, Any],
+        end: TurnEnd,
+        fresh: dict[str, Any] | None,
+        *,
+        require_known_calls: bool = True,
     ) -> None:
         """The D5 rule for one invite after a turn or a run, and the one call
         it asks for."""
         key = f"invite|{invite['invite_id']}"
         silent_before = self._silent.get(key, 0)
-        outcome = invite_outcome(turn=end, invite=invite, fresh_tray=fresh, silent_before=silent_before)
+        outcome = invite_outcome(
+            turn=end,
+            invite=invite,
+            fresh_tray=fresh,
+            silent_before=silent_before,
+            require_known_calls=require_known_calls,
+        )
         self._count(f"invite_{outcome.reason}")
         if outcome.reason == "silent_first":
             self._remember(key, silent_before + 1)

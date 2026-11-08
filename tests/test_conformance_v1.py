@@ -256,7 +256,8 @@ def test_single_run_invite_case(case: dict[str, Any]) -> None:
     # The loop's rule after each run (see single_run_invite_cases_about):
     # completed → a completed turn with unknown calls and the fresh tray;
     # failed / not_started → a failed turn, no tray read; silent_before
-    # counts the earlier silent_first outcomes.
+    # counts the earlier silent_first outcomes; a run reports no counts, so
+    # require_known_calls is off.
     silent = 0
     got: list[dict[str, Any]] = []
     for run in case["runs"]:
@@ -266,6 +267,7 @@ def test_single_run_invite_case(case: dict[str, Any]) -> None:
             invite=case["invite"],
             fresh_tray=run["fresh_tray"] if completed else None,
             silent_before=silent,
+            require_known_calls=False,
         )
         if outcome.reason == "silent_first":
             silent += 1
