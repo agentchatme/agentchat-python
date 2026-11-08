@@ -62,7 +62,7 @@ import logging
 import random
 import time
 import warnings
-from collections import OrderedDict
+from collections import OrderedDict, deque
 from collections.abc import Awaitable, Coroutine
 from dataclasses import dataclass, field, replace
 from typing import (
@@ -569,6 +569,32 @@ class _InFlight:
 
 
 @dataclass
+class _Job:
+    """One frame waiting in (or running on) a dispatch lane."""
+
+    message: dict[str, Any]
+    handlers: list[Any]
+    # message.new only: what its settlement records.
+    message_new: bool = False
+    message_id: str | None = None
+    own: _InFlight | None = None
+    ws_ack: bool = False
+    settlement: asyncio.Future[bool] | None = None
+    # Where the handlers stand: the next one to call, and what an async one
+    # called inline returned (the lane's worker awaits it, so a handler runs
+    # inside its lane's task).
+    next_index: int = 0
+    awaiting: Any = None
+    ok: bool = True
+
+
+@dataclass
+class _Lane:
+    jobs: deque[_Job] = field(default_factory=deque)
+    worker: asyncio.Task[None] | None = None
+
+
+@dataclass
 class _OrderState:
     next_expected_seq: int | None = None
     buffer: dict[int, _PendingEnvelope] = field(default_factory=dict)
@@ -745,16 +771,18 @@ class RealtimeClient:
         # long as its handlers run, so the map is bounded by the dispatches
         # in flight. Off with the dedup cache (``dedup_cache_size=0``).
         self._inflight: dict[str, _InFlight] = {}
-        # Async handler tasks, running off the receive loop; disconnect()
-        # gives them a short grace, then cancels them.
+        # Async on_connect handler tasks; disconnect() gives them a short
+        # grace, then cancels them.
         self._dispatch_tasks: set[asyncio.Future[Any]] = set()
+        # Dispatch lanes: one serial lane per conversation (message.new and
+        # every frame of that conversation) and one for frames of no
+        # conversation (wake, presence, invites, ...). At most one handler
+        # runs per lane; lanes run concurrently; none blocks the receive
+        # loop. A lane's worker exists only while it has work.
+        self._lanes: dict[str, _Lane] = {}
         # Bumped on every socket close: a repeat adopts a running first copy
         # from an earlier connection only within in_flight_adopt_ms.
         self._generation = 0
-        # The tasks that wait for a message.new's async handlers and then
-        # settle it (dedup, in-flight map, ack), with the handler tasks each
-        # waits on. They end on their own once those handlers have ended.
-        self._settle_tasks: dict[asyncio.Future[bool], list[asyncio.Future[Any]]] = {}
         # One REST drain at a time: the server-side ack pointer only moves
         # forward, so a second concurrent drain adds nothing but races.
         self._drain_in_flight = False
@@ -1829,22 +1857,21 @@ class RealtimeClient:
     # ─── Dispatch ────────────────────────────────────────────────────
 
     async def _release_dispatches(self, current: asyncio.Future[Any] | None) -> None:
-        """disconnect(): let running handlers finish within the grace, cancel
-        the rest, then wait for their settlements (which then record the
-        cancelled ones as not handled, so nothing is acked for them)."""
-        handlers = [t for t in self._dispatch_tasks if t is not current and not t.done()]
-        if handlers:
-            with contextlib.suppress(Exception):
-                await asyncio.wait(handlers, timeout=_DISPOSE_GRACE_S)
-        await _release_tasks(handlers, current)
-        settlements = [
-            task
-            for task, waits_on in list(self._settle_tasks.items())
-            if not task.done() and current not in waits_on
+        """disconnect(): let running lanes (and on_connect handlers) finish
+        within the grace, then cancel the rest; a cancelled lane records its
+        frames as not handled, so nothing is acked for them. The lane whose
+        handler is calling disconnect() is skipped."""
+        workers = [
+            lane.worker
+            for lane in list(self._lanes.values())
+            if lane.worker is not None and lane.worker is not current and not lane.worker.done()
         ]
-        if settlements:
+        connects = [t for t in self._dispatch_tasks if t is not current and not t.done()]
+        running: list[asyncio.Future[Any]] = [*workers, *connects]
+        if running:
             with contextlib.suppress(Exception):
-                await asyncio.wait(settlements, timeout=_DISPOSE_GRACE_S)
+                await asyncio.wait(running, timeout=_DISPOSE_GRACE_S)
+        await _release_tasks(running, current)
         self._dispatch_tasks.clear()
 
     async def _emit_error(self, error: BaseException) -> None:
@@ -1892,14 +1919,103 @@ class RealtimeClient:
             await _invoke(h, message)
 
     def _dispatch_frame(self, message: dict[str, Any]) -> None:
-        """Hand a server frame (not ``message.new``) to its handlers without
-        waiting for them: sync handlers run now, async ones start now and run
-        as their own tasks. Failures are logged."""
+        """Hand a server frame (not ``message.new``) to its handlers on its
+        lane, without waiting for them. Failures are logged."""
         event = message.get("type")
         if not isinstance(event, str):
             return
-        for h in list(self._handlers.get(event, ())):
-            self._start_handler(h, (message,), fire_and_forget=True)
+        handlers = list(self._handlers.get(event, ()))
+        if not handlers:
+            return
+        self._submit(_lane_of(message), _Job(message=message, handlers=handlers))
+
+    # ─── Lanes ───────────────────────────────────────────────────────
+
+    def _submit(self, key: str, job: _Job) -> bool:
+        """Run ``job`` on lane ``key``. On an idle lane its handlers start at
+        once, inline, and a sync handler finishes before this returns;
+        ``True`` when every handler finished that way. Otherwise the lane's
+        worker carries the job (behind the jobs already waiting there) and
+        ``False`` is returned."""
+        lane = self._lanes.get(key)
+        if lane is None or (lane.worker is None and not lane.jobs):
+            if self._run_inline(job):
+                return True
+            lane = self._lanes.setdefault(key, _Lane())
+        lane.jobs.append(job)
+        if lane.worker is None:
+            lane.worker = asyncio.ensure_future(self._lane_worker(key, lane))
+        return False
+
+    def _run_inline(self, job: _Job) -> bool:
+        """Call the job's handlers now, in order, until one is async: that
+        one is started as a task the lane's worker will wait for."""
+        while job.next_index < len(job.handlers):
+            handler = job.handlers[job.next_index]
+            job.next_index += 1
+            try:
+                result = handler(job.message)
+            except Exception:
+                job.ok = False
+                _log.warning("realtime handler raised", exc_info=True)
+                continue
+            if inspect.isawaitable(result):
+                job.awaiting = result
+                return False
+        return True
+
+    async def _run_job(self, job: _Job) -> None:
+        """Finish the job's handlers, one at a time."""
+        if job.awaiting is not None:
+            awaiting, job.awaiting = job.awaiting, None
+            try:
+                await awaiting
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                job.ok = False
+                _log.warning("realtime handler raised", exc_info=True)
+        while job.next_index < len(job.handlers):
+            handler = job.handlers[job.next_index]
+            job.next_index += 1
+            try:
+                result = handler(job.message)
+                if inspect.isawaitable(result):
+                    await result
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                job.ok = False
+                _log.warning("realtime handler raised", exc_info=True)
+
+    async def _lane_worker(self, key: str, lane: _Lane) -> None:
+        try:
+            while lane.jobs:
+                job = lane.jobs[0]
+                await self._run_job(job)
+                lane.jobs.popleft()
+                await self._settle_job(job, ok=job.ok)
+        except asyncio.CancelledError:
+            # disconnect() released the lane: what it held was not handled.
+            for job in lane.jobs:
+                _discard_awaitable(job.awaiting)
+                job.awaiting = None
+                await self._settle_job(job, ok=False, ack=False)
+            lane.jobs.clear()
+            raise
+        finally:
+            lane.worker = None
+            if not lane.jobs and self._lanes.get(key) is lane:
+                del self._lanes[key]
+
+    async def _settle_job(self, job: _Job, *, ok: bool, ack: bool = True) -> None:
+        if not job.message_new:
+            return
+        self._finish_dispatch_sync(job.message_id, job.own, ok=ok)
+        if ok and ack and job.ws_ack and job.message_id is not None and not self._disposed:
+            await self._send_delivery_ack(job.message_id)
+        if job.settlement is not None and not job.settlement.done():
+            job.settlement.set_result(ok)
 
     def _has_message_handler(self) -> bool:
         return bool(self._handlers.get("message.new"))
@@ -1986,67 +2102,22 @@ class RealtimeClient:
             own = _InFlight(loop.create_future(), self._generation, time.monotonic())
             self._inflight[message_id] = own
 
-        started: list[asyncio.Future[Any]] = []
-        ok = True
-        for handler in handlers:
-            outcome = self._start_handler(handler, (message,), fire_and_forget=False)
-            if outcome is False:
-                ok = False
-            elif outcome is not True:
-                started.append(outcome)
-
-        if not started:
-            # Every handler was sync and has run: settle in this step, so the
-            # ack goes out in arrival order exactly as before.
-            self._finish_dispatch_sync(message_id, own, ok=ok)
-            if ok and ws_ack and message_id is not None:
-                await self._send_delivery_ack(message_id)
-            return self._settle_drain_row(message, _resolved(loop, ok))
-
-        settlement = self._settle_later(message_id, own, started, ok=ok, ws_ack=ws_ack)
+        job = _Job(
+            message=message,
+            handlers=handlers,
+            message_new=True,
+            message_id=message_id,
+            own=own,
+            ws_ack=ws_ack,
+        )
+        if self._submit(_lane_of(message), job):
+            # Every handler was sync and has run on an idle lane: settle in
+            # this step, so the ack goes out in arrival order.
+            await self._settle_job(job, ok=job.ok)
+            return self._settle_drain_row(message, _resolved(loop, job.ok))
+        settlement: asyncio.Future[bool] = loop.create_future()
+        job.settlement = settlement
         return self._settle_drain_row(message, settlement)
-
-    def _settle_later(
-        self,
-        message_id: str | None,
-        own: _InFlight | None,
-        started: list[asyncio.Future[Any]],
-        *,
-        ok: bool,
-        ws_ack: bool,
-    ) -> asyncio.Future[bool]:
-        """Wait for the async handlers off the receive loop, then settle, and
-        acknowledge (``ws_ack``) on the current socket when every handler
-        settled cleanly. After a reconnect that is the new socket: the server
-        accepts an ack for a message on any connection of the agent."""
-
-        async def settle() -> bool:
-            try:
-                results = await asyncio.gather(*started, return_exceptions=True)
-            except asyncio.CancelledError:
-                # disconnect() released the dispatch before its handlers
-                # finished: not handled, so not acked.
-                self._finish_dispatch_sync(message_id, own, ok=False)
-                raise
-            clean = ok
-            for result in results:
-                if isinstance(result, BaseException):
-                    clean = False
-                    if not isinstance(result, asyncio.CancelledError):
-                        _log.warning(
-                            "realtime handler raised",
-                            exc_info=(type(result), result, result.__traceback__),
-                        )
-            self._finish_dispatch_sync(message_id, own, ok=clean)
-            if clean and ws_ack and message_id is not None and not self._disposed:
-                await self._send_delivery_ack(message_id)
-            return clean
-
-        task: asyncio.Future[bool] = asyncio.ensure_future(settle())
-        self._settle_tasks[task] = started
-        task.add_done_callback(lambda done: self._settle_tasks.pop(done, None))
-        task.add_done_callback(_consume_future)
-        return task
 
     def _finish_dispatch_sync(
         self, message_id: str | None, own: _InFlight | None, *, ok: bool
@@ -2586,6 +2657,33 @@ async def _invoke(handler: Any, arg: Any) -> bool:
         _log.warning("realtime handler raised", exc_info=True)
         return False
     return True
+
+
+_NO_CONVERSATION_LANE = "events"
+
+
+def _discard_awaitable(awaitable: Any) -> None:
+    """Drop what an async handler returned without running it (its lane was
+    released first): close a coroutine, cancel a future."""
+    if awaitable is None:
+        return
+    if inspect.iscoroutine(awaitable):
+        awaitable.close()
+    elif isinstance(awaitable, asyncio.Future):
+        awaitable.cancel()
+
+
+def _lane_of(message: dict[str, Any]) -> str:
+    """The dispatch lane of a frame: its conversation (``message.new`` and
+    every frame that names one), or the one lane for frames of no
+    conversation. A ``wake`` is a tray-level signal: the no-conversation
+    lane, whatever conversation it names."""
+    if message.get("type") != "wake":
+        payload = message.get("payload")
+        cid = payload.get("conversation_id") if isinstance(payload, dict) else None
+        if isinstance(cid, str) and cid:
+            return f"conversation:{cid}"
+    return _NO_CONVERSATION_LANE
 
 
 def _resolved(loop: asyncio.AbstractEventLoop, value: bool) -> asyncio.Future[bool]:

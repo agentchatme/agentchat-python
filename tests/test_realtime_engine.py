@@ -658,8 +658,11 @@ async def test_a_cancelled_first_copy_counts_as_not_handled() -> None:
         settlement = await rt._deliver_message_new(frame, ws_ack=True)
         await entered.wait()
         assert rt._adopt_in_flight(dict(frame), ws_ack=True) is not None
-        settlement.cancel()
+        worker = rt._lanes["conversation:c"].worker
+        assert worker is not None
+        worker.cancel()  # what disconnect() does after its grace
         await _settle()
+        assert settlement.done() and settlement.result() is False
         assert _ack_frames(ws) == []
         assert rt._inflight == {}
     finally:
@@ -684,9 +687,13 @@ async def test_with_the_dedup_cache_off_every_copy_is_dispatched() -> None:
             for _ in range(2)
         ]
         await _settle()
-        assert calls == ["msg_1", "msg_1"]
+        # Both copies are dispatched (no dedup), one after the other: one
+        # handler at a time per conversation.
+        assert calls == ["msg_1"]
         release.set()
         await asyncio.gather(*tasks)
+        await _settle()
+        assert calls == ["msg_1", "msg_1"]
     finally:
         release.set()
         await rt.disconnect()
@@ -965,11 +972,15 @@ async def test_an_adopted_in_order_repeat_moves_the_cursor_on(
         await ws.push(message_new("c", 2))  # live repeat: adopted
         await ws.push(message_new("c", 3))
         await _settle()
-        assert seen == [1, 2, 3]
+        # Seq 3 is taken in order (no gap) and waits for seq 2's handler: one
+        # handler at a time per conversation.
+        assert seen == [1, 2]
         await asyncio.sleep(0.2)  # well past the gap window
         assert gaps == []
         assert api.get_messages_calls == []
         release.set()
+        await _settle()
+        assert seen == [1, 2, 3]
         await asyncio.wait_for(drain, timeout=1.0)
         await _settle()
         assert sorted(_ack_frames(ws)) == ["msg_1", "msg_2", "msg_3"]
@@ -983,8 +994,9 @@ async def test_a_frame_behind_a_new_hole_gets_its_own_gap_window(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     # While a lapsed gap's handler for seq 3 runs, seq 4 arrives in order and
-    # seq 6 behind a new hole. Seq 4 is dispatched at once by the receive
-    # loop; seq 6 waits for its own gap window and its own report.
+    # seq 6 behind a new hole. Seq 4 is taken in order and handed over once
+    # seq 3's handler is done; seq 6 waits for its own gap window and its own
+    # report.
     monkeypatch.setattr("agentchatme._realtime._GAP_FILL_WINDOW_S", 0.1)
     gaps: list[Any] = []
     rt, ws = await connected(capabilities=["ack"], on_sequence_gap=gaps.append)
@@ -1006,7 +1018,9 @@ async def test_a_frame_behind_a_new_hole_gets_its_own_gap_window(
         await ws.push(message_new("c", 4))
         await ws.push(message_new("c", 6))
         await _settle()
-        assert seen == [1, 3, 4]
+        # Seq 4 is taken in order at once and waits for seq 3's handler (one
+        # at a time per conversation); seq 6 parks behind the new hole.
+        assert seen == [1, 3]
         release.set()
         await _settle()
         assert seen == [1, 3, 4]

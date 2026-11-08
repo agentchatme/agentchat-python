@@ -216,6 +216,37 @@ def _check_invariants(out: _Outcome, mode: str) -> None:
         last[p["conversation_id"]] = p["seq"]
 
 
+# Expectations the shared fixture still encodes for concurrent dispatch
+# within a conversation. Lead decision (2026-11-08): the SDKs run at most one
+# handler per conversation, so a frame waits for the previous frame's
+# handler. The TypeScript SDK adopts the same rule and the fixture is then
+# regenerated; until then these overrides apply, and a test below fails as
+# soon as the fixture changes, so they are removed then.
+_PENDING_FIXTURE_UPDATES: dict[tuple[str, str], dict[str, Any]] = {
+    ("frames-arrive-while-a-lapsed-gap-is-handled", "default"): {
+        # seq 4 is acked after seq 3's handler, not before it
+        "was": {"ws_acks": ["msg_gone0wait0001", "msg_gone0wait0004", "msg_gone0wait0003", "msg_gone0wait0006"]},
+        "now": {"ws_acks": ["msg_gone0wait0001", "msg_gone0wait0003", "msg_gone0wait0004", "msg_gone0wait0006"]},
+    },
+}
+
+
+def _expected(scenario: dict[str, Any], mode: str) -> dict[str, Any]:
+    expected = dict(scenario["expect"][mode])
+    pending = _PENDING_FIXTURE_UPDATES.get((scenario["name"], mode))
+    if pending is not None:
+        expected.update(pending["now"])
+    return expected
+
+
+def test_pending_fixture_updates_are_still_pending() -> None:
+    by_name = {s["name"]: s for s in DOC["scenarios"]}
+    for (name, mode), pending in _PENDING_FIXTURE_UPDATES.items():
+        current = by_name[name]["expect"][mode]
+        for key, value in pending["was"].items():
+            assert current[key] == value, f"{name}/{mode}: the fixture changed — drop the override"
+
+
 def _check_expectations(out: _Outcome, expected: dict[str, Any]) -> None:
     ids = [p["id"] for p in out.dispatched]
     if "dispatched" in expected:
@@ -256,4 +287,4 @@ def test_scenario_names_are_unique() -> None:
 async def test_engine_scenario(scenario: dict[str, Any], mode: str) -> None:
     out = await _run(scenario, mode)
     _check_invariants(out, mode)
-    _check_expectations(out, scenario["expect"][mode])
+    _check_expectations(out, _expected(scenario, mode))

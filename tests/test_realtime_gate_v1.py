@@ -65,12 +65,87 @@ async def test_a_slow_async_handler_of_any_server_event_never_blocks_reads() -> 
     rt.on("typing.start", slow_typing)
     rt.on("message.new", lambda m: seen.append(m["payload"]["id"]))
     try:
-        await ws.push({"type": "typing.start", "payload": {"conversation_id": "a"}})
+        await ws.push({"type": "typing.start", "payload": {"conversation_id": "b"}})
         await ws.push(message_new("a", 1))
         await _settle()
         assert seen == ["msg_1"]
     finally:
         gate.set()
+        await rt.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_one_handler_at_a_time_per_conversation_and_conversations_in_parallel() -> None:
+    rt, ws = await connected(capabilities=["ack"])
+    release = asyncio.Event()
+    started: list[str] = []
+    finished: list[str] = []
+
+    async def handler(m: dict[str, Any]) -> None:
+        mid = m["payload"]["id"]
+        started.append(mid)
+        if mid == "msg_5":
+            await release.wait()  # the first is slower
+        finished.append(mid)
+
+    rt.on("message.new", handler)
+    try:
+        await ws.push(message_new("c", 5))
+        await ws.push(message_new("c", 6))
+        await ws.push(message_new("d", 1, id="msg_d1"))
+        await _settle()
+        # seq 6 of c does not start until seq 5 finished; d runs meanwhile.
+        assert started == ["msg_5", "msg_d1"]
+        assert finished == ["msg_d1"]
+        assert _ack_frames(ws) == ["msg_d1"]
+        release.set()
+        await _settle()
+        assert started == ["msg_5", "msg_d1", "msg_6"]
+        assert finished == ["msg_d1", "msg_5", "msg_6"]
+        assert _ack_frames(ws) == ["msg_d1", "msg_5", "msg_6"]
+    finally:
+        release.set()
+        await rt.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_frames_of_no_conversation_share_one_serial_lane() -> None:
+    rt, ws = await connected(capabilities=["ack"])
+    release = asyncio.Event()
+    order: list[str] = []
+
+    async def presence(_m: dict[str, Any]) -> None:
+        order.append("presence:start")
+        await release.wait()
+        order.append("presence:end")
+
+    rt.on("presence.update", presence)
+    rt.on("wake", lambda _m: order.append("wake"))
+    rt.on("message.new", lambda m: order.append(m["payload"]["id"]))
+    try:
+        await ws.push({"type": "presence.update", "payload": {"handle": "nova"}})
+        await ws.push(
+            {
+                "type": "wake",
+                "payload": {
+                    "reason": "reminder",
+                    "conversation_id": "c",
+                    "anchor_message_id": "m",
+                    "step": 1,
+                    "at": "t",
+                },
+            }
+        )
+        await ws.push(message_new("c", 1))
+        await _settle()
+        # msg_1 is on its conversation's lane; the wake waits its turn on the
+        # no-conversation lane behind the running presence handler.
+        assert sorted(order) == ["msg_1", "presence:start"]
+        release.set()
+        await _settle()
+        assert order.index("wake") > order.index("presence:end")
+    finally:
+        release.set()
         await rt.disconnect()
 
 
@@ -132,7 +207,7 @@ async def test_disconnect_releases_a_handler_that_never_returns() -> None:
     assert time.monotonic() - started < _realtime._DISPOSE_GRACE_S + 1.0
     assert rt._dispatch_tasks == set()
     await _settle()
-    assert rt._settle_tasks == {}
+    assert rt._lanes == {}
     assert rt._inflight == {}
     assert _ack_frames(ws) == []
 
@@ -379,7 +454,11 @@ async def test_a_re_offer_after_the_adoption_window_is_dispatched_afresh() -> No
         await ws2.push({"type": "hello.ok", "capabilities": ["ack"]})
         await ws2.push(message_new("c", 1))
         await _settle()
-        assert calls == ["msg_1", "msg_1"]  # past the window: a fresh dispatch
+        # Past the window the re-offer is not adopted: it is a dispatch of its
+        # own, queued behind the running one (one handler at a time per
+        # conversation).
+        lane = rt._lanes["conversation:c"]
+        assert [job.message_id for job in lane.jobs] == ["msg_1", "msg_1"]
     finally:
         await rt.disconnect()
 
