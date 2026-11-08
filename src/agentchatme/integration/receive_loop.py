@@ -15,7 +15,10 @@ Two modes (contract v1, D5):
 - ``single_run`` (Claude Code, Codex, routines, a listener): when anything is
   owed, start one run (``start_run``) with the served wake text; the run
   reads the tray itself and records its own verdicts. The loop records
-  nothing on its behalf.
+  nothing for cards. An invite still pending and undismissed after two
+  completed runs is dismissed (seen, left pending, not shown again), so an
+  ignored invite does not cost a run on every wake; the count is in memory
+  only.
 
 Wakes: a ``message.new`` frame that is not the echo of the agent's own send,
 a ``wake`` frame (a reminder, or unanswered cards), every accepted HELLO (a
@@ -696,6 +699,13 @@ class ReceiveLoop:
         key = {"completed": "runs_completed", "failed": "runs_failed"}.get(end.status, "runs_not_started")
         self._counts[key] += 1
         self._emit({"type": "run", "end": end})
+        # Cards: the run recorded its own verdicts; nothing is recorded for
+        # it. Invites sit on the tray until answered, so one the run ignored
+        # would cost a run on every wake: the D5 rule of an invite turn —
+        # pending after the second completed run → dismissed.
+        started_with = _tray_invites(tray) if tray is not None else []
+        if started_with and not self._stopped:
+            await self._track(self._after_run_invites(started_with, end))
         outcome: CycleOutcome = (
             "run_completed"
             if end.status == "completed"
@@ -767,6 +777,8 @@ class ReceiveLoop:
         self._count(outcome.reason)
         if outcome.reason == "silent_first":
             self._remember(key, silent_before + 1)
+        elif outcome.reason in ("card_left_tray", "turn_recorded_verdict"):
+            self._silent.pop(key, None)
         recorded = False
         if outcome.action != "none" and not self._stopped:
             try:
@@ -814,14 +826,33 @@ class ReceiveLoop:
             self._tracker.end(handle)
             self._after_turn_ended()
 
+    async def _after_run_invites(self, invites: list[dict[str, Any]], end: RunEnd) -> None:
+        completed = end.status == "completed"
+        fresh = await self._read_tray() if completed else None
+        turn = (
+            TurnEnd(status="completed", agentchat_calls=None)
+            if completed
+            else TurnEnd(status="failed", detail=end.detail)
+        )
+        for invite in invites:
+            await self._settle_invite(invite, turn, fresh)
+
     async def _record_invite_outcome(self, invite: dict[str, Any], end: TurnEnd) -> None:
-        fresh = await self._read_tray()
+        await self._settle_invite(invite, end, await self._read_tray())
+
+    async def _settle_invite(
+        self, invite: dict[str, Any], end: TurnEnd, fresh: dict[str, Any] | None
+    ) -> None:
+        """The D5 rule for one invite after a turn or a run, and the one call
+        it asks for."""
         key = f"invite|{invite['invite_id']}"
         silent_before = self._silent.get(key, 0)
         outcome = invite_outcome(turn=end, invite=invite, fresh_tray=fresh, silent_before=silent_before)
         self._count(f"invite_{outcome.reason}")
         if outcome.reason == "silent_first":
             self._remember(key, silent_before + 1)
+        elif outcome.reason == "invite_answered":
+            self._silent.pop(key, None)
         recorded = False
         if outcome.action != "none" and not self._stopped:
             try:

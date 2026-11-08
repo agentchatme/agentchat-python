@@ -183,13 +183,13 @@ async def test_connect_sends_hello_frame() -> None:
         await _settle()
         assert len(ws.sent) == 1
         sent = json.loads(ws.sent[0])
-        # HELLO authenticates over the wire and advertises the delivery-ack
-        # and heartbeat capabilities (rewake is opt-in); the server ignores
-        # unknown capability strings.
+        # HELLO authenticates over the wire and advertises heartbeat (rewake
+        # is opt-in, ack only while a message.new handler is attached); the
+        # server ignores unknown capability strings.
         assert sent == {
             "type": "hello",
             "api_key": "sk_test",
-            "capabilities": ["ack", "heartbeat"],
+            "capabilities": ["heartbeat"],
             "client": "python_sdk",
             "client_version": VERSION,
         }

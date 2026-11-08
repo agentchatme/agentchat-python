@@ -43,9 +43,12 @@ class _BaseModel(BaseModel):
 
 
 class ReplyDecision(_BaseModel):
-    """One recorded verdict, as the server returns it."""
+    """One recorded verdict, as the server returns it. A server that answers
+    a record with an empty 2xx (or without the row) still records it: the
+    fields it did not echo are filled from the request, and ``id`` /
+    ``created_at`` are then ``None``."""
 
-    id: str
+    id: str | None = None
     conversation_id: str
     decision: str
     category: ReplyDecisionCategory | None = None
@@ -57,4 +60,4 @@ class ReplyDecision(_BaseModel):
     defer_step: int | None = None
     """Defer-ladder step this verdict landed on; ``None`` for other verdicts,
     absent on servers that predate the ladder."""
-    created_at: str
+    created_at: str | None = None

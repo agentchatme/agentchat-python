@@ -145,26 +145,48 @@ async def test_disconnect_releases_a_handler_that_never_returns() -> None:
 async def test_a_frame_is_never_acked_while_no_message_handler_is_attached(
     ack_on_receipt: bool,
 ) -> None:
-    rt, ws = await connected(capabilities=["ack"], ack_on_receipt=ack_on_receipt)
+    # A server that echoes ack although HELLO did not offer it (no handler
+    # was attached): the capability does not hold, and nothing is acked.
+    rt, ws = await connected(capabilities=["ack"], with_handler=False, ack_on_receipt=ack_on_receipt)
     try:
+        assert json.loads(ws.sent[0])["capabilities"] == ["heartbeat"]
+        assert rt.ack_negotiated is False
         await ws.push(message_new("c", 1))
         await _settle()
         assert _ack_frames(ws) == []
-        # Nothing remembers it either: once a handler is attached, the
-        # server's re-offer is handled and acked.
+    finally:
+        await rt.disconnect()
+    # A handler attached, but removed before the frame: not acked, and not
+    # remembered, so the re-offer is handled once a handler is back.
+    rt, ws = await connected(capabilities=["ack"], with_handler=False, ack_on_receipt=ack_on_receipt)
+    try:
+        off = rt.on("message.new", lambda _m: None)
+        off()
+        await ws.push(message_new("c", 1))
+        await _settle()
+        assert _ack_frames(ws) == []
+    finally:
+        await rt.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_ack_is_offered_and_negotiated_only_with_a_message_handler() -> None:
+    rt, ws = await connected(capabilities=["ack", "heartbeat"])
+    try:
+        assert json.loads(ws.sent[0])["capabilities"] == ["ack", "heartbeat"]
+        assert rt.capabilities == frozenset({"ack", "heartbeat"})
         seen: list[str] = []
         rt.on("message.new", lambda m: seen.append(m["payload"]["id"]))
         await ws.push(message_new("c", 1))
         await _settle()
-        assert seen == ["msg_1"]
-        assert _ack_frames(ws) == ["msg_1"]
+        assert seen == ["msg_1"] and _ack_frames(ws) == ["msg_1"]
     finally:
         await rt.disconnect()
 
 
 @pytest.mark.asyncio
 async def test_a_wake_handler_alone_does_not_make_message_frames_ackable() -> None:
-    rt, ws = await connected(capabilities=["ack"], ack_on_receipt=True)
+    rt, ws = await connected(capabilities=["ack"], with_handler=False, ack_on_receipt=True)
     rt.on("wake", lambda _m: None)
     try:
         await ws.push(message_new("c", 1))
@@ -191,6 +213,7 @@ async def test_hello_offers_heartbeat_by_default_and_rewake_only_when_asked(
     offered: Any, caps: list[str]
 ) -> None:
     rt, ws = _make_client(capabilities=offered)
+    rt.on("message.new", lambda _m: None)
     try:
         await rt.connect()
         await _settle()
@@ -201,7 +224,7 @@ async def test_hello_offers_heartbeat_by_default_and_rewake_only_when_asked(
 
 @pytest.mark.asyncio
 async def test_negotiated_capabilities_are_exposed_and_cleared_on_close() -> None:
-    rt, ws = await connected(capabilities=["ack", "heartbeat", "rewake"])
+    rt, ws = await connected(capabilities=["ack", "heartbeat", "rewake"], offer={"rewake": True})
     try:
         assert rt.capabilities == frozenset({"ack", "heartbeat", "rewake"})
         await ws.close(code=1006)
@@ -253,7 +276,7 @@ async def test_heartbeat_frames_keep_a_quiet_socket_alive_and_their_absence_trip
 
 @pytest.mark.asyncio
 async def test_an_unanswered_wake_reaches_wake_handlers() -> None:
-    rt, ws = await connected(capabilities=["ack", "heartbeat", "rewake"])
+    rt, ws = await connected(capabilities=["ack", "heartbeat", "rewake"], offer={"rewake": True})
     wakes: list[dict[str, Any]] = []
     rt.on("wake", lambda m: wakes.append(m["payload"]))
     payload = {
@@ -293,11 +316,72 @@ async def test_an_unanswered_wake_reaches_wake_handlers() -> None:
     ],
 )
 def test_wake_payload_problem(payload: Any, problem: str | None) -> None:
-    got = wake_payload_problem(payload)
+    got = wake_payload_problem(payload, rewake=True)
     if problem is None:
         assert got is None
     else:
         assert got is not None and problem in got
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"reason": "unanswered", "conversation_ids": ["a"], "step": 1, "at": "t"},
+        {"reason": "something_new", "at": "t"},
+    ],
+)
+def test_without_rewake_the_1_2_wake_rule_holds(payload: dict[str, Any]) -> None:
+    assert wake_payload_problem(payload, rewake=False) is not None
+    reminder = {"reason": "reminder", "conversation_id": "c", "anchor_message_id": "m", "step": 1, "at": "t"}
+    assert wake_payload_problem(reminder, rewake=False) is None
+
+
+@pytest.mark.asyncio
+async def test_an_unanswered_wake_on_a_socket_without_rewake_is_rejected() -> None:
+    rt, ws = await connected(capabilities=["ack", "heartbeat"])
+    wakes: list[Any] = []
+    errors: list[BaseException] = []
+    rt.on("wake", wakes.append)
+    rt.on_error(errors.append)
+    try:
+        await ws.push({"type": "wake", "payload": {"reason": "unanswered", "conversation_ids": ["c"], "step": 1, "at": "t"}})
+        await _settle()
+        assert wakes == [] and any("wake frame failed validation" in str(e) for e in errors)
+    finally:
+        await rt.disconnect()
+
+
+# ─────────────── in-flight adoption across reconnects is bounded ───────────────
+
+
+@pytest.mark.asyncio
+async def test_a_re_offer_after_the_adoption_window_is_dispatched_afresh() -> None:
+    rt, ws = await connected(capabilities=["ack"], in_flight_adopt_ms=0)
+    calls: list[str] = []
+
+    async def hangs(m: dict[str, Any]) -> None:
+        calls.append(m["payload"]["id"])
+        await asyncio.Event().wait()
+
+    rt.on("message.new", hangs)
+    try:
+        await ws.push(message_new("c", 1))
+        await _settle()
+        await ws.close(code=1006)
+        await _settle()
+        ws2 = MockWebSocket()
+
+        async def connect2(_url: str, **_kw: Any) -> MockWebSocket:
+            return ws2
+
+        rt._websocket_connect = connect2
+        await rt.connect()
+        await ws2.push({"type": "hello.ok", "capabilities": ["ack"]})
+        await ws2.push(message_new("c", 1))
+        await _settle()
+        assert calls == ["msg_1", "msg_1"]  # past the window: a fresh dispatch
+    finally:
+        await rt.disconnect()
 
 
 # ─────────────── the connect budget ───────────────
@@ -337,8 +421,9 @@ async def test_a_1013_close_backs_off_with_the_servers_delay_and_never_blocks() 
 
 
 @pytest.mark.asyncio
-async def test_a_1013_close_during_the_handshake_is_not_an_auth_rejection() -> None:
-    # Even with the auth reason in the text: 1013 is the budget, never blocked.
+async def test_a_1013_without_a_hint_is_the_ordinary_backoff_never_blocked() -> None:
+    # The server's slow-consumer close (1013 "overload"), even with the auth
+    # reason in the text: ordinary backoff, never blocked.
     sock = MockWebSocket()
     rt, _handed = _client_with_sockets([sock])
     sleep = ControlledSleep(hold=True)
@@ -347,13 +432,33 @@ async def test_a_1013_close_during_the_handshake_is_not_an_auth_rejection() -> N
         await rt.connect()
         await _settle()
         sock.close_code = 1013
-        sock.close_reason = "invalid token"
+        sock.close_reason = "overload"
         await sock._inbox.put(None)
         await _until(lambda: bool(sleep.delays))
         assert rt.state == "backoff"
         assert rt.blocked_reason is None
-        # No hint: the per-minute budget's window.
-        assert 60.0 <= sleep.delays[0] <= 66.0
+        assert sleep.delays[0] <= 0.02  # the 10-20 ms test backoff
+        assert rt.rate_limited_ms is None
+    finally:
+        sleep.release()
+        await rt.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_a_hinted_1013_during_the_handshake_is_not_an_auth_rejection() -> None:
+    sock = MockWebSocket()
+    rt, _handed = _client_with_sockets([sock])
+    sleep = ControlledSleep(hold=True)
+    rt._sleep = sleep
+    try:
+        await rt.connect()
+        await _settle()
+        sock.close_code = 1013
+        sock.close_reason = "invalid token; retry_after=5"
+        await sock._inbox.put(None)
+        await _until(lambda: bool(sleep.delays))
+        assert rt.state == "backoff" and rt.blocked_reason is None
+        assert 5.0 <= sleep.delays[0] <= 5.5
     finally:
         sleep.release()
         await rt.disconnect()

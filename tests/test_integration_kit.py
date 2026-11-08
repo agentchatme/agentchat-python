@@ -773,7 +773,18 @@ async def test_single_run_starts_one_run_with_the_served_texts_and_records_nothi
         runs.append(request)
         return RunEnd(status="completed")
 
-    client = _LoopClient([_tray([_card("c1", "m1")]), _tray([], [invite]), _tray([_card("c1", "m1")], [invite]), _tray([])])
+    # After a run that started with invites the loop reads the tray once more
+    # (the single-run invite rule): here the run answered them.
+    client = _LoopClient(
+        [
+            _tray([_card("c1", "m1")]),
+            _tray([], [invite]),
+            _tray([]),
+            _tray([_card("c1", "m1")], [invite]),
+            _tray([]),
+            _tray([]),
+        ]
+    )
     loop = _loop(client, mode="single_run", start_run=start_run)
     await loop.start()
     for _ in range(4):
@@ -785,6 +796,22 @@ async def test_single_run_starts_one_run_with_the_served_texts_and_records_nothi
     ]
     assert loop.status().last_cycle.outcome == "empty"  # type: ignore[union-attr]
     assert client.decisions.recorded == [] and client.groups.dismissed == []
+    await loop.stop()
+
+
+@pytest.mark.asyncio
+async def test_single_run_dismisses_an_invite_left_pending_after_two_completed_runs() -> None:
+    invite = {"invite_id": "gri_1", "group": {"id": "g", "name": "n", "member_count": 1}, "invited_by": "@p", "at": "t"}
+    ends = [RunEnd(status="failed"), RunEnd(status="completed"), RunEnd(status="completed")]
+    client = _LoopClient([_tray([], [invite])])
+    loop = _loop(client, mode="single_run", start_run=lambda _r: ends.pop(0))
+    await loop.start()
+    for _ in range(3):
+        await _cycle(loop)
+    assert client.groups.dismissed == ["gri_1"]
+    assert client.decisions.recorded == []
+    outcomes = loop.status().counters["outcomes"]
+    assert outcomes == {"invite_turn_failed": 1, "invite_silent_first": 1, "invite_silent_again": 1}
     await loop.stop()
 
 

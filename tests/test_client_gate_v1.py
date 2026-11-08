@@ -103,6 +103,33 @@ def test_a_retry_policy_of_its_own_applies_to_one_call() -> None:
     assert route.call_count == 2
 
 
+# ─────────────── decisions.record on any 2xx ───────────────
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        httpx.Response(204),
+        httpx.Response(200, text=""),
+        httpx.Response(200, json=None),
+        httpx.Response(200, json={"ok": True}),
+        httpx.Response(201, json={"decision": {"id": "dec_1", "decision": "reply"}}),
+    ],
+)
+@respx.mock
+def test_decisions_record_succeeds_on_any_2xx(response: httpx.Response) -> None:
+    respx.post(f"{BASE}/v1/conversations/c1/decisions").mock(return_value=response)
+    decision = _client().decisions.record(
+        "c1", decision="reply", category="open_request", through_message_id="m1"
+    )
+    assert decision.conversation_id == "c1" and decision.decision == "reply"
+    assert decision.through_message_id == "m1" and decision.category == "open_request"
+    if response.status_code == 201:
+        assert decision.id == "dec_1"
+    else:
+        assert decision.id is None and decision.created_at is None
+
+
 # ─────────────── /context ───────────────
 
 CONTEXT: dict[str, Any] = {

@@ -133,7 +133,7 @@ def test_frames_parse_and_validate() -> None:
 @pytest.mark.asyncio
 async def test_hello_ok_v1_negotiates_every_capability() -> None:
     hello = load("hello-ok.v1.json")
-    rt, _ws = await connected(capabilities=hello["capabilities"])
+    rt, _ws = await connected(capabilities=hello["capabilities"], offer={"rewake": True})
     try:
         assert rt.capabilities == frozenset(hello["capabilities"])
         assert rt.ack_negotiated
@@ -143,7 +143,7 @@ async def test_hello_ok_v1_negotiates_every_capability() -> None:
 
 @pytest.mark.asyncio
 async def test_the_unanswered_wake_frame_reaches_wake_handlers_as_is() -> None:
-    rt, ws = await connected(capabilities=["ack", "heartbeat", "rewake"])
+    rt, ws = await connected(capabilities=["ack", "heartbeat", "rewake"], offer={"rewake": True})
     seen: list[dict[str, Any]] = []
     rt.on("wake", seen.append)
     try:
@@ -252,8 +252,37 @@ def _turn(raw_turn: dict[str, Any]) -> TurnEnd:
 
 
 def test_turn_outcome_case_names_are_unique() -> None:
-    names = [c["name"] for c in OUTCOMES["cases"] + OUTCOMES["invite_cases"]]
+    names = [
+        c["name"]
+        for c in OUTCOMES["cases"] + OUTCOMES["invite_cases"] + OUTCOMES["single_run_invite_cases"]
+    ]
     assert len(set(names)) == len(names)
+
+
+@pytest.mark.parametrize(
+    "case",
+    OUTCOMES["single_run_invite_cases"],
+    ids=[c["name"] for c in OUTCOMES["single_run_invite_cases"]],
+)
+def test_single_run_invite_case(case: dict[str, Any]) -> None:
+    # The loop's rule after each run (see single_run_invite_cases_about):
+    # completed → a completed turn with unknown calls and the fresh tray;
+    # failed / not_started → a failed turn, no tray read; silent_before
+    # counts the earlier silent_first outcomes.
+    silent = 0
+    got: list[dict[str, Any]] = []
+    for run in case["runs"]:
+        completed = run["status"] == "completed"
+        outcome = invite_outcome(
+            turn=TurnEnd(status="completed") if completed else TurnEnd(status="failed"),
+            invite=case["invite"],
+            fresh_tray=run["fresh_tray"] if completed else None,
+            silent_before=silent,
+        )
+        if outcome.reason == "silent_first":
+            silent += 1
+        got.append({"action": outcome.action, "reason": outcome.reason})
+    assert got == case["expect"]
 
 
 @pytest.mark.parametrize("case", OUTCOMES["cases"], ids=[c["name"] for c in OUTCOMES["cases"]])

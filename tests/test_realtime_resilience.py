@@ -196,6 +196,7 @@ async def test_blocked_retries_slowly_and_hello_ok_clears_it(
     rt._sleep = sleeper
     blocked: list[dict[str, Any]] = []
     rt.on("blocked", lambda evt: blocked.append(evt))
+    rt.on("message.new", lambda _m: None)  # so HELLO offers ack
     try:
         with caplog.at_level(logging.DEBUG, logger="agentchat.realtime"):
             await rt.connect()
@@ -529,6 +530,7 @@ async def test_explicit_liveness_timeout_counts_frames_alone_without_ping() -> N
 async def test_state_walks_the_lifecycle_and_ack_negotiated_tracks_the_connection() -> None:
     sock = MockWebSocket()
     rt, _handed = _client_with_sockets([sock])
+    rt.on("message.new", lambda _m: None)  # so HELLO offers ack
     assert rt.state == "idle"
     assert rt.ack_negotiated is False
     try:

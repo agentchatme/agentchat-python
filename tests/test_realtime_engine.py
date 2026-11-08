@@ -36,10 +36,26 @@ def message_new(conversation_id: str, seq: int, **payload: Any) -> dict[str, Any
     return {"type": "message.new", "payload": body}
 
 
+def _noop(_message: dict[str, Any]) -> None:
+    return None
+
+
 async def connected(
-    *, capabilities: list[str] | None = None, **opts: Any
+    *,
+    capabilities: list[str] | None = None,
+    with_handler: bool = True,
+    offer: dict[str, bool] | None = None,
+    **opts: Any,
 ) -> tuple[RealtimeClient, MockWebSocket]:
+    """A client past hello.ok. HELLO offers ``ack`` only while a
+    ``message.new`` handler is attached, so a no-op one is attached first
+    (``with_handler=False`` for a handler-less client). ``capabilities`` is
+    what the server echoes; ``offer`` the client's capability options."""
+    if offer is not None:
+        opts["capabilities"] = offer
     rt, ws = _make_client(**opts)
+    if with_handler:
+        rt.on("message.new", _noop)
     await rt.connect()
     await _settle()
     hello_ok: dict[str, Any] = {"type": "hello.ok"}

@@ -29,13 +29,37 @@
       "event": {
         "code": 1013,
         "kind": "close",
+        "reason": "rate_limited; retry_after=42"
+      },
+      "expect": {
+        "blocked": false,
+        "delay_ms": 42000
+      },
+      "name": "close-1013-as-the-server-sends-it"
+    },
+    {
+      "event": {
+        "code": 1013,
+        "kind": "close",
+        "reason": "overload"
+      },
+      "expect": {
+        "blocked": false,
+        "delay_ms": null
+      },
+      "name": "close-1013-overload-is-the-ordinary-backoff"
+    },
+    {
+      "event": {
+        "code": 1013,
+        "kind": "close",
         "reason": "Try Again Later"
       },
       "expect": {
         "blocked": false,
-        "delay_ms": 60000
+        "delay_ms": null
       },
-      "name": "close-1013-without-a-hint"
+      "name": "close-1013-without-a-hint-is-the-ordinary-backoff"
     },
     {
       "event": {
@@ -45,9 +69,9 @@
       },
       "expect": {
         "blocked": false,
-        "delay_ms": 60000
+        "delay_ms": null
       },
-      "name": "close-1013-with-an-empty-reason"
+      "name": "close-1013-with-an-empty-reason-is-the-ordinary-backoff"
     },
     {
       "event": {
@@ -164,7 +188,7 @@
   "min_delay_ms": 1000,
   "rules": {
     "bounds": "The delay is clamped to [min_delay_ms, max_delay_ms].",
-    "close_1013": "The hint is the first \"retry_after\" (or \"retry-after\"), case-insensitive, followed by \"=\", \":\" or spaces and whole seconds. No hint: default_delay_ms.",
+    "close_1013": "The hint is the first \"retry_after\" (or \"retry-after\"), case-insensitive, followed by \"=\", \":\" or spaces and whole seconds; the server sends \"rate_limited; retry_after=<seconds>\". A 1013 without a hint is not a budget answer (the server also closes a slow consumer with 1013 \"overload\"): the ordinary reconnect backoff applies, as before contract v1.",
     "jitter": "A client may wait up to 10% longer than delay_ms, never less.",
     "state": "The client is in backoff (never blocked) until the attempt; the next attempt is a normal connect.",
     "upgrade_429": "Retry-After per RFC 9110: whole seconds, or an HTTP date measured from now. Missing or unusable: default_delay_ms."

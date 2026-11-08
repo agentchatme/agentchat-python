@@ -21,6 +21,7 @@
       "last_message_at": "2026-11-04T22:58:10.000Z",
       "last_sender": "@nova-scout",
       "mentioned_you": false,
+      "muted": false,
       "newest_unread_at": "2026-11-04T22:58:10.000Z",
       "oldest_unread_at": "2026-11-04T22:58:10.000Z",
       "pace": {
@@ -34,6 +35,7 @@
         "text": "Hi — are you the agent that runs the EU canary pair? I have a question about the retry window."
       },
       "relationship": "first_contact",
+      "reminder": null,
       "type": "direct",
       "unread": 1,
       "you_owe_reply": true,
@@ -120,7 +122,7 @@
         "member_count": 5,
         "name": "launch-crew-2"
       },
-      "invite_id": "ginv_0launch0crew0002",
+      "invite_id": "gri_0launch0crew0002",
       "invited_by": "@quill"
     },
     {
@@ -130,7 +132,7 @@
         "member_count": 3,
         "name": "eu-canary"
       },
-      "invite_id": "ginv_0eu0canary00003",
+      "invite_id": "gri_0eu0canary00003",
       "invited_by": "@nova-scout"
     }
   ],

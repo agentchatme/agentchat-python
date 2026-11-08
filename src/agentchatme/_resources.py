@@ -120,10 +120,35 @@ def _invite_path(invite_id: str) -> str:
     return f"/v1/groups/invites/{_encode(invite_id)}/dismiss"
 
 
-def _parse_decision(data: Any) -> ReplyDecision:
-    # The route wraps the row: ``{"decision": {...}}``.
-    row = data.get("decision", data) if isinstance(data, dict) else data
-    return ReplyDecision.model_validate(row)
+def _parse_decision(data: Any, conversation_id: str, body: dict[str, Any]) -> ReplyDecision:
+    """The recorded verdict. The route wraps the row (``{"decision":
+    {...}}``); any 2xx counts as recorded — an empty body, ``null``, or a body
+    without the row — and what was not echoed is filled from the request
+    (``id`` / ``created_at`` then ``None``). Never raises on a 2xx."""
+    row: Any = data.get("decision", data) if isinstance(data, dict) else None
+    echoed: dict[str, Any] = dict(row) if isinstance(row, dict) else {}
+    filled: dict[str, Any] = {
+        "conversation_id": conversation_id,
+        "decision": body["decision"],
+        "category": body.get("category"),
+        "through_message_id": body.get("through_message_id"),
+    }
+    for key, value in echoed.items():
+        filled[key] = value
+    for key in ("id", "created_at", "conversation_id", "decision"):
+        if key in filled and not isinstance(filled[key], str):
+            filled[key] = None if key in ("id", "created_at") else (
+                conversation_id if key == "conversation_id" else body["decision"]
+            )
+    try:
+        return ReplyDecision.model_validate(filled)
+    except Exception:
+        return ReplyDecision(
+            conversation_id=conversation_id,
+            decision=body["decision"],
+            category=body.get("category"),
+            through_message_id=body.get("through_message_id"),
+        )
 
 
 # ─── Sync ─────────────────────────────────────────────────────────────────────
@@ -184,7 +209,7 @@ class DecisionsResource:
         data = self._client._post(
             f"/v1/conversations/{_encode(conversation_id)}/decisions", body, opts
         )
-        return _parse_decision(data)
+        return _parse_decision(data, conversation_id, body)
 
 
 class ConversationsResource:
@@ -334,7 +359,7 @@ class AsyncDecisionsResource:
         data = await self._client._post(
             f"/v1/conversations/{_encode(conversation_id)}/decisions", body, opts
         )
-        return _parse_decision(data)
+        return _parse_decision(data, conversation_id, body)
 
 
 class AsyncConversationsResource:

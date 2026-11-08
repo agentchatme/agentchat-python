@@ -2,9 +2,11 @@
 
 Over its per-agent connect budget the server answers the WebSocket upgrade
 with HTTP 429 and ``Retry-After``, or closes the socket with 1013 ("try
-again later") and a retry hint in the close reason after the HELLO. Either
-way the client backs off for the server's delay; it never goes
-``blocked``. Conformance: ``conformance/v1/connect-budget.cases.json``.
+again later") and a retry hint in the close reason after the HELLO
+(``rate_limited; retry_after=<seconds>``). Either way the client backs off
+for the server's delay; it never goes ``blocked``. A 1013 without the hint
+(the slow-consumer ``overload`` close) keeps the ordinary backoff.
+Conformance: ``conformance/v1/connect-budget.cases.json``.
 """
 
 from __future__ import annotations
@@ -18,7 +20,8 @@ from typing import Literal, Union
 CONNECT_BUDGET_CLOSE_CODE = 1013
 """Close code the server uses when the connect budget is spent."""
 CONNECT_BUDGET_DEFAULT_DELAY_MS = 60_000
-"""Delay when the server gave none (the budget's shortest window is a minute)."""
+"""Delay for a 429 that gave no usable ``Retry-After`` (the budget's
+shortest window is a minute)."""
 CONNECT_BUDGET_MIN_DELAY_MS = 1_000
 CONNECT_BUDGET_MAX_DELAY_MS = 3_600_000
 
@@ -81,15 +84,20 @@ def connect_budget_delay_ms(event: ConnectBudgetEvent) -> int | None:
     ordinary reconnect backoff applies). Pure.
 
     Close 1013: the first ``retry_after`` (or ``retry-after``), any case,
-    followed by ``=``, ``:`` or spaces and whole seconds. Upgrade 429:
-    ``Retry-After``. No usable hint: one minute. Clamped to [1 s, 1 h].
+    followed by ``=``, ``:`` or spaces and whole seconds; no hint: ``None``.
+    Upgrade 429: ``Retry-After``; none usable: one minute. Clamped to
+    [1 s, 1 h].
     """
     ms: int | None
     if isinstance(event, BudgetClose):
         if event.code != CONNECT_BUDGET_CLOSE_CODE:
             return None
         match = _HINT_RE.search(event.reason if isinstance(event.reason, str) else "")
-        ms = int(match.group(1)) * 1000 if match else None
+        if match is None:
+            # A 1013 without the hint is the server's slow-consumer
+            # ``overload`` close, not the budget: the ordinary backoff.
+            return None
+        ms = int(match.group(1)) * 1000
     else:
         if event.status != 429:
             return None

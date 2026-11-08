@@ -50,12 +50,23 @@ that upgrades without changing its code keeps working as before.
 - A `message.new` below the connection's seq anchor that nobody has handled
   is delivered late (out of order) instead of dropped, so the drain cursor
   never stalls behind it (TypeScript parity).
-- A frame is never acknowledged while no `message.new` handler is attached.
+- HELLO offers `ack` only while a `message.new` handler is attached (a
+  handler-less client is marked on send, as a handler-less 1.2 client
+  effectively was), and a capability holds only when offered and echoed. A
+  frame is never acknowledged while no `message.new` handler is attached.
 - A re-offer whose first copy is still with the handlers is not dispatched
-  again on a later connection either.
-- The connect budget: HTTP 429 before the upgrade and close 1013 after
-  HELLO wait for the server's delay (1 s to 1 h, default 1 min), never
-  `blocked`.
+  again on a later connection either, while that copy has run less than
+  `in_flight_adopt_ms` (15 min).
+- The connect budget: HTTP 429 before the upgrade (Retry-After; default
+  1 min) and a close 1013 carrying `retry_after=<s>` wait for the server's
+  delay (1 s to 1 h), never `blocked`. Any other 1013 (the slow-consumer
+  `overload` close) keeps the ordinary backoff.
+- Without `rewake`, `wake` frames keep the 1.2 validation.
+- `decisions.record` succeeds on any 2xx (an empty body, 204, or a body
+  without the row): fields the server did not echo come from the request,
+  `id` / `created_at` are then `None`.
+- `ReceiveLoop` single-run mode: an invite still pending after two
+  completed runs is dismissed (in memory).
 - `register` no longer sends `"description": null` / `"display_name": null`.
 
 ## [1.2.1] — 2026-11-08

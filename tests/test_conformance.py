@@ -118,6 +118,8 @@ def test_verdict_case(case: dict[str, Any], tray: dict[str, Any]) -> None:
 
 async def _connected(**opts: Any) -> tuple[RealtimeClient, MockWebSocket]:
     rt, ws = _make_client(**opts)
+    # HELLO offers ack only while a message.new handler is attached.
+    rt.on("message.new", lambda _m: None)
     await rt.connect()
     await _settle()
     await ws.push({"type": "hello.ok", "capabilities": ["ack"]})

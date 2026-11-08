@@ -272,9 +272,15 @@ class RealtimeOptions:
     default mode keeps ordering because unacked frames come back in order
     on the next drain. Such a flush fires ``on_sequence_gap`` with
     ``reason="connection_closed"``."""
+    in_flight_adopt_ms: int = 15 * 60_000
+    """A re-offer of a message whose first copy is still with the handlers
+    takes that copy's outcome instead of being dispatched again — on the same
+    connection always, on a later connection while the first copy has run
+    less than this. Past it a handler that never finishes does not swallow
+    every re-offer. Default 15 minutes."""
     capabilities: SocketCapabilityOptions | None = None
-    """Socket capabilities to offer in HELLO besides ``ack`` (always
-    offered); the server echoes what it accepted
+    """Socket capabilities to offer in HELLO besides ``ack`` (offered while a
+    ``message.new`` handler is attached); the server echoes what it accepted
     (:attr:`RealtimeClient.capabilities`).
 
     ``heartbeat`` (default ``True``): the server sends a ``heartbeat`` frame
@@ -554,9 +560,12 @@ class _BoundedLruSet:
 @dataclass
 class _InFlight:
     """A ``message.new`` whose handlers are running: the future its outcome
-    lands on (``True`` = every handler settled cleanly)."""
+    lands on (``True`` = every handler settled cleanly), the connection
+    generation it was dispatched on, and when (monotonic seconds)."""
 
     outcome: asyncio.Future[bool]
+    generation: int
+    started_at: float
 
 
 @dataclass
@@ -613,6 +622,7 @@ class RealtimeClient:
         liveness_timeout_ms: int | None = None,
         ack_on_receipt: bool | None = None,
         capabilities: SocketCapabilityOptions | None = None,
+        in_flight_adopt_ms: int | None = None,
         websocket_connect: Callable[..., Awaitable[Any]] | None = None,
     ) -> None:
         if options is None:
@@ -648,6 +658,9 @@ class RealtimeClient:
                 liveness_timeout_ms=liveness_timeout_ms,
                 ack_on_receipt=bool(ack_on_receipt),
                 capabilities=capabilities,
+                in_flight_adopt_ms=(
+                    in_flight_adopt_ms if in_flight_adopt_ms is not None else 15 * 60_000
+                ),
             )
 
         # A private copy: the client writes to its options (the auto-drain
@@ -695,9 +708,11 @@ class RealtimeClient:
         # Delivery-ack mode: on only when THIS connection's hello.ok echoed
         # the `ack` capability. Reset on every connect/close.
         self._ack_negotiated = False
-        # Every capability THIS connection's hello.ok echoed (empty between
-        # connections and against a legacy server).
+        # Every capability THIS connection's hello.ok echoed of the ones its
+        # HELLO offered (empty between connections and against a legacy
+        # server).
         self._negotiated: frozenset[str] = frozenset()
+        self._offered_this_hello: frozenset[str] = frozenset()
         # Set when the server's last close or upgrade answer was the connect
         # budget (D8): the delay it asked for, until the next hello.ok.
         self._rate_limited_ms: int | None = None
@@ -733,6 +748,9 @@ class RealtimeClient:
         # Async handler tasks, running off the receive loop; disconnect()
         # gives them a short grace, then cancels them.
         self._dispatch_tasks: set[asyncio.Future[Any]] = set()
+        # Bumped on every socket close: a repeat adopts a running first copy
+        # from an earlier connection only within in_flight_adopt_ms.
+        self._generation = 0
         # The tasks that wait for a message.new's async handlers and then
         # settle it (dedup, in-flight map, ack), with the handler tasks each
         # waits on. They end on their own once those handlers have ended.
@@ -885,12 +903,19 @@ class RealtimeClient:
         self._recv_task = asyncio.create_task(self._recv_loop())
 
     def _advertised_capabilities(self) -> list[str]:
+        """What this HELLO offers. ``ack`` only while a ``message.new``
+        handler is attached: a handler-less client is marked on send, as a
+        handler-less 1.2 client effectively was, and never builds a stored
+        backlog on the server."""
         offered = self._opts.capabilities or {}
-        caps = ["ack"]
+        caps: list[str] = []
+        if self._has_message_handler():
+            caps.append("ack")
         if offered.get("heartbeat", True) is not False:
             caps.append("heartbeat")
         if offered.get("rewake", False) is True:
             caps.append("rewake")
+        self._offered_this_hello = frozenset(caps)
         return caps
 
     def _resolve_connect_fn(self) -> Callable[..., Awaitable[Any]]:
@@ -1125,9 +1150,13 @@ class RealtimeClient:
                         # if the server echoed `ack`. A hello.ok without a
                         # capabilities list is a legacy server → stay in
                         # mark-on-send semantics and send no ack frames.
+                        # A capability holds only when this HELLO offered it
+                        # and the server echoed it.
                         caps = message.get("capabilities")
                         self._negotiated = frozenset(
-                            cap for cap in caps if isinstance(cap, str)
+                            cap
+                            for cap in caps
+                            if isinstance(cap, str) and cap in self._offered_this_hello
                         ) if isinstance(caps, list) else frozenset()
                         self._ack_negotiated = "ack" in self._negotiated
                         self._rate_limited_ms = None
@@ -1277,6 +1306,7 @@ class RealtimeClient:
             if self._opts.ack_on_receipt:
                 await self._flush_parked_frames("connection_closed")
             self._reset_order_states()
+            self._generation += 1
             if not self._disposed:
                 _log.debug(
                     "realtime socket closed (code=%s reason=%r ours=%s handshake_done=%s)",
@@ -1841,7 +1871,9 @@ class RealtimeClient:
         A frame the server sent malformed is surfaced through ``on_error``
         rather than handed to handlers as something it is not.
         """
-        problem = wake_payload_problem(message.get("payload"))
+        problem = wake_payload_problem(
+            message.get("payload"), rewake="rewake" in self._negotiated
+        )
         if problem is not None:
             await self._emit_error(
                 _RealtimeConnectionError(f"wake frame failed validation: {problem}")
@@ -1931,7 +1963,7 @@ class RealtimeClient:
         loop = asyncio.get_running_loop()
         message_id = _extract_message_id(message)
         handlers = list(self._handlers.get("message.new", ()))
-        first = self._inflight.get(message_id) if message_id is not None else None
+        first = self._adoptable(message_id)
 
         if first is None and not handlers:
             # No handler attached: nothing on this machine received the
@@ -1951,7 +1983,7 @@ class RealtimeClient:
 
         own: _InFlight | None = None
         if message_id is not None and self._dedup.enabled:
-            own = _InFlight(loop.create_future())
+            own = _InFlight(loop.create_future(), self._generation, time.monotonic())
             self._inflight[message_id] = own
 
         started: list[asyncio.Future[Any]] = []
@@ -2047,7 +2079,7 @@ class RealtimeClient:
         message_id = _extract_message_id(message)
         if message_id is None:
             return None
-        first = self._inflight.get(message_id)
+        first = self._adoptable(message_id)
         if first is None:
             return None
         if id(message) in self._drain_settlements:
@@ -2061,6 +2093,21 @@ class RealtimeClient:
 
             first.outcome.add_done_callback(ack_if_handled)
         return first.outcome
+
+    def _adoptable(self, message_id: str | None) -> _InFlight | None:
+        """The running first copy a repeat may adopt: one on this connection,
+        or one on an earlier connection that has run less than
+        ``in_flight_adopt_ms`` (past that, a handler that never finishes must
+        not swallow every re-offer: the repeat is dispatched afresh)."""
+        if message_id is None:
+            return None
+        running = self._inflight.get(message_id)
+        if running is None:
+            return None
+        if running.generation == self._generation:
+            return running
+        age_ms = (time.monotonic() - running.started_at) * 1000.0
+        return running if age_ms < self._opts.in_flight_adopt_ms else None
 
     def _settle_drain_row(
         self, message: dict[str, Any], settlement: asyncio.Future[bool]
@@ -2558,15 +2605,20 @@ def _log_handler_failure(task: asyncio.Future[Any]) -> None:
         )
 
 
-def wake_payload_problem(payload: Any) -> str | None:
+def wake_payload_problem(payload: Any, *, rewake: bool = True) -> str | None:
     """Why a ``wake`` frame's payload is not one, or ``None`` when it is.
 
-    Every wake carries ``reason`` and ``at`` (non-empty strings). A
-    ``reminder`` also carries ``conversation_id``, ``anchor_message_id`` and
-    an integer ``step``; an ``unanswered`` wake a list of conversation ids
-    (``conversation_ids``) and an integer ``step``. A reason this SDK does
-    not know yet is forwarded (its ``step``, when present, is an integer):
-    any wake means the same thing — read the tray. Pure.
+    Without ``rewake`` (a socket that did not negotiate it) the 1.2 rule,
+    unchanged: ``reason``, ``conversation_id``, ``anchor_message_id`` and
+    ``at`` are non-empty strings and ``step`` an integer.
+
+    With ``rewake``: every wake carries ``reason`` and ``at`` (non-empty
+    strings). A ``reminder`` also carries ``conversation_id``,
+    ``anchor_message_id`` and an integer ``step``; an ``unanswered`` wake a
+    list of conversation ids (``conversation_ids``) and an integer ``step``.
+    A reason this SDK does not know yet is forwarded (its ``step``, when
+    present, is an integer): any wake means the same thing — read the tray.
+    Pure.
     """
     if not isinstance(payload, dict):
         return "payload is not an object"
@@ -2575,11 +2627,19 @@ def wake_payload_problem(payload: Any) -> str | None:
         value = payload.get(key)
         return None if isinstance(value, str) and value else f"{key} is not a non-empty string"
 
+    step = payload.get("step")
+    integer_step = isinstance(step, int) and not isinstance(step, bool)
+    if not rewake:
+        return (
+            text("reason")
+            or text("conversation_id")
+            or text("anchor_message_id")
+            or text("at")
+            or (None if integer_step else "step is not an integer")
+        )
     problem = text("reason") or text("at")
     if problem is not None:
         return problem
-    step = payload.get("step")
-    integer_step = isinstance(step, int) and not isinstance(step, bool)
     reason = payload["reason"]
     if reason == "reminder":
         return (
