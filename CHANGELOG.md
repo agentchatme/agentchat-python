@@ -71,8 +71,11 @@ changes under **Types**.
   queue is back to half — the whole episode, so a later message never
   overtakes one left with the server; then the client fetches what it left
   (the REST drain, or one quiet reconnect without a REST client, which
-  hands parked frames over only under `ack_on_receipt`). Gap-fill rows are
-  always taken in. One notice per episode through `on_error`.
+  hands parked frames over only under `ack_on_receipt` and keeps new
+  messages refused, quietly, until the new socket's `hello.ok`; frames
+  still read off the closing socket start no new episode). Gap-fill rows are always
+  taken in. One notice per episode through `on_error`.
+  `RealtimeClient.intake_paused` tells whether new messages are refused.
 - The first `message.new` handler attached after a HELLO that offered no
   `ack` (also while that HELLO is being sent) triggers one quiet reconnect
   (no error, no backoff step) so the next HELLO negotiates delivery acks.
@@ -142,14 +145,20 @@ changes under **Types**.
   one, which the cycle simply stops waiting for). `status().recent_cycles`
   keeps the last 20 cycle summaries, newest last. `gate.run_async(...,
   timeout_ms=)` bounds the model call. Either deadline: `None` (left out) is
-  the default, `0` turns it off, a negative value raises `ValueError`.
+  the default, `0` (or `math.inf`) turns it off, a negative value raises
+  `ValueError`. `status().socket["intake_paused"]` shows whether the socket
+  refuses new messages right now (backpressure).
 - An abandoned cycle records nothing more: `gate.run` / `gate.run_async`
   take `cancel=` (anything with `is_set()`), and once it is set record no
   further verdict and hand back no reply (the rest count as undecided); the
-  loop passes its cycle's. A verdict still being recorded is never aborted
-  and holds its card out of the next gate, so no verdict is recorded twice.
-- A `TurnTracker.release` from another thread hands the loop's slot work
-  over to the loop's event loop (the waiting turn then starts).
+  loop passes its cycle's, and `stop()` sets it too (a gate mid-way records
+  no further verdict; its cards stay for the next start; a pending model
+  call is told through its cancel handle). A verdict still being recorded
+  is never aborted and holds its card out of the next gate, so no verdict
+  is recorded twice.
+- `ReceiveLoop.release_turn`, `ReceiveLoop.wake` and a `TurnTracker.release`
+  are safe from another thread: the work (the slot, the wake) runs on the
+  loop's event loop, so the waiting turn starts and the wake is not lost.
 - `inbox.tray(include_invites=True)` sends `invites=1`: a pending invite then
   also ends a held read (default off, as before).
 - `register`, `verify`, `recover` and `recover_verify` take `timeout_ms` and

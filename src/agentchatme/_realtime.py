@@ -799,6 +799,10 @@ class RealtimeClient:
         # until the count is back to half, then fetches what it left.
         self._queued_messages = 0
         self._shedding = False
+        # A backpressure refetch reconnect is under way (no REST client): new
+        # messages stay refused until the new socket is up, so none taken in
+        # while the old one closes overtakes one left with the server.
+        self._refetch_pending = False
         self._drain_again = False
         # Bumped on every socket close: a repeat adopts a running first copy
         # from an earlier connection only within in_flight_adopt_ms.
@@ -1200,6 +1204,9 @@ class RealtimeClient:
                 if not self._authenticated:
                     if message.get("type") == "hello.ok":
                         self._authenticated = True
+                        # The new socket is up: a refetch reconnect is over,
+                        # the server re-offers what was left with it.
+                        self._refetch_pending = False
                         # NOT reset here. A successful handshake proves the
                         # credential, not the connection — see
                         # _STABLE_CONNECTION_S. The counter clears from the
@@ -1862,6 +1869,15 @@ class RealtimeClient:
         return self._rate_limited_ms
 
     @property
+    def intake_paused(self) -> bool:
+        """True while backpressure refuses new messages: from the moment the
+        handler queue filled (``max_queued_messages``) until it is back to
+        half and, without a REST client, the reconnect that fetches what was
+        left is up. Refused messages stay on the server. A host can alarm
+        when it stays true (handlers that hang)."""
+        return self._shedding or self._refetch_pending
+
+    @property
     def ack_negotiated(self) -> bool:
         """True while the current connection's ``hello.ok`` echoed the
         ``ack`` capability: the server keeps envelopes ``stored`` until this
@@ -1883,6 +1899,7 @@ class RealtimeClient:
         """
         self._disposed = True
         self._opts.reconnect = False
+        self._refetch_pending = False
         await self._set_state("stopped")
 
         current = asyncio.current_task()
@@ -2151,14 +2168,20 @@ class RealtimeClient:
         return self._queued_messages >= self._opts.max_queued_messages
 
     def _refusing_intake(self) -> bool:
-        """No new message is taken in: the queue is full, or a shedding
-        episode has not ended (the queue is not back to half yet)."""
-        return self._shedding or self._queue_full()
+        """No new message is taken in: the queue is full, a shedding episode
+        has not ended (the queue is not back to half yet), or a refetch
+        reconnect is under way (until the new socket is up)."""
+        return self._shedding or self._refetch_pending or self._queue_full()
 
     def _start_shedding(self) -> None:
         """The queue is full: messages are left with the server from here
         (one notice per episode)."""
         if self._shedding:
+            return
+        if self._refetch_pending and not self._queue_full():
+            # A frame read off the socket a refetch reconnect is closing:
+            # refused quietly, no new episode (the queue is not full; the new
+            # socket's hello.ok re-opens intake and re-offers what is stored).
             return
         self._shedding = True
         self._spawn(
@@ -2185,6 +2208,7 @@ class RealtimeClient:
             self._spawn(self.drain_offline_envelopes())
         elif self._ws is not None and self._authenticated:
             self._quiet_reconnect = "backpressure"
+            self._refetch_pending = True
             self._spawn(
                 self._close_socket(
                     self._ws, 1000, "client reconnects to fetch messages it left with the server"

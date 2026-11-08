@@ -973,3 +973,67 @@ async def test_a_handler_attached_while_the_hello_is_sent_still_renegotiates() -
         assert hellos and "ack" in hellos[0]["capabilities"]
     finally:
         await rt.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_intake_stays_refused_through_a_refetch_close_until_the_new_socket_is_up() -> None:
+    class PoliteClose(MockWebSocket):
+        """A close that is answered later: frames keep arriving meanwhile."""
+
+        async def close(self, code: int = 1000, reason: str = "") -> None:
+            if self.closed:
+                return
+            self.closed = True
+            self.close_code = code
+            self.close_reason = reason
+
+        async def finish_close(self) -> None:
+            await self._inbox.put(None)
+
+    first, second = PoliteClose(), MockWebSocket()
+    rt, handed = _client_with_sockets([first, second], ack_on_receipt=True, max_queued_messages=2)
+    sleep = ControlledSleep(hold=True)
+    rt._sleep = sleep
+    entered: list[str] = []
+    hang = asyncio.Event()
+
+    def handler(m: dict[str, Any]) -> Any:
+        mid = m["payload"]["id"]
+        entered.append(mid)
+        return hang.wait() if mid.startswith("b") else None
+
+    rt.on("message.new", handler)
+    try:
+        await rt.connect()
+        await _flush()
+        await first.push({"type": "hello.ok", "capabilities": ["ack"]})
+        for seq in (1, 2, 3):
+            await first.push(message_new("b", seq, id=f"b{seq}"))
+        await _flush()
+        assert rt._shedding and rt.intake_paused
+        hang.set()
+        await _until(lambda: first.closed)
+        # Back to half, no REST client: the refetch close is under way. The
+        # old socket is still read, but nothing new is taken in.
+        assert first.close_reason == "client reconnects to fetch messages it left with the server"
+        assert not rt._shedding and rt.intake_paused
+        await _until(lambda: rt._queued_messages == 0)  # every handler done: nothing would end a new episode
+        await first.push(message_new("a", 1, id="a1"))
+        await _flush()
+        assert "a1" not in entered and "a1" not in _ack_frames(first)
+        # Refused quietly: no new shedding episode (with an empty queue it
+        # would never end — a permanent stall).
+        assert not rt._shedding and rt._queued_messages == 0
+        await first.finish_close()
+        await _until(lambda: len(handed) == 2)
+        await _flush()
+        await second.push({"type": "hello.ok", "capabilities": ["ack"]})
+        await _flush()
+        assert not rt.intake_paused and not rt._shedding  # the new socket is up
+        await second.push(message_new("a", 1, id="a1"))
+        await _flush()
+        assert "a1" in entered
+    finally:
+        hang.set()
+        sleep.release()
+        await rt.disconnect()

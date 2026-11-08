@@ -828,15 +828,104 @@ async def test_a_release_from_another_thread_starts_the_waiting_turn() -> None:
     await loop.stop()
 
 
+@pytest.mark.asyncio
+async def test_release_turn_and_wake_from_another_thread_reach_the_loop() -> None:
+    import threading
+
+    client = _LoopClient([_tray([_card("c1", "m1")])])
+    turns = _Turns()
+    events: list[dict[str, Any]] = []
+    loop = _loop(
+        client, call_model=lambda _p: _answer(("c1", "reply")), start_turn=turns, on_event=events.append
+    )
+    await loop.start()
+    await _cycle(loop)
+    assert len(turns.requests) == 1
+    cycles = loop.status().coalescer["cycles"]
+    errors: list[BaseException] = []
+    results: list[bool] = []
+
+    def other() -> None:
+        try:
+            results.append(loop.release_turn("conversation:c1"))
+            loop.wake()
+        except BaseException as err:
+            errors.append(err)
+
+    worker = threading.Thread(target=other)
+    worker.start()
+    worker.join()
+    await asyncio.sleep(0.05)
+    await loop.idle()
+    assert errors == [] and results == [True]
+    sources = [e["source"] for e in events if e["type"] == "wake"]
+    assert "more" in sources and "external" in sources
+    # The wake was not lost: a cycle ran, and the released card was gated again.
+    assert loop.status().coalescer["cycles"] > cycles and len(turns.requests) == 2
+    await loop.stop()
+
+
+def test_status_shows_whether_the_socket_refuses_new_messages() -> None:
+    from agentchatme import RealtimeClient
+
+    socket = RealtimeClient(api_key="sk_test", reconnect=False)
+    loop = _loop(_LoopClient([_tray([])]), call_model=lambda _p: "", start_turn=_Turns(), socket=socket)
+    shown = loop.status().socket
+    assert shown is not None and shown["intake_paused"] is False
+    socket._shedding = True  # backpressure refuses new messages
+    assert loop.status().socket["intake_paused"] is True  # type: ignore[index]
+
+
+@pytest.mark.asyncio
+async def test_stop_mid_gate_records_no_further_verdict_and_tells_the_model_call() -> None:
+    cards = [_card(f"c{i}", f"m{i}") for i in range(3)]
+    calls: list[str] = []
+
+    class SlowDecisions:
+        async def record(self, conversation_id: str, **_kw: Any) -> Any:
+            calls.append(conversation_id)
+            await asyncio.sleep(0.03)
+            return {"id": "d"}
+
+    client = _LoopClient([_tray(cards)])
+    client.decisions = SlowDecisions()  # type: ignore[assignment]
+    answer = json.dumps({"decisions": [{"conversation_id": c["conversation_id"], "decision": "defer"} for c in cards]})
+    loop = _loop(client, call_model=lambda _p: answer, start_turn=_Turns())
+    await loop.start()
+    loop.wake()
+    await asyncio.sleep(0.045)  # c0 recorded, c1 on its way
+    await loop.stop()
+    await asyncio.sleep(0.05)
+    assert calls == ["c0", "c1"]  # c1 finished (never aborted), c2 never sent
+
+    told: list[bool] = []
+
+    async def waits(_prompt: str, *, cancel: asyncio.Event) -> str:
+        await cancel.wait()
+        told.append(True)
+        return answer
+
+    client2 = _LoopClient([_tray(cards)])
+    loop2 = _loop(client2, call_model=waits, start_turn=_Turns())
+    await loop2.start()
+    loop2.wake()
+    await asyncio.sleep(0.02)
+    await loop2.stop()
+    assert told == [True] and client2.decisions.recorded == []
+
+
 @pytest.mark.parametrize("name", ["gate_call_timeout_ms", "cycle_timeout_ms"])
 def test_timeouts_none_is_the_default_zero_is_off_negative_is_an_error(name: str) -> None:
     client = _LoopClient([_tray([])])
     default = _loop(client, call_model=lambda _p: "", start_turn=_Turns())
     off = _loop(client, call_model=lambda _p: "", start_turn=_Turns(), **{name: 0})
+    infinite = _loop(client, call_model=lambda _p: "", start_turn=_Turns(), **{name: float("inf")})
     if name == "gate_call_timeout_ms":
-        assert default._gate_call_timeout_ms == 60_000 and off._gate_call_timeout_ms == 0
+        assert default._gate_call_timeout_ms == 60_000
+        assert off._gate_call_timeout_ms == 0 and infinite._gate_call_timeout_ms == 0
     else:
-        assert default._cycle_timeout_s == 600 and off._cycle_timeout_s == 0
+        assert default._cycle_timeout_s == 600
+        assert off._cycle_timeout_s == 0 and infinite._cycle_timeout_s == 0
     with pytest.raises(ValueError):
         _loop(client, call_model=lambda _p: "", start_turn=_Turns(), **{name: -1})
 

@@ -587,7 +587,7 @@ class ReceiveLoop:
 
     def wake(self) -> None:
         """A wake the integration heard itself (a wake webhook, a timer of
-        its own). Call it on the loop's thread."""
+        its own). Safe to call from another thread."""
         self._wake_from("external")
 
     async def stop(self) -> None:
@@ -601,6 +601,12 @@ class ReceiveLoop:
         if self._stopped:
             return
         self._stopped = True
+        # The running cycle stops acting: a gate mid-way records no further
+        # verdict (its cards stay on the tray for the next start) and a
+        # pending model call is told through its cancel handle. A verdict
+        # already on its way is left to finish.
+        self._cycle_cancel.set()
+        self._cycle_cancel_thread.set()
         self._coalescer.stop()
         self._clear_more_timer()
         self._unsubscribe_release()
@@ -628,7 +634,9 @@ class ReceiveLoop:
         """Let go of a turn whose end the runtime will never confirm (an
         operator's call). ``key`` is ``conversation:<id>`` or
         ``invite:<id>``. Nothing is recorded for it, its slot is freed at
-        once (a waiting turn starts), and its card may be gated again."""
+        once (a waiting turn starts), and its card may be gated again. Safe
+        to call from another thread: the work runs on the loop's event
+        loop."""
         released = self._tracker.release(key)
         if released:
             self._wake_from("more")
@@ -649,6 +657,7 @@ class ReceiveLoop:
                 "state": rt.state,
                 "ack_negotiated": rt.ack_negotiated,
                 "capabilities": sorted(rt.capabilities),
+                "intake_paused": rt.intake_paused,
             },
             coalescer={
                 "state": self._coalescer.state,
@@ -724,6 +733,13 @@ class ReceiveLoop:
         extra: dict[str, Any] | None = None,
     ) -> None:
         if self._stopped:
+            return
+        hop = self._hop()
+        if hop is not None:
+            # Called from another thread (release_turn, wake): the wake runs
+            # on the loop's own event loop.
+            with contextlib.suppress(RuntimeError):  # the event loop has closed
+                hop.call_soon_threadsafe(self._wake_from, source, conversation_id, extra)
             return
         event: ReceiveLoopEvent = {"type": "wake", "source": source}
         if conversation_id:
@@ -1091,19 +1107,27 @@ class ReceiveLoop:
             if not await admit():
                 self._active.discard(handle)
 
-    def _on_release_any_thread(self, handle: TurnHandle) -> None:
-        """A tracker release, from whichever thread called it: the slot work
-        runs on the loop's own event loop."""
+    def _hop(self) -> asyncio.AbstractEventLoop | None:
+        """The loop's event loop when called from somewhere else (another
+        thread), ``None`` when already on it (or before :meth:`start`)."""
         loop = self._event_loop
+        if loop is None:
+            return None
         try:
             running: asyncio.AbstractEventLoop | None = asyncio.get_running_loop()
         except RuntimeError:
             running = None
-        if loop is None or running is loop:
+        return None if running is loop else loop
+
+    def _on_release_any_thread(self, handle: TurnHandle) -> None:
+        """A tracker release, from whichever thread called it: the slot work
+        runs on the loop's own event loop."""
+        hop = self._hop()
+        if hop is None:
             self._on_turn_released(handle)
             return
         with contextlib.suppress(RuntimeError):  # the event loop has closed
-            loop.call_soon_threadsafe(self._on_turn_released, handle)
+            hop.call_soon_threadsafe(self._on_turn_released, handle)
 
     def _on_turn_released(self, handle: TurnHandle) -> None:
         waiting = [entry for entry in self._waiting if entry[0] is not handle]
