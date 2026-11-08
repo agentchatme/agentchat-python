@@ -524,9 +524,7 @@
     {
       "expect": {
         "ack_on_receipt": {
-          "cursor_acks": [
-            "del_000000000000000000000000000d0002"
-          ],
+          "cursor_acks": [],
           "dispatched": [
             "msg_ops0slow00001",
             "msg_ops0slow00002"
@@ -537,9 +535,7 @@
           ]
         },
         "default": {
-          "cursor_acks": [
-            "del_000000000000000000000000000d0002"
-          ],
+          "cursor_acks": [],
           "dispatched": [
             "msg_ops0slow00001",
             "msg_ops0slow00002"
@@ -610,14 +606,12 @@
           }
         ]
       ],
-      "why": "Seq 2 arrives live and its handler is slow (it calls a model). Meanwhile the same stored row comes back through the REST drain, as it does after every reconnect because the server also pushes its backlog on the socket. The second copy is not handed to the handler: it takes the first copy's outcome, so the cursor covers it once that handler finished."
+      "why": "Seq 2 arrives live and its handler is slow (it calls a model). Meanwhile the same stored row comes back through the REST drain, as it does after every reconnect because the server also pushes its backlog on the socket. The second copy is not handed to the handler again, and nothing waits for the first: the cursor stops at the row (the next drain finds it in the dedup cache), and the live copy is acknowledged when its handler finished."
     },
     {
       "expect": {
         "ack_on_receipt": {
-          "cursor_acks": [
-            "del_00000000000000000000000000090001"
-          ],
+          "cursor_acks": [],
           "dispatched": [
             "msg_crew0slow0001"
           ],
@@ -626,9 +620,7 @@
           ]
         },
         "default": {
-          "cursor_acks": [
-            "del_00000000000000000000000000090001"
-          ],
+          "cursor_acks": [],
           "dispatched": [
             "msg_crew0slow0001"
           ],
@@ -683,7 +675,7 @@
           }
         ]
       ],
-      "why": "The conversation's first live frame has a slow handler, and the REST drain brings the same row while it runs: below the anchor, not yet in the dedup cache. It is not handed over again; the cursor covers it once the first copy's handler finished."
+      "why": "The conversation's first live frame has a slow handler, and the REST drain brings the same row while it runs: below the anchor, not yet in the dedup cache. It is not handed over again and the drain does not wait for the first copy: the cursor stops at the row."
     },
     {
       "expect": {
@@ -692,12 +684,14 @@
           "dispatched": [
             "msg_gone0wait0001",
             "msg_gone0wait0003",
-            "msg_gone0wait0005"
+            "msg_gone0wait0004",
+            "msg_gone0wait0006"
           ],
           "ws_acks": [
             "msg_gone0wait0001",
             "msg_gone0wait0003",
-            "msg_gone0wait0005"
+            "msg_gone0wait0004",
+            "msg_gone0wait0006"
           ]
         },
         "default": {
@@ -705,14 +699,21 @@
           "dispatched": [
             "msg_gone0wait0001",
             "msg_gone0wait0003",
-            "msg_gone0wait0005"
+            "msg_gone0wait0004",
+            "msg_gone0wait0006"
+          ],
+          "ws_acks": [
+            "msg_gone0wait0001",
+            "msg_gone0wait0004",
+            "msg_gone0wait0003",
+            "msg_gone0wait0006"
           ]
         }
       },
       "hold": [
         "msg_gone0wait0003"
       ],
-      "name": "frame-arrives-while-a-lapsed-gap-is-handled",
+      "name": "frames-arrive-while-a-lapsed-gap-is-handled",
       "steps": [
         {
           "op": "connect"
@@ -756,22 +757,39 @@
           "op": "frame",
           "payload": {
             "content": {
-              "text": "message 5"
+              "text": "message 4"
             },
             "conversation_id": "conv_group0gone0001",
-            "created_at": "2026-11-04T23:05:00.000Z",
-            "id": "msg_gone0wait0005",
+            "created_at": "2026-11-04T23:04:00.000Z",
+            "id": "msg_gone0wait0004",
             "sender": "nova",
-            "seq": 5,
+            "seq": 4,
+            "type": "text"
+          }
+        },
+        {
+          "op": "frame",
+          "payload": {
+            "content": {
+              "text": "message 6"
+            },
+            "conversation_id": "conv_group0gone0001",
+            "created_at": "2026-11-04T23:06:00.000Z",
+            "id": "msg_gone0wait0006",
+            "sender": "nova",
+            "seq": 6,
             "type": "text"
           }
         },
         {
           "message_id": "msg_gone0wait0003",
           "op": "release"
+        },
+        {
+          "op": "gap_window_lapses"
         }
       ],
-      "why": "Seq 3 waits on a gap that is never filled. When the gap window lapses, seq 3 is handed over and its handler is slow. Seq 5 arrives while it runs. It must reach the handler: under ack_on_receipt it was acked at receipt, so a client that clears it with the buffer loses it for good."
+      "why": "Seq 3 waits on a gap that is never filled. When the gap window lapses, seq 3 is handed over and its handler is slow. Meanwhile seq 4 arrives in order and seq 6 behind a new hole. Both must reach the handler (under ack_on_receipt they were acked at receipt, so a client that clears them with the buffer loses them): seq 4 at once, seq 6 after a gap window of its own."
     }
   ]
 }

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 from typing import Any
 
 import pytest
@@ -430,10 +431,16 @@ def _row(seq: int, *, mid: str | None = None) -> dict[str, Any]:
 
 @pytest.mark.parametrize("ack_on_receipt", [False, True])
 @pytest.mark.asyncio
-async def test_a_drain_row_repeat_of_a_running_live_message_is_not_dispatched_again(
+async def test_a_drain_repeat_of_a_running_message_is_not_dispatched_and_never_waited_for(
     ack_on_receipt: bool,
 ) -> None:
-    api = MockAsyncClient(sync_pages=[[_row(2)]])
+    # The live copy of seq 2 has a slow handler. The drain brings the same
+    # row and, after it, a row of another conversation. The repeat is not
+    # dispatched, the drain does not wait for the live handler (the other
+    # conversation's row is handled meanwhile and the drain finishes), and
+    # the cursor stops at the repeat; the next drain covers it as a dedup hit.
+    other = {**_row(1, mid="msg_d1"), "conversation_id": "d", "delivery_id": "del_d1"}
+    api = MockAsyncClient(sync_pages=[[_row(2), other], [_row(2), other]])
     rt, ws = await connected(
         capabilities=["ack"], client=api, auto_drain_on_connect=False, ack_on_receipt=ack_on_receipt
     )
@@ -450,19 +457,77 @@ async def test_a_drain_row_repeat_of_a_running_live_message_is_not_dispatched_ag
         await ws.push(message_new("c", 1))
         await ws.push(message_new("c", 2))  # in order; its handler is slow
         await _settle()
-        drain = asyncio.create_task(rt.drain_offline_envelopes())
-        await _settle()
-        assert calls == ["msg_1", "msg_2"]
+        await asyncio.wait_for(rt.drain_offline_envelopes(), timeout=1.0)
+        assert calls == ["msg_1", "msg_2", "msg_d1"]
         assert api.sync_ack_calls == []
 
         release.set()
-        await asyncio.wait_for(drain, timeout=1.0)
         await _settle()
-        assert calls == ["msg_1", "msg_2"]
-        assert api.sync_ack_calls == ["del_2"]
         assert _ack_frames(ws) == ["msg_1", "msg_2"]
+        await asyncio.wait_for(rt.drain_offline_envelopes(), timeout=1.0)
+        assert calls == ["msg_1", "msg_2", "msg_d1"]
+        assert api.sync_ack_calls == ["del_d1"]
     finally:
         release.set()
+        await rt.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_a_live_repeat_of_a_first_copy_that_failed_is_never_acked() -> None:
+    # The first copy is a drain row whose handler fails; the server's
+    # backlog push brings the same message live, below the anchor, while it
+    # runs. The repeat adopts the first copy, so it must not be acked.
+    api = MockAsyncClient(sync_pages=[[_row(1)]])
+    rt, ws = await connected(capabilities=["ack"], client=api, auto_drain_on_connect=False)
+    release = asyncio.Event()
+
+    async def fails(_m: dict[str, Any]) -> None:
+        await release.wait()
+        raise RuntimeError("model call failed")
+
+    rt.on("message.new", fails)
+    try:
+        drain = asyncio.create_task(rt.drain_offline_envelopes())
+        await _settle()
+        await ws.push(message_new("c", 1))
+        await _settle()
+        release.set()
+        await asyncio.wait_for(drain, timeout=1.0)
+        await _settle()
+        assert _ack_frames(ws) == []
+        assert api.sync_ack_calls == []
+    finally:
+        release.set()
+        await rt.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_a_copy_on_a_later_connection_is_dispatched_afresh_while_the_first_runs() -> None:
+    # Adoption is per connection: a handler that never finishes must not
+    # swallow every re-offer of its message.
+    rt, _ws = await connected(capabilities=["ack"])
+    entered = asyncio.Event()
+    calls: list[str] = []
+
+    async def first_hangs(m: dict[str, Any]) -> None:
+        calls.append(m["payload"]["id"])
+        if len(calls) == 1:
+            entered.set()
+            await asyncio.Event().wait()
+
+    rt.on("message.new", first_hangs)
+    first = asyncio.create_task(rt._deliver_message_new(message_new("c", 1), ws_ack=False))
+    try:
+        await entered.wait()
+        repeat = rt._deliver_message_new(message_new("c", 1), ws_ack=False)
+        assert await asyncio.wait_for(repeat, timeout=1.0) is False
+        assert calls == ["msg_1"]  # same connection: adopted, not waited for
+        rt._generation += 1  # what a socket close does
+        later = rt._deliver_message_new(message_new("c", 1), ws_ack=False)
+        assert await asyncio.wait_for(later, timeout=1.0) is True
+        assert calls == ["msg_1", "msg_1"]
+    finally:
+        first.cancel()
         await rt.disconnect()
 
 
@@ -543,8 +608,8 @@ async def test_a_failed_first_copy_leaves_the_repeat_unacked_and_a_later_copy_is
 
 
 @pytest.mark.asyncio
-async def test_a_cancelled_first_copy_releases_the_repeat_as_not_handled() -> None:
-    rt, _ws = await connected(capabilities=["ack"])
+async def test_a_cancelled_first_copy_counts_as_not_handled() -> None:
+    rt, ws = await connected(capabilities=["ack"])
     entered = asyncio.Event()
 
     async def hangs(_m: dict[str, Any]) -> None:
@@ -554,13 +619,12 @@ async def test_a_cancelled_first_copy_releases_the_repeat_as_not_handled() -> No
     rt.on("message.new", hangs)
     try:
         frame = message_new("c", 1)
-        first = asyncio.create_task(rt._deliver_message_new(frame, ws_ack=False))
+        first = asyncio.create_task(rt._deliver_message_new(frame, ws_ack=True))
         await entered.wait()
-        repeat = asyncio.create_task(rt._deliver_message_new(dict(frame), ws_ack=False))
-        await _settle()
-        assert not repeat.done()
+        assert rt._adopt_in_flight(dict(frame), ws_ack=True) is True
         first.cancel()
-        assert await asyncio.wait_for(repeat, timeout=1.0) is False
+        await _settle()
+        assert _ack_frames(ws) == []
         assert rt._inflight == {}
     finally:
         await rt.disconnect()
@@ -706,11 +770,10 @@ async def test_the_missing_seq_arriving_while_a_resolved_gap_is_handled_is_not_a
 
 
 @pytest.mark.asyncio
-async def test_disconnect_dispatches_frames_that_park_during_its_own_flush() -> None:
-    # disconnect() flushes parked frames while the socket is still open; a
-    # frame that parks during that flush (the handler for an earlier one is
-    # awaited) was cleared with the ordering state. Acked at receipt, it
-    # must reach the handler.
+async def test_disconnect_takes_no_frame_in_once_it_began() -> None:
+    # disconnect() flushes parked frames while the socket is still open. A
+    # frame that arrives meanwhile is neither acked nor dispatched (the
+    # server keeps it), so the flush ends on a fixed set.
     rt, ws = await connected(capabilities=["ack"], ack_on_receipt=True)
     release = asyncio.Event()
     entered = asyncio.Event()
@@ -732,7 +795,102 @@ async def test_disconnect_dispatches_frames_that_park_during_its_own_flush() -> 
     await _settle()
     release.set()
     await asyncio.wait_for(stopping, timeout=3.0)
-    assert seen == [1, 3, 6]
+    assert seen == [1, 3]
+    assert _ack_frames(ws) == ["msg_1", "msg_3"]
+
+
+@pytest.mark.parametrize("ack_on_receipt", [False, True])
+@pytest.mark.asyncio
+async def test_disconnect_returns_promptly_while_frames_keep_arriving(ack_on_receipt: bool) -> None:
+    rt, ws = await connected(capabilities=["ack"], ack_on_receipt=ack_on_receipt)
+
+    async def slow(_m: dict[str, Any]) -> None:
+        await asyncio.sleep(0.03)
+
+    rt.on("message.new", slow)
+    await ws.push(message_new("c", 1))
+    await asyncio.sleep(0.05)
+    await ws.push(message_new("c", 3))  # parks on the hole at 2
+    await _settle()
+    started = time.monotonic()
+    stopping = asyncio.create_task(rt.disconnect())
+    seq = 4
+    while not stopping.done() and time.monotonic() - started < 2.0:
+        await ws.push(message_new("c", seq))
+        seq += 1
+        await asyncio.sleep(0.01)
+    await asyncio.wait_for(stopping, timeout=3.0)
+    assert time.monotonic() - started < 0.5
+
+
+@pytest.mark.asyncio
+async def test_a_handler_that_disconnects_while_a_repeat_of_its_message_arrives_returns(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("agentchatme._realtime._GAP_FILL_WINDOW_S", 0.05)
+    rt, ws = await connected(capabilities=["ack"])
+    entered = asyncio.Event()
+    go = asyncio.Event()
+    returned = asyncio.Event()
+
+    async def h(m: dict[str, Any]) -> None:
+        if m["payload"]["seq"] == 3:
+            entered.set()
+            await go.wait()
+            await rt.disconnect()
+            returned.set()
+
+    rt.on("message.new", h)
+    await ws.push(message_new("c", 1))
+    await ws.push(message_new("c", 3))
+    await asyncio.wait_for(entered.wait(), timeout=1.0)  # the lapsed gap handed 3 over
+    await ws.push(message_new("c", 3))  # the server repeats it while its handler runs
+    await _settle()
+    go.set()
+    await asyncio.wait_for(returned.wait(), timeout=2.0)
+    assert rt.state == "stopped"
+    assert rt._inflight == {}
+
+
+@pytest.mark.asyncio
+async def test_a_frame_behind_a_new_hole_gets_its_own_gap_window(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # While a lapsed gap's handler for seq 3 runs, seq 4 arrives in order and
+    # seq 6 behind a new hole. Seq 4 is dispatched at once by the receive
+    # loop; seq 6 waits for its own gap window and its own report.
+    monkeypatch.setattr("agentchatme._realtime._GAP_FILL_WINDOW_S", 0.1)
+    gaps: list[Any] = []
+    rt, ws = await connected(capabilities=["ack"], on_sequence_gap=gaps.append)
+    release = asyncio.Event()
+    entered = asyncio.Event()
+    seen: list[int] = []
+
+    async def slow(m: dict[str, Any]) -> None:
+        seen.append(m["payload"]["seq"])
+        if m["payload"]["seq"] == 3:
+            entered.set()
+            await release.wait()
+
+    rt.on("message.new", slow)
+    try:
+        await ws.push(message_new("c", 1))
+        await ws.push(message_new("c", 3))
+        await asyncio.wait_for(entered.wait(), timeout=1.0)
+        await ws.push(message_new("c", 4))
+        await ws.push(message_new("c", 6))
+        await _settle()
+        assert seen == [1, 3, 4]
+        release.set()
+        await _settle()
+        assert seen == [1, 3, 4]
+        assert [g.expected_seq for g in gaps] == [2]
+        await asyncio.sleep(0.3)
+        assert seen == [1, 3, 4, 6]
+        assert [g.expected_seq for g in gaps] == [2, 5]
+    finally:
+        release.set()
+        await rt.disconnect()
 
 
 # ─────────────── a guest in a host process ───────────────

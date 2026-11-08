@@ -23,15 +23,20 @@ major. The on-the-wire API is versioned separately under `/v1/...`.
   stored backlog on the socket and the REST drain brings the same rows; the
   dedup cache is filled only once a handler succeeds, so with a slow handler
   (a model call) the second copy was dispatched again, and a script that
-  replies per message replied twice. A copy whose first copy is still with
-  the handlers is now not dispatched: it takes that outcome. Success acks it
-  (an ack frame for a live copy, the cursor for a drain row); a failure or a
-  cancelled first copy leaves it unacked so the server re-offers it. A copy
-  waits on the first copy only where it waited on its own handler call
-  before; a live repeat below the anchor, which used to be dropped at once,
-  still never holds up the socket and is acked when the first copy
-  finished. With `dedup_cache_size=0` every copy is dispatched, as before.
-  Matches the TypeScript SDK.
+  replies per message replied twice. A copy that arrives on the same
+  connection while its first copy is still with the handlers is now not
+  dispatched, and nothing waits for the first copy: progress beats dedup.
+  A live copy is acked once the first copy finished cleanly, never if it
+  failed. A drain row's cursor stops at the row unless the first copy
+  already finished cleanly (the next drain covers it as a dedup hit). If the
+  first copy fails, the repeat is not acked either: in the default mode the
+  server re-offers the message; under `ack_on_receipt` the live copy was
+  already acked at receipt, so it is not re-offered, as with any failed
+  handler in that mode. A copy on a later connection is
+  dispatched afresh even if the first copy is still running, so a handler
+  that never finishes cannot swallow every re-offer. In-flight entries live
+  only while handlers run; with `dedup_cache_size=0` every copy is
+  dispatched, as before. Matches the TypeScript SDK.
 - Two ordering-state races between concurrent copies are closed: the
   per-conversation cursor never moves backwards when a slower copy finishes
   after a faster one moved it on, and a caller that resumes after a socket
@@ -44,11 +49,17 @@ major. The on-the-wire API is versioned separately under `/v1/...`.
   each handler in turn, and the receive loop keeps running meanwhile. A frame
   that parked during those awaits was then cleared with the buffer: acked at
   receipt, it was never handled. In the default mode it was left unacked and
-  waited for the next reconnect. Each frame is now taken out of the buffer
-  before it is handed over, and the client keeps going until no frame is
-  parked, so such frames are handed over too. This also ends a crash: when
-  the missing seq arrived meanwhile, the receive loop could take buffered
-  frames the gap task still expected (`KeyError`), or hand them over twice.
+  waited for the next reconnect. Now the frames parked when the gap resolved
+  are each taken out of the buffer, and the cursor moves past each, before
+  its handler is awaited. A frame that arrives in order meanwhile is
+  dispatched by the receive loop at once; one behind a new hole parks with a
+  gap window and report of its own; nothing is cleared. `disconnect()` stops
+  taking frames in before it flushes (an arriving frame is neither acked nor
+  dispatched; the server keeps it), so it returns promptly while frames keep
+  arriving, and a frame acked at receipt is never dropped by the flush. This
+  also ends a crash: when the missing seq arrived meanwhile, the receive loop
+  could take buffered frames the gap task still expected (`KeyError`), or
+  hand them over twice.
 
 ### Added
 
@@ -61,7 +72,7 @@ major. The on-the-wire API is versioned separately under `/v1/...`.
   handler did not finish, no message is dispatched twice, seqs stay in order
   per conversation. Identical bytes ship in the TypeScript SDK.
 - Engine scenarios `repeat-while-handler-runs-in-order` / `-below-anchor`
-  and `frame-arrives-while-a-lapsed-gap-is-handled` (new op
+  and `frames-arrive-while-a-lapsed-gap-is-handled` (new op
   `gap_window_lapses`, a real 2 s wait).
 
 ### Changed
