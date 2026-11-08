@@ -1299,6 +1299,57 @@ async def test_drain_never_acks_a_below_anchor_row_nobody_dispatched() -> None:
         await rt.disconnect()
 
 
+@pytest.mark.parametrize("ack_on_receipt", [False, True])
+@pytest.mark.asyncio
+async def test_drain_cursor_covers_only_handled_rows_when_the_socket_drops_mid_handler(
+    ack_on_receipt: bool,
+) -> None:
+    # Page [g1, g3, h1]: g3 parks on the gap (the agent's own message is g's
+    # seq 2) and h1's handler, a LATER row, is slow. This drain routes rows
+    # one at a time, so the socket drop during h1 clears the parked g3 before
+    # the cursor is computed: g3 is then neither parked nor dispatched, and
+    # the cursor must stop before it unless a handler finished it.
+    page = [
+        _sync_row("g_1", conversation_id="g", delivery_id="del_g1", seq=1),
+        _sync_row("g_3", conversation_id="g", delivery_id="del_g3", seq=3),
+        _sync_row("h_1", conversation_id="h", delivery_id="del_h1", seq=1),
+    ]
+    mock_api = MockAsyncClient(sync_pages=[page])
+    rt, ws = _make_client(
+        client=mock_api, auto_drain_on_connect=False, ack_on_receipt=ack_on_receipt
+    )
+    finished: list[str] = []
+    release = asyncio.Event()
+
+    async def slow(m: dict[str, Any]) -> None:
+        if m["payload"]["id"] == "h_1":
+            await release.wait()
+        finished.append(m["payload"]["id"])
+
+    rt.on("message.new", slow)
+    try:
+        await rt.connect()
+        await _settle()
+        await ws.push({"type": "hello.ok", "capabilities": ["ack"]})
+        await _settle()
+        drain = asyncio.create_task(rt.drain_offline_envelopes())
+        await _settle()
+        await ws.close(code=1006, reason="abnormal")
+        await _settle()
+        release.set()
+        await asyncio.wait_for(drain, timeout=1.0)
+
+        if ack_on_receipt:
+            # The close handed the parked g3 to the handler first.
+            assert sorted(finished) == ["g_1", "g_3", "h_1"]
+            assert mock_api.sync_ack_calls == ["del_h1"]
+        else:
+            assert finished == ["g_1", "h_1"]
+            assert mock_api.sync_ack_calls == ["del_g1"]
+    finally:
+        await rt.disconnect()
+
+
 @pytest.mark.asyncio
 async def test_drain_dispatches_and_acks_nothing_after_disconnect() -> None:
     gate = asyncio.Event()

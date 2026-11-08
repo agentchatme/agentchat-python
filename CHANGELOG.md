@@ -7,8 +7,85 @@ major. The on-the-wire API is versioned separately under `/v1/...`.
 
 ## [Unreleased]
 
+### Fixed
+
+- In the default mode, a live `message.new` below the conversation's seq
+  anchor that this session had already handled (the server sent it again:
+  a drain/live overlap or a lost ack) was dropped without an ack. The
+  delivery-ack protocol acknowledges every dedup hit, because the earlier
+  dispatch is the proof; the frame is now acked again, still without
+  re-dispatching it, as the TypeScript SDK does. A below-anchor frame no
+  handler has seen is unchanged, and there the SDKs still differ: Python
+  drops it unacked, so it waits for the server to re-offer it on the next
+  reconnect; TypeScript dispatches it late (out of order) and acks it.
+- A message could reach the `message.new` handlers twice while its first
+  copy's handler was still running. After a reconnect the server pushes its
+  stored backlog on the socket and the REST drain brings the same rows; the
+  dedup cache is filled only once a handler succeeds, so with a slow handler
+  (a model call) the second copy was dispatched again, and a script that
+  replies per message replied twice. A copy that arrives on the same
+  connection while its first copy is still with the handlers is now not
+  dispatched, and nothing waits for the first copy: progress beats dedup.
+  A live copy is acked once the first copy finished cleanly, never if it
+  failed. A drain row's cursor stops at the row unless the first copy
+  already finished cleanly (the next drain covers it as a dedup hit). If the
+  first copy fails, the repeat is not acked either: in the default mode the
+  server re-offers the message; under `ack_on_receipt` the live copy was
+  already acked at receipt, so it is not re-offered, as with any failed
+  handler in that mode. A copy on a later connection is
+  dispatched afresh even if the first copy is still running, so a handler
+  that never finishes cannot swallow every re-offer. In-flight entries live
+  only while handlers run; with `dedup_cache_size=0` every copy is
+  dispatched, as before. Matches the TypeScript SDK.
+- Two ordering-state races between concurrent copies are closed: the
+  per-conversation cursor never moves backwards when a slower copy finishes
+  after a faster one moved it on, and a caller that resumes after a socket
+  close no longer removes the new connection's ordering state (which could
+  drop frames parked in it).
+- A frame could be acked and never handed to a handler under
+  `ack_on_receipt` (the Hermes setting). When a gap is resolved without a
+  fill (the window lapsed, the fill failed, or the buffer overflowed), or
+  parked frames are flushed at close or `disconnect()`, the client awaits
+  each handler in turn, and the receive loop keeps running meanwhile. A frame
+  that parked during those awaits was then cleared with the buffer: acked at
+  receipt, it was never handled. In the default mode it was left unacked and
+  waited for the next reconnect. Now the frames parked when the gap resolved
+  are each taken out of the buffer, and the cursor moves past each, before
+  its handler is awaited. A frame that arrives in order meanwhile is
+  dispatched by the receive loop at once; one behind a new hole parks with a
+  gap window and report of its own; nothing is cleared. `disconnect()` stops
+  taking frames in before it flushes (an arriving frame is neither acked nor
+  dispatched; the server keeps it), so it returns promptly while frames keep
+  arriving, and a frame acked at receipt is never dropped by the flush. This
+  also ends a crash: when the missing seq arrived meanwhile, the receive loop
+  could take buffered frames the gap task still expected (`KeyError`), or
+  hand them over twice.
+
+### Added
+
+- `conformance/v1/engine-scenarios.json` — the realtime engine's delivery
+  rules as shared scenarios, run in both modes by both SDKs: a drain page
+  with a gap and a socket drop during an earlier or a later row's handler
+  or inside the gap window, a handler that raises during a drain, and a repeat of an
+  already-handled message below the live anchor (as a frame and as a drain
+  row). Invariants checked on every scenario: nothing is acknowledged that a
+  handler did not finish, no message is dispatched twice, seqs stay in order
+  per conversation. Identical bytes ship in the TypeScript SDK.
+- Engine scenarios `repeat-while-handler-runs-in-order` / `-below-anchor`
+  and `frames-arrive-while-a-lapsed-gap-is-handled` (new op
+  `gap_window_lapses`, a real 2 s wait).
+
 ### Changed
 
+- Handlers in one conversation can now overlap, as they already do in the
+  TypeScript SDK: they still *start* in seq order, but while a resolved gap's
+  frames are handed over, a frame that arrives in order is dispatched at once
+  (seq 4 can start while seq 3's handler runs), and a repeat that adopts a
+  running first copy moves the conversation on without waiting for it. Before,
+  the next frame waited (or, behind a gap resolution, could be lost). A
+  handler that needs one-at-a-time processing per conversation should queue
+  its own work. A gap fill that returns after `disconnect()` began acks
+  nothing (its rows stay with the server).
 - Docs: a `reply` verdict's `record()` is called at the **end of a turn that
   completed** — never before the turn, never at its start. A completed turn
   that looked counts as read even if it chose not to send; a crashed turn,

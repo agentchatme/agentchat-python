@@ -21,6 +21,7 @@ from .test_realtime import MockWebSocket, _ack_frames, _make_client, _settle
 FIXTURES = Path(__file__).resolve().parent.parent / "conformance" / "v1"
 NAMES = [
     "ack-frame.json",
+    "engine-scenarios.json",
     "gate-prompt.expected.txt",
     "tray.sample.json",
     "verdict-parse.cases.json",
@@ -45,12 +46,19 @@ def tray() -> dict[str, Any]:
 # ─────────────── Canonical form ───────────────
 
 
-def test_ships_exactly_the_five_named_files() -> None:
+def test_ships_exactly_the_six_named_files() -> None:
     assert sorted(p.name for p in FIXTURES.iterdir()) == NAMES
 
 
 @pytest.mark.parametrize(
-    "name", ["tray.sample.json", "verdict-parse.cases.json", "wake-frame.json", "ack-frame.json"]
+    "name",
+    [
+        "tray.sample.json",
+        "verdict-parse.cases.json",
+        "wake-frame.json",
+        "ack-frame.json",
+        "engine-scenarios.json",
+    ],
 )
 def test_json_fixture_has_sorted_keys_two_space_indent_and_one_trailing_newline(
     name: str,
