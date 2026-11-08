@@ -28,7 +28,7 @@ gone.
 Runs on an asyncio loop: :meth:`WakeCoalescer.wake` must be called from the
 loop's thread (from another thread, use ``loop.call_soon_threadsafe``).
 ``on_cycle`` may be a plain function (the cycle ends when it returns) or
-return an awaitable (the cycle ends when it settles, either way).
+return an awaitable (the cycle ends when it finishes, either way).
 """
 
 from __future__ import annotations

@@ -166,7 +166,7 @@ def _make_client(
     return rt, sock
 
 
-async def _settle() -> None:
+async def _flush() -> None:
     """Yield the event loop a few times so queued coroutines run."""
     for _ in range(5):
         await asyncio.sleep(0)
@@ -180,7 +180,7 @@ async def test_connect_sends_hello_frame() -> None:
     rt, ws = _make_client()
     try:
         await rt.connect()
-        await _settle()
+        await _flush()
         assert len(ws.sent) == 1
         sent = json.loads(ws.sent[0])
         # HELLO authenticates over the wire and advertises heartbeat (rewake
@@ -206,9 +206,9 @@ async def test_hello_ok_fires_on_connect_and_is_not_dispatched() -> None:
     rt.on("hello.ok", lambda _m: msg_handler_called.__setitem__(0, msg_handler_called[0] + 1))
     try:
         await rt.connect()
-        await _settle()
+        await _flush()
         await ws.push({"type": "hello.ok"})
-        await _settle()
+        await _flush()
         assert connected[0] == 1
         assert msg_handler_called[0] == 0
         assert rt.is_connected is True
@@ -223,12 +223,12 @@ async def test_pre_ack_frames_are_dropped() -> None:
     rt.on("message.new", lambda m: msgs.append(m))
     try:
         await rt.connect()
-        await _settle()
+        await _flush()
         # Before hello.ok — must be ignored by the client.
         await ws.push(
             {"type": "message.new", "payload": {"conversation_id": "c1", "seq": 1}}
         )
-        await _settle()
+        await _flush()
         assert msgs == []
     finally:
         await rt.disconnect()
@@ -241,12 +241,12 @@ async def test_non_message_event_dispatches() -> None:
     rt.on("presence.update", lambda m: events.append(m))
     try:
         await rt.connect()
-        await _settle()
+        await _flush()
         await ws.push({"type": "hello.ok"})
-        await _settle()
+        await _flush()
         payload = {"handle": "@alice", "status": "online"}
         await ws.push({"type": "presence.update", "payload": payload})
-        await _settle()
+        await _flush()
         assert len(events) == 1
         assert events[0]["payload"] == payload
     finally:
@@ -263,14 +263,14 @@ async def test_message_new_dispatches_in_order() -> None:
     rt.on("message.new", lambda m: seqs.append(m["payload"]["seq"]))
     try:
         await rt.connect()
-        await _settle()
+        await _flush()
         await ws.push({"type": "hello.ok"})
-        await _settle()
+        await _flush()
         for seq in (1, 2, 3):
             await ws.push(
                 {"type": "message.new", "payload": {"conversation_id": "c1", "seq": seq}}
             )
-        await _settle()
+        await _flush()
         assert seqs == [1, 2, 3]
     finally:
         await rt.disconnect()
@@ -290,9 +290,9 @@ async def test_duplicate_seq_is_dropped_while_state_active() -> None:
 
     try:
         await rt.connect()
-        await _settle()
+        await _flush()
         await ws.push({"type": "hello.ok"})
-        await _settle()
+        await _flush()
         # Anchor at 1 → next_expected_seq = 2.
         await ws.push(frame(1))
         # Buffer 3 — state stays live waiting on the missing 2.
@@ -301,7 +301,7 @@ async def test_duplicate_seq_is_dropped_while_state_active() -> None:
         await ws.push(frame(1))
         # Now 2 arrives → drain 2, 3 in order.
         await ws.push(frame(2))
-        await _settle()
+        await _flush()
         assert seqs == [1, 2, 3]
     finally:
         await rt.disconnect()
@@ -314,19 +314,19 @@ async def test_out_of_order_drains_when_missing_arrives() -> None:
     rt.on("message.new", lambda m: seqs.append(m["payload"]["seq"]))
     try:
         await rt.connect()
-        await _settle()
+        await _flush()
         await ws.push({"type": "hello.ok"})
-        await _settle()
+        await _flush()
         # Anchor at 1 (next_expected_seq becomes 2).
         await ws.push({"type": "message.new", "payload": {"conversation_id": "c1", "seq": 1}})
         # Buffer 3 and 4 waiting for 2.
         await ws.push({"type": "message.new", "payload": {"conversation_id": "c1", "seq": 3}})
         await ws.push({"type": "message.new", "payload": {"conversation_id": "c1", "seq": 4}})
-        await _settle()
+        await _flush()
         assert seqs == [1]
         # 2 arrives — drain 2, 3, 4 in order.
         await ws.push({"type": "message.new", "payload": {"conversation_id": "c1", "seq": 2}})
-        await _settle()
+        await _flush()
         assert seqs == [1, 2, 3, 4]
     finally:
         await rt.disconnect()
@@ -339,15 +339,15 @@ async def test_independent_ordering_per_conversation() -> None:
     rt.on("message.new", lambda m: dispatched.append(m["payload"]))
     try:
         await rt.connect()
-        await _settle()
+        await _flush()
         await ws.push({"type": "hello.ok"})
-        await _settle()
+        await _flush()
         # Interleave two conversations — each anchors on its own first seq.
         await ws.push({"type": "message.new", "payload": {"conversation_id": "c1", "seq": 100}})
         await ws.push({"type": "message.new", "payload": {"conversation_id": "c2", "seq": 5}})
         await ws.push({"type": "message.new", "payload": {"conversation_id": "c1", "seq": 101}})
         await ws.push({"type": "message.new", "payload": {"conversation_id": "c2", "seq": 6}})
-        await _settle()
+        await _flush()
         assert [p["conversation_id"] for p in dispatched] == ["c1", "c2", "c1", "c2"]
     finally:
         await rt.disconnect()
@@ -360,14 +360,14 @@ async def test_message_without_seq_passes_through() -> None:
     rt.on("message.new", lambda m: dispatched.append(m))
     try:
         await rt.connect()
-        await _settle()
+        await _flush()
         await ws.push({"type": "hello.ok"})
-        await _settle()
+        await _flush()
         # No seq — system notice reusing the message.new shape.
         await ws.push(
             {"type": "message.new", "payload": {"conversation_id": "c1", "body": "x"}}
         )
-        await _settle()
+        await _flush()
         assert len(dispatched) == 1
     finally:
         await rt.disconnect()
@@ -386,17 +386,17 @@ async def test_gap_fill_unavailable_without_client(monkeypatch: pytest.MonkeyPat
     rt.on("message.new", lambda m: seqs.append(m["payload"]["seq"]))
     try:
         await rt.connect()
-        await _settle()
+        await _flush()
         await ws.push({"type": "hello.ok"})
-        await _settle()
+        await _flush()
         # Anchor at 1 → next_expected = 2.
         await ws.push({"type": "message.new", "payload": {"conversation_id": "c1", "seq": 1}})
         # 3 arrives — 2 is missing; no client means no recovery path.
         await ws.push({"type": "message.new", "payload": {"conversation_id": "c1", "seq": 3}})
-        await _settle()
+        await _flush()
         # Let the gap timer fire.
         await asyncio.sleep(0.12)
-        await _settle()
+        await _flush()
         assert len(gaps) == 1
         assert gaps[0].recovered is False
         assert gaps[0].reason == "gap_fill_unavailable"
@@ -417,14 +417,14 @@ async def test_gap_fill_success_via_get_messages(monkeypatch: pytest.MonkeyPatch
     rt.on("message.new", lambda m: seqs.append(m["payload"]["seq"]))
     try:
         await rt.connect()
-        await _settle()
+        await _flush()
         await ws.push({"type": "hello.ok"})
-        await _settle()
+        await _flush()
         await ws.push({"type": "message.new", "payload": {"conversation_id": "c1", "seq": 1}})
         # Skip 2, push 3.
         await ws.push({"type": "message.new", "payload": {"conversation_id": "c1", "seq": 3}})
         await asyncio.sleep(0.12)
-        await _settle()
+        await _flush()
         assert len(gaps) == 1
         assert gaps[0].recovered is True
         assert gaps[0].reason == "gap_filled"
@@ -447,13 +447,13 @@ async def test_gap_fill_failure_surfaces_recovered_false(
     rt, ws = _make_client(client=mock_api, on_sequence_gap=lambda info: gaps.append(info))
     try:
         await rt.connect()
-        await _settle()
+        await _flush()
         await ws.push({"type": "hello.ok"})
-        await _settle()
+        await _flush()
         await ws.push({"type": "message.new", "payload": {"conversation_id": "c1", "seq": 1}})
         await ws.push({"type": "message.new", "payload": {"conversation_id": "c1", "seq": 3}})
         await asyncio.sleep(0.12)
-        await _settle()
+        await _flush()
         assert len(gaps) == 1
         assert gaps[0].recovered is False
         assert gaps[0].reason == "gap_fill_failed"
@@ -470,16 +470,16 @@ async def test_buffer_overflow_triggers_force_drain(monkeypatch: pytest.MonkeyPa
     rt, ws = _make_client(on_sequence_gap=lambda info: gaps.append(info))
     try:
         await rt.connect()
-        await _settle()
+        await _flush()
         await ws.push({"type": "hello.ok"})
-        await _settle()
+        await _flush()
         await ws.push({"type": "message.new", "payload": {"conversation_id": "c1", "seq": 1}})
         # Leave 2 missing, queue 3..7 to exceed cap (4).
         for seq in (3, 4, 5, 6, 7):
             await ws.push(
                 {"type": "message.new", "payload": {"conversation_id": "c1", "seq": seq}}
             )
-        await _settle()
+        await _flush()
         assert len(gaps) == 1
         assert gaps[0].reason == "buffer_overflow"
     finally:
@@ -493,7 +493,7 @@ async def test_buffer_overflow_triggers_force_drain(monkeypatch: pytest.MonkeyPa
 async def test_disconnect_sets_disposed_and_blocks_reconnect() -> None:
     rt, _ws = _make_client(reconnect=True)
     await rt.connect()
-    await _settle()
+    await _flush()
     await rt.disconnect()
     # connect() now raises because the client is disposed.
     with pytest.raises(AgentChatConnectionError):
@@ -506,11 +506,11 @@ async def test_on_disconnect_fires_on_close() -> None:
     seen: list[dict[str, Any]] = []
     rt.on_disconnect(lambda info: seen.append(info))
     await rt.connect()
-    await _settle()
+    await _flush()
     await ws.push({"type": "hello.ok"})
-    await _settle()
+    await _flush()
     await ws.close(code=1000)
-    await _settle()
+    await _flush()
     # Disconnect handler got the close info.
     assert len(seen) == 1
     assert seen[0]["code"] == 1000
@@ -532,7 +532,7 @@ async def test_offline_drain_after_hello_ok() -> None:
     rt.on("message.new", lambda m: seqs.append(m["payload"]["seq"]))
     try:
         await rt.connect()
-        await _settle()
+        await _flush()
         await ws.push({"type": "hello.ok"})
         # Give the fire-and-forget drain task enough time to resolve.
         for _ in range(20):
@@ -552,7 +552,7 @@ async def test_drain_skipped_when_auto_drain_disabled() -> None:
     rt, ws = _make_client(client=mock_api, auto_drain_on_connect=False)
     try:
         await rt.connect()
-        await _settle()
+        await _flush()
         await ws.push({"type": "hello.ok"})
         await asyncio.sleep(0.05)
         assert mock_api.sync_calls == []
@@ -590,9 +590,9 @@ async def test_drain_paginates_with_positional_cursor(
     rt.on("message.new", on_msg)
     try:
         await rt.connect()
-        await _settle()
+        await _flush()
         await ws.push({"type": "hello.ok"})
-        await _settle()
+        await _flush()
         await rt.drain_offline_envelopes()
 
         assert seqs == [1, 2, 3]
@@ -627,9 +627,9 @@ async def test_drain_stops_at_invalid_row_and_never_acks_past_it(
     rt.on_error(lambda e: errors.append(e))
     try:
         await rt.connect()
-        await _settle()
+        await _flush()
         await ws.push({"type": "hello.ok"})
-        await _settle()
+        await _flush()
         await rt.drain_offline_envelopes()
 
         # Clean prefix only: the row AFTER the invalid one is never
@@ -654,9 +654,9 @@ async def test_drain_invalid_first_row_acks_nothing() -> None:
     rt.on_error(lambda e: errors.append(e))
     try:
         await rt.connect()
-        await _settle()
+        await _flush()
         await ws.push({"type": "hello.ok"})
-        await _settle()
+        await _flush()
         await rt.drain_offline_envelopes()
 
         # The pre-1.0.31 envelope shape (numeric delivery_id, nested
@@ -681,9 +681,9 @@ async def test_drain_sync_error_surfaces_via_error_handler() -> None:
     rt.on_error(lambda e: errors.append(e))
     try:
         await rt.connect()
-        await _settle()
+        await _flush()
         await ws.push({"type": "hello.ok"})
-        await _settle()
+        await _flush()
         await rt.drain_offline_envelopes()
         assert any("sync drain failed" in str(e) for e in errors)
     finally:
@@ -700,17 +700,17 @@ async def test_ack_mode_on_when_server_echoes_capability() -> None:
     rt.on("message.new", lambda m: handled.append(m["payload"]["id"]))
     try:
         await rt.connect()
-        await _settle()
+        await _flush()
         # Server may echo extra capabilities; only `ack` matters to us.
         await ws.push({"type": "hello.ok", "capabilities": ["ack", "future-cap"]})
-        await _settle()
+        await _flush()
         await ws.push(
             {
                 "type": "message.new",
                 "payload": {"conversation_id": "c1", "seq": 1, "id": "m_1"},
             }
         )
-        await _settle()
+        await _flush()
         assert handled == ["m_1"]
         assert _ack_frames(ws) == ["m_1"]
     finally:
@@ -726,16 +726,16 @@ async def test_ack_mode_off_when_hello_ok_has_no_capabilities() -> None:
     rt.on("message.new", lambda m: handled.append(m["payload"]["id"]))
     try:
         await rt.connect()
-        await _settle()
+        await _flush()
         await ws.push({"type": "hello.ok"})
-        await _settle()
+        await _flush()
         await ws.push(
             {
                 "type": "message.new",
                 "payload": {"conversation_id": "c1", "seq": 1, "id": "m_1"},
             }
         )
-        await _settle()
+        await _flush()
         assert handled == ["m_1"]
         assert _ack_frames(ws) == []
     finally:
@@ -755,21 +755,21 @@ async def test_ack_sent_only_after_async_handler_completes() -> None:
     rt.on("message.new", slow_handler)
     try:
         await rt.connect()
-        await _settle()
+        await _flush()
         await ws.push({"type": "hello.ok", "capabilities": ["ack"]})
-        await _settle()
+        await _flush()
         await ws.push(
             {
                 "type": "message.new",
                 "payload": {"conversation_id": "c1", "seq": 1, "id": "m_1"},
             }
         )
-        await _settle()
+        await _flush()
         # Handler is still awaiting the gate — no ack may exist yet.
         assert handled == []
         assert _ack_frames(ws) == []
         gate.set()
-        await _settle()
+        await _flush()
         assert handled == ["m_1"]
         assert _ack_frames(ws) == ["m_1"]
     finally:
@@ -790,21 +790,21 @@ async def test_handler_exception_withholds_ack_and_allows_retry() -> None:
     rt.on("message.new", flaky)
     try:
         await rt.connect()
-        await _settle()
+        await _flush()
         await ws.push({"type": "hello.ok", "capabilities": ["ack"]})
-        await _settle()
+        await _flush()
         # No seq → bypasses the ordering layer, so the redelivery below
         # exercises the ack/dedup path, not the seq-duplicate drop.
         await ws.push({"type": "message.new", "payload": {"id": "m_bad"}})
         await ws.push({"type": "message.new", "payload": {"id": "m_ok"}})
-        await _settle()
+        await _flush()
         assert attempts == ["m_bad", "m_ok"]
         # Only the clean dispatch acked.
         assert _ack_frames(ws) == ["m_ok"]
         # Server redelivers the unacked message: the failed dispatch must
         # NOT have poisoned the dedup cache — the handler runs again.
         await ws.push({"type": "message.new", "payload": {"id": "m_bad"}})
-        await _settle()
+        await _flush()
         assert attempts == ["m_bad", "m_ok", "m_bad"]
         assert _ack_frames(ws) == ["m_ok"]
     finally:
@@ -821,13 +821,13 @@ async def test_dedup_hit_skips_dispatch_but_still_acks() -> None:
     rt.on("message.new", lambda m: handled.append(m["payload"]["id"]))
     try:
         await rt.connect()
-        await _settle()
+        await _flush()
         await ws.push({"type": "hello.ok", "capabilities": ["ack"]})
-        await _settle()
+        await _flush()
         frame = {"type": "message.new", "payload": {"id": "m_1"}}
         await ws.push(frame)
         await ws.push(frame)  # server redelivery of an already-processed id
-        await _settle()
+        await _flush()
         # Dispatched once; acked BOTH times (prior processing is the proof).
         assert handled == ["m_1"]
         assert _ack_frames(ws) == ["m_1", "m_1"]
@@ -846,14 +846,14 @@ async def test_dedup_spans_drain_and_live_paths() -> None:
     rt.on("message.new", lambda m: handled.append(m["payload"]["id"]))
     try:
         await rt.connect()
-        await _settle()
+        await _flush()
         await ws.push({"type": "hello.ok"})
-        await _settle()
+        await _flush()
         await rt.drain_offline_envelopes()
         assert handled == ["m_1"]
         assert mock_api.sync_ack_calls == ["del_1"]
         await ws.push({"type": "message.new", "payload": dict(row)})
-        await _settle()
+        await _flush()
         assert handled == ["m_1"]
     finally:
         await rt.disconnect()
@@ -867,12 +867,12 @@ async def test_dedup_cache_size_is_configurable_and_bounded() -> None:
     rt.on("message.new", lambda m: handled.append(m["payload"]["id"]))
     try:
         await rt.connect()
-        await _settle()
+        await _flush()
         await ws.push({"type": "hello.ok"})
-        await _settle()
+        await _flush()
         for msg_id in ("m_1", "m_2", "m_1"):
             await ws.push({"type": "message.new", "payload": {"id": msg_id}})
-        await _settle()
+        await _flush()
         assert handled == ["m_1", "m_2", "m_1"]
     finally:
         await rt.disconnect()
@@ -906,10 +906,10 @@ async def test_auth_close_after_hello_ok_is_an_eviction_not_a_rejection(code: in
     rt.on_error(lambda e: errors.append(e))
     try:
         await rt.connect()
-        await _settle()
+        await _flush()
         ws = connects[0]
         await ws.push({"type": "hello.ok"})
-        await _settle()
+        await _flush()
         # Server evicts the authenticated session.
         await ws.close(code=code, reason="Key rotated")
         await asyncio.sleep(0.1)
@@ -939,9 +939,9 @@ async def test_non_terminal_close_still_reconnects() -> None:
     )
     try:
         await rt.connect()
-        await _settle()
+        await _flush()
         await connects[0].push({"type": "hello.ok"})
-        await _settle()
+        await _flush()
         await connects[0].close(code=1006)  # abnormal closure — transient
         await asyncio.sleep(0.1)
         assert len(connects) >= 2
@@ -993,7 +993,7 @@ async def test_hello_timeout_self_close_is_not_terminal(
 async def test_send_raises_before_authentication() -> None:
     rt, _ws = _make_client()
     await rt.connect()
-    await _settle()
+    await _flush()
     with pytest.raises(AgentChatConnectionError):
         await rt.send({"type": "typing.start", "payload": {"to": "@alice"}})
     await rt.disconnect()
@@ -1003,9 +1003,9 @@ async def test_send_raises_before_authentication() -> None:
 async def test_send_works_after_hello_ok() -> None:
     rt, ws = _make_client()
     await rt.connect()
-    await _settle()
+    await _flush()
     await ws.push({"type": "hello.ok"})
-    await _settle()
+    await _flush()
     await rt.send({"type": "typing.start", "payload": {"to": "@alice"}})
     # First entry is HELLO; second is the user-sent typing frame.
     assert len(ws.sent) == 2
@@ -1020,15 +1020,15 @@ async def test_on_unsubscribe_removes_handler() -> None:
     unsub = rt.on("message.new", lambda _m: count.__setitem__(0, count[0] + 1))
     try:
         await rt.connect()
-        await _settle()
+        await _flush()
         await ws.push({"type": "hello.ok"})
-        await _settle()
+        await _flush()
         await ws.push({"type": "message.new", "payload": {"conversation_id": "c1", "seq": 1}})
-        await _settle()
+        await _flush()
         assert count[0] == 1
         unsub()
         await ws.push({"type": "message.new", "payload": {"conversation_id": "c1", "seq": 2}})
-        await _settle()
+        await _flush()
         assert count[0] == 1
     finally:
         await rt.disconnect()
@@ -1052,11 +1052,11 @@ async def test_user_handler_exception_is_logged_not_swallowed(
 
     with caplog.at_level(logging.WARNING, logger="agentchatme.realtime"):
         await rt.connect()
-        await _settle()
+        await _flush()
         await ws.push({"type": "hello.ok"})
-        await _settle()
+        await _flush()
         await ws.push({"type": "message.new", "payload": {"conversation_id": "c1", "seq": 1}})
-        await _settle()
+        await _flush()
         # Second handler still fires — raise didn't break dispatch.
         assert other_saw == [1]
         # And the exception was logged, not swallowed.
@@ -1086,19 +1086,19 @@ async def test_short_lived_connection_does_not_clear_backoff(
     rt, ws = _make_client()
     try:
         await rt.connect()
-        await _settle()
+        await _flush()
         # Backoff already climbing from earlier failures. Seed it BEFORE the
         # handshake — the old code reset here, so this ordering is what
         # makes the test a real regression guard rather than a tautology.
         rt._reconnect_attempts = 4
         await ws.push({"type": "hello.ok"})
-        await _settle()
+        await _flush()
         assert rt._reconnect_attempts == 4, (
             "hello.ok alone must not clear the backoff — that is the bug"
         )
         # Dying before the window elapses must also leave it untouched.
         await ws.close(1006, "abnormal")
-        await _settle()
+        await _flush()
         assert rt._reconnect_attempts == 4
     finally:
         await rt.disconnect()
@@ -1114,10 +1114,10 @@ async def test_stable_connection_clears_backoff(
     try:
         rt._reconnect_attempts = 7
         await rt.connect()
-        await _settle()
+        await _flush()
         await ws.push({"type": "hello.ok"})
         await asyncio.sleep(0.05)
-        await _settle()
+        await _flush()
         assert rt._reconnect_attempts == 0
     finally:
         await rt.disconnect()
@@ -1182,7 +1182,7 @@ async def test_long_lived_connection_resets_the_instability_counter() -> None:
 # ─────────────── Drain ack cursor: only what the app was handed ───────────────
 #
 # The sync/ack cursor commits everything at-or-before it. It may therefore
-# only cover rows whose dispatch is known to have settled; anything parked,
+# only cover rows whose dispatch is known to have finished; anything parked,
 # failed or never shown must stop it. Before this fix the drain acked the
 # whole page after injecting it into the ordering layer, so a row parked on
 # a seq gap (or dropped as a below-anchor duplicate) was marked delivered
@@ -1203,9 +1203,9 @@ async def test_drain_never_acks_a_row_parked_on_a_seq_gap() -> None:
     seen: list[int] = []
     rt.on("message.new", lambda m: seen.append(m["payload"]["seq"]))
     await rt.connect()
-    await _settle()
+    await _flush()
     await ws.push({"type": "hello.ok"})
-    await _settle()
+    await _flush()
     await rt.drain_offline_envelopes()
 
     assert seen == [1]
@@ -1235,9 +1235,9 @@ async def test_drain_freezes_the_cursor_at_a_failed_handler() -> None:
     rt.on("message.new", flaky)
     try:
         await rt.connect()
-        await _settle()
+        await _flush()
         await ws.push({"type": "hello.ok"})
-        await _settle()
+        await _flush()
         await rt.drain_offline_envelopes()
         # Every row was offered to the handler, but the cursor stops before
         # the failure: rows 2 and 3 stay `stored` for redelivery.
@@ -1262,12 +1262,12 @@ async def test_drain_acks_a_below_anchor_duplicate_only_if_this_session_dispatch
     rt.on("message.new", lambda m: handled.append(m["payload"]["id"]))
     try:
         await rt.connect()
-        await _settle()
+        await _flush()
         await ws.push({"type": "hello.ok"})
-        await _settle()
+        await _flush()
         await ws.push({"type": "message.new", "payload": {"id": "m_1", "conversation_id": "c1", "seq": 1}})
         await ws.push({"type": "message.new", "payload": {"id": "m_2", "conversation_id": "c1", "seq": 2}})
-        await _settle()
+        await _flush()
         await rt.drain_offline_envelopes()
         assert handled == ["m_1", "m_2"]
         assert mock_api.sync_ack_calls == ["del_2"]
@@ -1292,11 +1292,11 @@ async def test_drain_delivers_below_anchor_rows_nobody_saw_late_and_covers_them(
     rt.on("message.new", lambda m: handled.append(m["payload"]["id"]))
     try:
         await rt.connect()
-        await _settle()
+        await _flush()
         await ws.push({"type": "hello.ok"})
-        await _settle()
+        await _flush()
         await ws.push({"type": "message.new", "payload": {"id": "m_5", "conversation_id": "c1", "seq": 5}})
-        await _settle()
+        await _flush()
         await rt.drain_offline_envelopes()
         assert handled == ["m_5", "m_3", "m_4"]
         assert mock_api.sync_ack_calls == ["del_4"]
@@ -1312,9 +1312,9 @@ async def test_drain_covers_nothing_while_no_message_handler_is_attached() -> No
     rt, ws = _make_client(client=mock_api, auto_drain_on_connect=False)
     try:
         await rt.connect()
-        await _settle()
+        await _flush()
         await ws.push({"type": "hello.ok", "capabilities": ["ack"]})
-        await _settle()
+        await _flush()
         await rt.drain_offline_envelopes()
         assert mock_api.sync_ack_calls == []
     finally:
@@ -1351,16 +1351,16 @@ async def test_drain_cursor_covers_only_handled_rows_when_the_socket_drops_mid_h
     rt.on("message.new", slow)
     try:
         await rt.connect()
-        await _settle()
+        await _flush()
         await ws.push({"type": "hello.ok", "capabilities": ["ack"]})
-        await _settle()
+        await _flush()
         drain = asyncio.create_task(rt.drain_offline_envelopes())
-        await _settle()
+        await _flush()
         await ws.close(code=1006, reason="abnormal")
-        await _settle()
+        await _flush()
         release.set()
         await asyncio.wait_for(drain, timeout=1.0)
-        await _settle()  # handlers run as their own tasks
+        await _flush()  # handlers run as their own tasks
 
         # The drain routes the page without waiting for handlers, so the
         # cursor is computed while g3 is still parked: it stops before g3 in
@@ -1390,11 +1390,11 @@ async def test_drain_dispatches_and_acks_nothing_after_disconnect() -> None:
     handled: list[str] = []
     rt.on("message.new", lambda m: handled.append(m["payload"]["id"]))
     await rt.connect()
-    await _settle()
+    await _flush()
     await ws.push({"type": "hello.ok"})
-    await _settle()
+    await _flush()
     drain = asyncio.create_task(rt.drain_offline_envelopes())
-    await _settle()
+    await _flush()
     await rt.disconnect()  # handlers are gone; the page must not be acked
     gate.set()
     await asyncio.wait_for(drain, timeout=1.0)
@@ -1417,15 +1417,17 @@ async def test_drain_coalesces_concurrent_calls() -> None:
     rt.on("message.new", lambda m: handled.append(m["payload"]["id"]))
     try:
         await rt.connect()
-        await _settle()
+        await _flush()
         await ws.push({"type": "hello.ok"})
-        await _settle()
+        await _flush()
         first = asyncio.create_task(rt.drain_offline_envelopes())
         second = asyncio.create_task(rt.drain_offline_envelopes())
-        await _settle()
+        await _flush()
         gate.set()
         await asyncio.gather(first, second)
-        assert len(mock_api.sync_calls) == 1
+        # Never two drains at once: the second call earns one more pass after
+        # the first (rows may have been left with the server meanwhile).
+        assert len(mock_api.sync_calls) == 2
         assert handled == ["m_1"]
         assert mock_api.sync_ack_calls == ["del_1"]
     finally:

@@ -7,8 +7,18 @@ major. The on-the-wire API is versioned separately under `/v1/...`.
 
 ## [Unreleased]
 
-Contract v1 (the finished receive gate). Every change is additive: a host
-that upgrades without changing its code keeps working as before.
+Contract v1 (the finished receive gate). A host that upgrades without
+changing its code keeps working; the behaviour changes it may notice are
+listed under **Changed** (marked *behaviour change*), and the type-level
+changes under **Types**.
+
+### Types
+
+- Type-level changes (no runtime effect on code that reads them as before):
+  `WakePayload.conversation_id`, `.anchor_message_id`, `.step` and `.at` are
+  `Optional` (an `unanswered` wake carries `conversation_ids` instead);
+  `ReplyDecision.id` and `.created_at` are `Optional` (a 2xx without the row
+  still records); `InboxTray.invites` is `Optional`.
 
 ### Added
 
@@ -42,19 +52,27 @@ that upgrades without changing its code keeps working as before.
 
 ### Changed
 
-- Socket handlers run off the receive loop, one at a time per
-  conversation: each conversation has a serial lane (frames of no
-  conversation — wake, presence, invites — share one), lanes run
-  concurrently, and the receive loop never waits for a handler. A slow
-  handler no longer holds up other conversations, other frames' acks or the
-  transport's pongs, and messages still reach the app in seq order per
-  conversation. A handler that never finishes holds its conversation at most
-  `in_flight_adopt_ms` (15 min).
+- *Behaviour change:* socket handlers run off the receive loop, one at a
+  time per conversation: each conversation has a serial lane (frames of no
+  conversation — wake, presence, invites — share one), and the receive loop
+  never waits for a handler. Within a conversation messages still reach the
+  app one at a time, in seq order; async handlers of *different*
+  conversations now run concurrently (in 1.2 every handler ran to the end
+  before the next frame was read). A handler that never finishes holds its
+  conversation at most `in_flight_adopt_ms` (15 min). Async `on_connect`
+  handlers are awaited before the reconnect drain starts, as in 1.2.
+- Backpressure: `RealtimeClient(max_queued_messages=1000)` bounds the
+  `message.new` handler runs queued or running. Past it a new message is not
+  taken in (not acked, not dispatched; the drain and gap fill stop) and
+  stays on the server; once the queue is back to half, the client fetches
+  it again (the REST drain, or one quiet reconnect without a REST client).
+  One notice per episode through `on_error`.
 - The first `message.new` handler attached after a HELLO that offered no
   `ack` triggers one quiet reconnect (no error, no backoff step) so the next
   HELLO negotiates delivery acks.
 - `CallOptions(retry=...)` never makes a POST / PATCH without an
-  Idempotency-Key retry.
+  Idempotency-Key retry; `send_message(opts=CallOptions(retry=...))` works
+  (it raised `TypeError`).
 - A `message.new` below the connection's seq anchor that nobody has handled
   is delivered late (out of order) instead of dropped, so the drain cursor
   never stalls behind it (TypeScript parity).
@@ -77,7 +95,10 @@ that upgrades without changing its code keeps working as before.
 - `ReceiveLoop` single-run mode: an invite still pending after two
   completed runs is dismissed (in memory).
 - `ReceiveLoop`: `max_concurrent_turns` (default 1) — extra turns wait for a
-  slot, held out of the gate; D5 pacing — after a silent turn the card is
+  slot, held out of the gate; `release_turn` (or a release through a shared
+  `TurnTracker`, which now has `holds()` and `on_release()`) frees the slot at
+  once and starts the next waiting turn, and a turn released while it waits
+  never starts; D5 pacing — after a silent turn the card is
   not gated again at the same anchor for 60 s (`pace_ms`) unless a newer
   message or an `unanswered` wake naming it arrives, and no second invite
   turn for an invite within 60 s; an optional shared `turn_tracker`; a turn

@@ -17,7 +17,7 @@ from agentchatme import RealtimeClient, gate
 from agentchatme.types import AckFrame, InboxTray, WakeFrame
 
 from ._texts import GATE_TEXTS
-from .test_realtime import MockWebSocket, _ack_frames, _make_client, _settle
+from .test_realtime import MockWebSocket, _ack_frames, _flush, _make_client
 
 FIXTURES = Path(__file__).resolve().parent.parent / "conformance" / "v1"
 def raw(name: str) -> str:
@@ -121,9 +121,9 @@ async def _connected(**opts: Any) -> tuple[RealtimeClient, MockWebSocket]:
     # HELLO offers ack only while a message.new handler is attached.
     rt.on("message.new", lambda _m: None)
     await rt.connect()
-    await _settle()
+    await _flush()
     await ws.push({"type": "hello.ok", "capabilities": ["ack"]})
-    await _settle()
+    await _flush()
     return rt, ws
 
 
@@ -136,7 +136,7 @@ async def test_wake_frame_reaches_wake_handlers_as_is_and_is_never_acked() -> No
     rt.on("wake", lambda m: seen.append(m))
     try:
         await ws.push(raw("wake-frame.json"))
-        await _settle()
+        await _flush()
         assert seen == [frame]
         assert _ack_frames(ws) == []
     finally:
@@ -160,7 +160,7 @@ async def test_ack_frame_is_what_the_client_sends_for_a_delivered_message() -> N
                 },
             }
         )
-        await _settle()
+        await _flush()
         sent = [json.loads(s) for s in ws.sent]
         assert ack in sent
         assert _ack_frames(ws) == [ack["message_id"]]

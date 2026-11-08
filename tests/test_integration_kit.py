@@ -34,7 +34,7 @@ from agentchatme.integration import (
 from agentchatme.types import Texts
 
 from ._texts import texts as texts_body
-from .test_realtime import MockWebSocket, _settle
+from .test_realtime import MockWebSocket, _flush
 
 # ─────────────── TurnTracker ───────────────
 
@@ -64,7 +64,7 @@ async def test_a_wait_timeout_is_not_an_end_and_next_is_followed() -> None:
     waiting = asyncio.ensure_future(
         tracker.confirmed_end(handle, _value(TurnEnd(status="still_running", next=later)))
     )
-    await _settle()
+    await _flush()
     assert not waiting.done()
     assert tracker.running()[0].wait_timed_out_at is not None
     later.set_result(TurnEnd(status="completed"))
@@ -79,11 +79,47 @@ async def test_a_turn_with_no_known_end_is_held_until_released() -> None:
     handle = tracker.begin(TrackedTurn.reply("c1"))
     assert handle is not None
     waiting = asyncio.ensure_future(tracker.confirmed_end(handle, TurnEnd(status="still_running")))
-    await _settle()
+    await _flush()
     assert not waiting.done()
     assert tracker.release("conversation:c1") is True
     assert await asyncio.wait_for(waiting, 1) is None
     assert tracker.release("conversation:c1") is False
+
+
+@pytest.mark.asyncio
+async def test_release_ends_a_wait_on_a_report_that_never_comes_and_tells_listeners() -> None:
+    tracker = TurnTracker()
+    handle = tracker.begin(TrackedTurn.reply("c1"))
+    assert handle is not None
+    released: list[str] = []
+    tracker.on_release(lambda h: released.append(h.key))
+    never: asyncio.Future[TurnEnd] = asyncio.get_running_loop().create_future()
+    waiting = asyncio.ensure_future(tracker.confirmed_end(handle, never))
+    await _flush()
+    assert tracker.holds(handle)
+    assert tracker.release("conversation:c1") is True
+    assert await asyncio.wait_for(waiting, 1) is None
+    assert released == ["conversation:c1"] and not tracker.holds(handle)
+
+
+@pytest.mark.asyncio
+async def test_a_shared_tracker_release_frees_the_loops_slot() -> None:
+    tracker = TurnTracker()
+    tray = _tray([_card("c1", "m1"), _card("c2", "m2")])
+    turns = _Turns()
+    loop = _loop(
+        _LoopClient([tray]),
+        call_model=lambda _p: _answer(("c1", "reply"), ("c2", "reply")),
+        start_turn=turns,
+        turn_tracker=tracker,
+    )
+    await loop.start()
+    await _cycle(loop)
+    assert [r.conversation_id for r in turns.requests] == ["c1"]
+    tracker.release("conversation:c1")  # the host lets go, not the loop
+    await asyncio.sleep(0.02)
+    assert [r.conversation_id for r in turns.requests] == ["c1", "c2"]
+    await loop.stop()
 
 
 @pytest.mark.asyncio
@@ -899,6 +935,53 @@ async def test_at_most_max_concurrent_turns_run_and_the_rest_wait_for_a_slot() -
 
 
 @pytest.mark.asyncio
+async def test_releasing_a_turn_that_never_ends_frees_its_slot() -> None:
+    tray = _tray([_card("c1", "m1"), _card("c2", "m2")])
+    client = _LoopClient([tray])
+    turns = _Turns()  # its turns end only when the test says so: never, for c1
+    loop = _loop(
+        client,
+        call_model=lambda _p: _answer(("c1", "reply"), ("c2", "reply")),
+        start_turn=turns,
+    )
+    await loop.start()
+    await _cycle(loop)
+    assert [r.conversation_id for r in turns.requests] == ["c1"]
+    assert loop.release_turn("conversation:c1") is True
+    await asyncio.sleep(0.02)
+    assert [r.conversation_id for r in turns.requests] == ["c1", "c2"]  # c2 got the slot
+    turns.ends[0].set_result(TurnEnd(status="completed"))  # a late end records nothing
+    await asyncio.sleep(0.02)
+    assert client.decisions.recorded == []
+    await loop.stop()
+
+
+@pytest.mark.asyncio
+async def test_a_waiting_turn_that_is_released_never_starts() -> None:
+    tray = _tray([_card("c1", "m1"), _card("c2", "m2")])
+    turns = _Turns()
+    timers = _Timers()  # cycles run only when the test fires their timer
+    loop = _loop(
+        _LoopClient([tray]),
+        call_model=lambda _p: _answer(("c1", "reply"), ("c2", "reply")),
+        start_turn=turns,
+        quiet_ms=5_000,
+        max_ms=5_000,
+        set_timer=timers,
+    )
+    await loop.start()
+    loop.wake()
+    timers.fns.pop(0)()
+    await asyncio.sleep(0.02)
+    assert [r.conversation_id for r in turns.requests] == ["c1"]  # c2 waits for the slot
+    assert loop.release_turn("conversation:c2") is True
+    turns.ends[0].set_result(TurnEnd(status="failed"))
+    await asyncio.sleep(0.02)
+    assert [r.conversation_id for r in turns.requests] == ["c1"]  # the released one never starts
+    await loop.stop()
+
+
+@pytest.mark.asyncio
 async def test_two_slots_run_two_turns_at_once() -> None:
     tray = _tray([_card("c1", "m1"), _card("c2", "m2"), _card("c3", "m3")])
     turns = _Turns()
@@ -1116,7 +1199,7 @@ async def test_the_socket_wakes_echoes_do_not_and_the_handle_is_learned() -> Non
         on_event=events.append,
     )
     await loop.start()
-    await _settle()
+    await _flush()
     hello = json.loads(ws.sent[0])
     assert hello["capabilities"] == ["ack", "heartbeat", "rewake"]
     await ws.push({"type": "hello.ok", "capabilities": ["ack", "heartbeat", "rewake"]})

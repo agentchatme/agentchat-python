@@ -385,9 +385,13 @@ class ReceiveLoop:
         self._tracker = turn_tracker if turn_tracker is not None else TurnTracker(now=self._now)
         self._pacer = _Pacer(pace_ms, self._now)
         self._max_turns = max_concurrent_turns
-        self._active_turns = 0
+        # Turns holding a slot right now.
+        self._active: set[TurnHandle] = set()
         # Turns waiting for a slot: (their tracker handle, the admission).
         self._waiting: deque[tuple[TurnHandle, Callable[[], Awaitable[bool]]]] = deque()
+        # A released turn (here, or by the host through a shared tracker)
+        # frees its slot at once; one released while it waits is dropped.
+        self._unsubscribe_release = self._tracker.on_release(self._on_turn_released)
         coalescer_options: dict[str, Any] = {}
         if quiet_ms is not None:
             coalescer_options["quiet_ms"] = quiet_ms
@@ -502,6 +506,7 @@ class ReceiveLoop:
         self._stopped = True
         self._coalescer.stop()
         self._clear_more_timer()
+        self._unsubscribe_release()
         self._stopping.set()
         # Turns that never got a slot never start; their cards stay on the tray.
         while self._waiting:
@@ -525,7 +530,8 @@ class ReceiveLoop:
     def release_turn(self, key: str) -> bool:
         """Let go of a turn whose end the runtime will never confirm (an
         operator's call). ``key`` is ``conversation:<id>`` or
-        ``invite:<id>``."""
+        ``invite:<id>``. Nothing is recorded for it, its slot is freed at
+        once (a waiting turn starts), and its card may be gated again."""
         released = self._tracker.release(key)
         if released:
             self._wake_from("more")
@@ -567,7 +573,7 @@ class ReceiveLoop:
             ],
             counters={
                 **self._counts,
-                "turns_active": self._active_turns,
+                "turns_active": len(self._active),
                 "turns_waiting": len(self._waiting),
                 "outcomes": dict(self._outcomes),
             },
@@ -872,26 +878,36 @@ class ReceiveLoop:
     ) -> Literal["started", "refused", "queued"]:
         """Start a turn now when a slot is free, else let it wait for one
         (held out of the gate by its tracker entry meanwhile)."""
-        if self._active_turns >= self._max_turns:
+        if len(self._active) >= self._max_turns:
             self._waiting.append((handle, admit))
             self._counts["turns_queued"] += 1
             return "queued"
-        self._active_turns += 1
+        self._active.add(handle)
         if await admit():
             return "started"
-        self._active_turns -= 1
+        self._active.discard(handle)
         return "refused"
 
     async def _pump(self) -> None:
         """A slot freed: start the turns waiting for one."""
-        while self._waiting and self._active_turns < self._max_turns and not self._stopped:
-            _handle, admit = self._waiting.popleft()
-            self._active_turns += 1
+        while self._waiting and len(self._active) < self._max_turns and not self._stopped:
+            handle, admit = self._waiting.popleft()
+            if not self._tracker.holds(handle):
+                continue  # released while it waited: it never starts
+            self._active.add(handle)
             if not await admit():
-                self._active_turns -= 1
+                self._active.discard(handle)
 
-    def _slot_freed(self) -> None:
-        self._active_turns = max(0, self._active_turns - 1)
+    def _on_turn_released(self, handle: TurnHandle) -> None:
+        waiting = [entry for entry in self._waiting if entry[0] is not handle]
+        if len(waiting) != len(self._waiting):
+            self._waiting = deque(waiting)
+        self._slot_freed(handle)
+
+    def _slot_freed(self, handle: TurnHandle) -> None:
+        if handle not in self._active:
+            return
+        self._active.discard(handle)
         if self._waiting and not self._stopped:
             self._spawn_turn(self._pump())
 
@@ -907,7 +923,7 @@ class ReceiveLoop:
             await self._track(self._record_reply_outcome(handle, card, category, end))
         finally:
             self._tracker.end(handle)
-            self._slot_freed()
+            self._slot_freed(handle)
             self._after_turn_ended()
 
     async def _record_reply_outcome(
@@ -988,7 +1004,7 @@ class ReceiveLoop:
             self._pacer.hold(f"invite:{invite['invite_id']}", None)
         finally:
             self._tracker.end(handle)
-            self._slot_freed()
+            self._slot_freed(handle)
             self._after_turn_ended()
 
     async def _after_run_invites(self, invites: list[dict[str, Any]], end: RunEnd) -> None:
@@ -1000,7 +1016,7 @@ class ReceiveLoop:
             else TurnEnd(status="failed", detail=end.detail)
         )
         for invite in invites:
-            await self._settle_invite(invite, turn, fresh)
+            await self._finish_invite(invite, turn, fresh)
 
     async def _record_invite_outcome(
         self, invite: dict[str, Any], end: TurnEnd, handle: TurnHandle
@@ -1008,9 +1024,9 @@ class ReceiveLoop:
         fresh = await self._read_tray()
         if not self._tracker.holds(handle):
             return  # released while the tray was read: nothing recorded
-        await self._settle_invite(invite, end, fresh)
+        await self._finish_invite(invite, end, fresh)
 
-    async def _settle_invite(
+    async def _finish_invite(
         self, invite: dict[str, Any], end: TurnEnd, fresh: dict[str, Any] | None
     ) -> None:
         """The D5 rule for one invite after a turn or a run, and the one call

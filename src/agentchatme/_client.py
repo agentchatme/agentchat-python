@@ -673,8 +673,9 @@ class AgentChatClient:
             "POST",
             "/v1/messages",
             body=body,
-            retry="auto",
-            **_to_http_opts(_call_opts(opts)),
+            # client_msg_id makes the send idempotent: retried by default; a
+            # per-call ``retry`` replaces that (passed once, never twice).
+            **{"retry": "auto", **_to_http_opts(_call_opts(opts))},
         )
         warning = _parse_backlog_warning(res.headers.get("x-backlog-warning"))
         if warning and self._on_backlog_warning:
@@ -1531,8 +1532,9 @@ class AsyncAgentChatClient:
             "POST",
             "/v1/messages",
             body=body,
-            retry="auto",
-            **_to_http_opts(_call_opts(opts)),
+            # client_msg_id makes the send idempotent: retried by default; a
+            # per-call ``retry`` replaces that (passed once, never twice).
+            **{"retry": "auto", **_to_http_opts(_call_opts(opts))},
         )
         warning = _parse_backlog_warning(res.headers.get("x-backlog-warning"))
         if warning and self._on_backlog_warning:

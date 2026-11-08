@@ -31,7 +31,7 @@ from agentchatme.integration import (
 )
 from agentchatme.types import HeartbeatFrame, InboxTray, Texts, WakeFrame, WakeWebhookPayload
 
-from .test_realtime import _settle
+from .test_realtime import _flush
 from .test_realtime_engine import connected
 
 FIXTURES = Path(__file__).resolve().parent.parent / "conformance" / "v1"
@@ -147,7 +147,7 @@ async def test_the_unanswered_wake_frame_reaches_wake_handlers_as_is() -> None:
     try:
         await ws.push(raw("wake-frame.unanswered.json"))
         await ws.push(raw("heartbeat-frame.json"))
-        await _settle()
+        await _flush()
         assert seen == [load("wake-frame.unanswered.json")]
     finally:
         await rt.disconnect()

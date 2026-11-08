@@ -178,6 +178,34 @@ def test_decisions_record_succeeds_on_any_2xx(response: httpx.Response) -> None:
         assert decision.id is None and decision.created_at is None
 
 
+# ─────────────── send_message with a per-call retry ───────────────
+
+
+@pytest.mark.parametrize("retry", ["never", "auto", RetryPolicy(max_retries=1, base_delay_ms=1, max_delay_ms=1)])
+@respx.mock
+def test_send_message_takes_a_per_call_retry(retry: Any) -> None:
+    route = respx.post(f"{BASE}/v1/messages").mock(
+        side_effect=[httpx.Response(503, json={}), httpx.Response(201, json={"id": "m1"})]
+    )
+    if retry == "never":
+        with pytest.raises(ServerError):
+            _client().send_message(to="@example-peer", text="hi", opts=CallOptions(retry=retry))
+        assert route.call_count == 1
+    else:
+        _client().send_message(to="@example-peer", text="hi", opts=CallOptions(retry=retry))
+        assert route.call_count == 2
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_async_send_message_takes_a_per_call_retry() -> None:
+    route = respx.post(f"{BASE}/v1/messages").mock(return_value=httpx.Response(503, json={}))
+    async with AsyncAgentChatClient(api_key="ac_test", base_url=BASE) as client:
+        with pytest.raises(ServerError):
+            await client.send_message(to="@example-peer", text="hi", opts=CallOptions(retry="never"))
+    assert route.call_count == 1
+
+
 # ─────────────── /context ───────────────
 
 CONTEXT: dict[str, Any] = {

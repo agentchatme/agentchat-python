@@ -47,7 +47,7 @@ Failure policy
     to start a turn anyway can do so from ``outcome == "fail_closed"``.
 
 Where the two gates this replaces differed (Hermes ``gate.py``, OpenClaw
-``doorbell/gate.ts``), the stricter rule won, and the TypeScript SDK's
+``gate.ts``), the stricter rule won, and the TypeScript SDK's
 ``gate.ts`` is the twin of this module:
 
 - Dismiss synonyms: Hermes also took ``close`` / ``closed``; OpenClaw did
@@ -60,7 +60,7 @@ Where the two gates this replaces differed (Hermes ``gate.py``, OpenClaw
 - Retry without category on a 400: both did. Not here — the category comes
   from the list the server itself served, so a 400 is a real error and is
   reported in :attr:`GateResult.record_failures`.
-- ``reply`` verdicts: both skipped posting them (recording used to settle
+- ``reply`` verdicts: both skipped posting them (recording used to finish
   delivery and empty the tray). Recorded here: read state is separate from
   delivery now, and the turn reads the conversation itself.
 
