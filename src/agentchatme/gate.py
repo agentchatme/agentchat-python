@@ -10,8 +10,11 @@ Code we keep, brain we don't
     This module only lays them out, parses the answer and records the
     verdicts with ``client.decisions.record``. No model runs here: the host
     passes ``call_model(prompt) -> str`` so the judgement is the agent's own
-    model, in the host's own harness. Without the served gate-call texts the
-    gate fails closed.
+    model, in the host's own harness. Called without the served gate-call
+    texts (a host written before contract v1, or texts from a server that
+    predates them), the prompt keeps the wording this module used before
+    (:data:`LEGACY_GATE_CALL_PREAMBLE`, deprecated), so an upgrade alone
+    never changes what a host's gate does.
 
 What gets recorded, and when
     ``dismiss`` and ``defer`` are recorded at once, each anchored to the
@@ -114,25 +117,62 @@ _HOSTED_TOOL_TOKEN = re.compile(r"\bagentchat_[a-z0-9_]+\b")
 TextsLike = Union["Texts", Mapping[str, Any]]
 """Parsed :class:`~agentchatme.types.Texts` or the raw ``GET /v1/texts`` JSON."""
 
+# The verdict tool the legacy preamble names; spelled through the namer.
+_DECIDE_TOOL = "agentchat_decide"
 
-def gate_call_texts(texts: TextsLike | None) -> tuple[str, str]:
-    """``(preamble, answer format)`` from the served texts.
+LEGACY_GATE_CALL_PREAMBLE = (
+    "You are triaging your AgentChat tray before any turn starts. This call has NO tools: "
+    "do not call agentchat_decide, do not open or send anything, and do not write a reply. "
+    "Answer the question below for every card, in JSON only; the host records your verdicts "
+    "from that JSON. Where the question says to record a verdict or to send, that happens "
+    'later: for each conversation you mark "reply", a turn will be started in which you open '
+    "it and reply."
+)
+"""Deprecated: the gate-call preamble this SDK used before the server served
+it (contract v1, ``texts.gate_call_preamble``). Used only when a host calls
+the gate without served texts; pass ``texts=`` instead. Kept so a host that
+upgrades the SDK without changing its code gates exactly as before."""
 
-    Raises :class:`ValueError` when either is missing or empty (texts from a
-    server that predates them, or none at all): the gate then fails closed
-    rather than judge with words this SDK made up.
-    """
+
+def prompt_preamble(tool_namer: ToolNamer | None = None) -> str:
+    """Deprecated: :data:`LEGACY_GATE_CALL_PREAMBLE` with the verdict tool
+    spelled through ``tool_namer``. Pass the served texts to
+    :func:`build_prompt` instead."""
+    namer = tool_namer or bare_tool_namer
+    return LEGACY_GATE_CALL_PREAMBLE.replace(_DECIDE_TOOL, namer(_DECIDE_TOOL), 1)
+
+
+def _legacy_answer_format(categories: list[str]) -> str:
+    """The answer shape this SDK wrote before the server served it."""
+    shape = (
+        '{"decisions": [{"conversation_id": "<conversation_id from a card>", '
+        '"decision": "reply" | "dismiss" | "defer"'
+    )
+    if categories:
+        shape += ', "category": "<one of: ' + ", ".join(categories) + '>"'
+    shape += "}]}"
+    return (
+        "Answer with ONLY a JSON object, no prose and no code fences, in this shape: "
+        + shape
+        + " — one entry per card, every card decided."
+    )
+
+
+def gate_call_texts(texts: TextsLike | None) -> tuple[str, str] | None:
+    """``(preamble, answer format)`` from the served texts, or ``None`` when
+    either is missing or empty (no texts, or texts from a server that
+    predates them)."""
     if texts is None:
-        raise ValueError("gate: no served texts (gate_call_preamble, gate_call_answer_format)")
+        return None
     data: Mapping[str, Any] = (
         texts if isinstance(texts, Mapping) else texts.model_dump(mode="json")
     )
     preamble = data.get("gate_call_preamble")
     answer_format = data.get("gate_call_answer_format")
     if not isinstance(preamble, str) or not preamble.strip():
-        raise ValueError("gate: the served texts carry no gate_call_preamble")
+        return None
     if not isinstance(answer_format, str) or not answer_format.strip():
-        raise ValueError("gate: the served texts carry no gate_call_answer_format")
+        return None
     return preamble.strip(), answer_format.strip()
 
 
@@ -226,34 +266,39 @@ def build_prompt(
     tray: TrayLike,
     tool_namer: ToolNamer | None = None,
     *,
-    texts: TextsLike | None,
+    texts: TextsLike | None = None,
 ) -> str:
-    """Render the gate prompt for one tray: the served preamble, the
-    server's question verbatim, the categories, one block per card, then the
-    served answer format. Pure.
+    """Render the gate prompt for one tray: the preamble, the server's
+    question verbatim, the categories, one block per card, then the answer
+    format. Pure.
 
     ``texts`` are the served texts (``client.texts.get(runtime=...)``, or a
-    :class:`~agentchatme.integration.TextsCache`'s ``current()``); their
-    preamble and answer format come already spelled for the runtime and are
-    used verbatim. ``tool_namer`` re-spells the hosted tool names inside the
-    tray's question (``agentchat_…``) the way this runtime exposes them;
-    default: as served.
+    :class:`~agentchatme.integration.TextsCache`'s ``current()``): their
+    ``gate_call_preamble`` and ``gate_call_answer_format`` come already
+    spelled for the runtime and are used verbatim. Without them (no
+    ``texts``, or texts from a server that predates contract v1) the
+    deprecated legacy wording is used, as before. ``tool_namer`` re-spells
+    the hosted tool names inside the tray's question (and the legacy
+    preamble) the way this runtime exposes them; default: as served.
 
-    Raises :class:`ValueError` when the tray carries no question or the
-    texts carry no gate-call preamble or answer format — judging without
-    them is exactly the drift this design removes, so the gate fails closed.
+    Raises :class:`ValueError` when the tray carries no question — judging
+    without it is exactly the drift this design removes, so the gate fails
+    closed instead.
     """
     data = _tray_data(tray)
     question = data.get("question")
     if not isinstance(question, str) or not question.strip():
         raise ValueError("gate: tray carries no question")
-    preamble, answer_format = gate_call_texts(texts)
     namer = tool_namer or bare_tool_namer
     cards = cards_of(data)
     categories = _categories_of(data)
+    served = gate_call_texts(texts)
+    if served is not None:
+        # Served already spelled for the runtime (``GET /v1/texts?runtime=``).
+        preamble, answer_format = served
+    else:
+        preamble, answer_format = prompt_preamble(namer), _legacy_answer_format(categories)
 
-    # The preamble and the answer format are served already spelled for the
-    # runtime (``GET /v1/texts?runtime=``); the tray's question is not.
     sections: list[str] = [preamble]
     sections.append(_respell(question.strip(), namer))
 
@@ -531,13 +576,13 @@ def run(
     call_model: CallModel,
     client: AgentChatClient,
     *,
-    texts: TextsLike | None,
     tool_namer: ToolNamer | None = None,
+    texts: TextsLike | None = None,
 ) -> GateResult[GateReply]:
     """Decide every card on the tray. Never raises: model and network
     failures land in the result. ``texts`` are the served texts the prompt
-    is built from (see :func:`build_prompt`); without their gate-call
-    fields the gate fails closed and nothing is recorded.
+    is built from (see :func:`build_prompt`; without them, the legacy
+    wording).
 
     ``dismiss`` and ``defer`` are recorded here, sequentially (a tray holds
     at most 50 cards), each anchored to its card. ``reply`` is handed back
@@ -595,8 +640,8 @@ async def run_async(
     call_model: AsyncCallModel,
     client: AsyncAgentChatClient,
     *,
-    texts: TextsLike | None,
     tool_namer: ToolNamer | None = None,
+    texts: TextsLike | None = None,
 ) -> GateResult[AsyncGateReply]:
     """Async counterpart of :func:`run`. ``call_model`` may be sync or async;
     reply entries are recorded with ``await entry.record()``."""
@@ -695,6 +740,7 @@ def _finish(
 
 
 __all__ = [
+    "LEGACY_GATE_CALL_PREAMBLE",
     "AsyncCallModel",
     "AsyncGateReply",
     "CallModel",
@@ -715,6 +761,7 @@ __all__ = [
     "mcp_tool_namer",
     "normalize_decision",
     "parse_verdicts",
+    "prompt_preamble",
     "run",
     "run_async",
 ]

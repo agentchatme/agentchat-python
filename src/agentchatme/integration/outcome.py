@@ -36,7 +36,7 @@ from __future__ import annotations
 
 import inspect
 from collections.abc import Awaitable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any, Literal, Protocol, Union
 
@@ -60,8 +60,9 @@ class AgentChatCallCount:
 class TurnEnd:
     """What the runtime reports about a turn.
 
-    A wait that timed out is not an end: report ``still_running`` and the
-    turn keeps its conversation (see
+    A wait that timed out is not an end: report ``still_running`` (with
+    ``next``, an awaitable of the next report, when the runtime can say when
+    it really ends) and the turn keeps its conversation (see
     :class:`~agentchatme.integration.TurnTracker`). ``agentchat_calls`` is
     ``None`` when the runtime cannot count its AgentChat calls; that counts
     as "it looked".
@@ -70,6 +71,7 @@ class TurnEnd:
     status: TurnStatus
     agentchat_calls: AgentChatCallCount | None = None
     detail: str | None = None
+    next: Awaitable[TurnEnd] | None = field(default=None, compare=False, repr=False)
 
 
 TurnOutcomeReason = Literal[

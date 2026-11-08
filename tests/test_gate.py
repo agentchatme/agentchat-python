@@ -124,9 +124,37 @@ def test_build_prompt_raises_without_a_question() -> None:
         {k: v for k, v in GATE_TEXTS.items() if k != "gate_call_preamble"},
     ],
 )
-def test_build_prompt_fails_closed_without_the_served_gate_call_texts(served: Any) -> None:
-    with pytest.raises(ValueError, match="gate_call"):
-        gate.build_prompt(sample_tray(), texts=served)
+def test_without_the_served_gate_call_texts_the_legacy_wording_is_kept(served: Any) -> None:
+    # A host written before contract v1 calls the gate without texts, and a
+    # server before contract v1 serves texts without the gate-call fields:
+    # both gate exactly as before the upgrade.
+    tray = sample_tray()
+    legacy = gate.build_prompt(tray, texts=served)
+    assert legacy == gate.build_prompt(tray)
+    assert legacy.startswith(gate.LEGACY_GATE_CALL_PREAMBLE + "\n\n" + tray["question"])
+    named = gate.build_prompt(tray, tool_namer=gate.mcp_tool_namer("ac"), texts=served)
+    assert named.startswith(gate.prompt_preamble(gate.mcp_tool_namer("ac")))
+    assert "do not call mcp__ac__agentchat_decide," in named
+
+
+def test_the_legacy_answer_format_follows_the_trays_categories() -> None:
+    tray = sample_tray()
+    tray["categories"] = []
+    prompt = gate.build_prompt(tray)
+    assert '"category": "<one of' not in prompt
+    assert prompt.endswith(
+        '"decision": "reply" | "dismiss" | "defer"}]} — one entry per card, every card decided.'
+    )
+
+
+def test_run_without_texts_gates_as_before() -> None:
+    prompts: list[str] = []
+    gate.run(
+        sample_tray(),
+        lambda p: prompts.append(p) or "",
+        FakeClient(FakeDecisions()),  # type: ignore[arg-type]
+    )
+    assert prompts == [gate.build_prompt(sample_tray())]
 
 
 def test_build_prompt_takes_typed_texts() -> None:

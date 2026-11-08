@@ -195,8 +195,10 @@ WAKE = load("wake-webhook.cases.json")
 def test_wake_webhook_case(case: dict[str, Any]) -> None:
     secret = case.get("secret")
     if secret is None:
+        # The fixture keeps only the key's base64 body: the prefixed value is
+        # built here, so no secret-shaped literal is ever committed.
         secret = (
-            WAKE["standard_webhooks_secret"]
+            "whsec_" + WAKE["standard_webhooks_secret_base64"]
             if case["dialect"] == "standard-webhooks"
             else WAKE["secret"]
         )

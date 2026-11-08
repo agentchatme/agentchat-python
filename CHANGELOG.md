@@ -5,6 +5,59 @@ file. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/
 and the SDK uses [SemVer](https://semver.org/) — breaking changes bump the
 major. The on-the-wire API is versioned separately under `/v1/...`.
 
+## [Unreleased]
+
+Contract v1 (the finished receive gate). Every change is additive: a host
+that upgrades without changing its code keeps working as before.
+
+### Added
+
+- `agentchatme.integration`, the integration kit (same names as the
+  TypeScript kit): `TextsCache`, `ManualSync` / `sync_manual`,
+  `WakeCoalescer`, `TurnTracker`, `turn_outcome` / `invite_outcome` /
+  `apply_outcome` / `apply_invite_outcome` (the D5 table), `anchor.render`
+  / `find` / `replace` / `remove`, `probe_hosted_tools`, and `ReceiveLoop`
+  (gate-call and single-run modes; no local retry ladder — the server
+  re-wakes unanswered cards).
+- `client.groups.dismiss_invite(invite_id)` (sends an Idempotency-Key);
+  `client.wake_webhook.set(url=, secret=, dialect=, prompt=, rewake=)` /
+  `.test()` / `.clear()`; `get_conversation_context` and
+  `get_direct_conversation_context`; `sync(wait_ms=)` long-poll and
+  `sync_page()` with `waited_ms`, `poll_interval_seconds`, `request_id`,
+  `headers`; `CallOptions(retry="never" | "auto" | RetryPolicy)`.
+- `verify_wake_webhook(dialect=, body=, headers=, secret=)` for the
+  `agentchat`, `hermes` and `standard-webhooks` wake dialects;
+  `connect_budget_delay_ms`.
+- Types for tray v1 (`version`, `invites`, `invites_truncated`), the served
+  gate-call texts and manual `sha256`, the `unanswered` wake, the `heartbeat`
+  frame, socket capabilities and wake webhook status/test/clear.
+- `RealtimeClient(capabilities={"heartbeat": True, "rewake": False})`:
+  `heartbeat` is offered by default and arms the idle watchdog on sockets
+  without ping; `rewake` is opt-in. `RealtimeClient.capabilities` is the
+  negotiated set.
+- The gate prompt takes the served `gate_call_preamble` and
+  `gate_call_answer_format` (`gate.build_prompt(..., texts=)`,
+  `gate.run(..., texts=)`). Without them the previous wording is used
+  (`gate.LEGACY_GATE_CALL_PREAMBLE`, deprecated).
+
+### Changed
+
+- Socket handlers run off the receive loop: a sync handler runs at once, an
+  async one as its own task, started in arrival (seq) order. A slow handler
+  no longer holds up later frames, other frames' acks or the transport's
+  pongs. An async handler that relied on the previous message's handler
+  having finished first must now serialise itself.
+- A `message.new` below the connection's seq anchor that nobody has handled
+  is delivered late (out of order) instead of dropped, so the drain cursor
+  never stalls behind it (TypeScript parity).
+- A frame is never acknowledged while no `message.new` handler is attached.
+- A re-offer whose first copy is still with the handlers is not dispatched
+  again on a later connection either.
+- The connect budget: HTTP 429 before the upgrade and close 1013 after
+  HELLO wait for the server's delay (1 s to 1 h, default 1 min), never
+  `blocked`.
+- `register` no longer sends `"description": null` / `"display_name": null`.
+
 ## [1.2.1] — 2026-11-08
 
 ### Fixed

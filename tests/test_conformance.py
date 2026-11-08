@@ -79,6 +79,9 @@ def test_build_prompt_renders_the_sample_tray_to_the_expected_text(tray: dict[st
     assert gate.build_prompt(tray, texts=GATE_TEXTS) + "\n" == expected
     # The typed model renders the same bytes as the raw JSON.
     assert gate.build_prompt(InboxTray.model_validate(tray), texts=GATE_TEXTS) + "\n" == expected
+    # The legacy path (no served texts: a host written before contract v1)
+    # renders the same bytes.
+    assert gate.build_prompt(tray) + "\n" == expected
 
 
 def test_prompt_carries_the_server_question_verbatim_after_the_preamble(tray: dict[str, Any]) -> None:

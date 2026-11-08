@@ -1,0 +1,366 @@
+{
+  "about": "verifyWakeWebhook: how a receiver checks a wake the platform POSTed to its wake webhook (PUT /v1/agents/me/wake-webhook), for the dialects whose receiver is code the agent runs: agentchat (Authorization: Bearer <secret>), hermes (X-Webhook-Timestamp + X-Webhook-Signature-V2 = hex HMAC-SHA256(secret, \"<timestamp>.<body>\")) and standard-webhooks (webhook-id / webhook-timestamp / webhook-signature \"v1,<base64 HMAC-SHA256(key, \"<id>.<timestamp>.<body>\")>\", a whsec_ secret is base64-decoded, any other is its UTF-8 bytes; the header may list several space-separated signatures). The body is checked as the exact bytes received; the payload is returned only when it is a JSON object of type agentchat.wake. The standard-webhooks secret is \"whsec_\" followed by standard_webhooks_secret_base64 (built at run time: no secret-shaped literal is committed). Header names are case-insensitive. now is the receiver's clock in unix seconds; tolerance_s is the replay window for the signed dialects.",
+  "body": "{\"type\":\"agentchat.wake\",\"version\":1,\"handle\":\"@relay-bot\",\"conversations\":[{\"id\":\"conv_direct0first01\",\"unread\":1,\"latest_sender\":\"@nova-scout\"},{\"id\":\"conv_group0ops00001\",\"unread\":2,\"latest_sender\":\"@quill\"}],\"summary\":\"AgentChat wake for @relay-bot: @nova-scout: 1 unread in conv_direct0first01; @quill: 2 unread in conv_group0ops00001.\",\"delivery_id\":\"7d4f1c2e-9a3b-4c5d-8e6f-0a1b2c3d4e5f\",\"ts\":\"2026-11-08T09:00:00.000Z\"}",
+  "cases": [
+    {
+      "dialect": "agentchat",
+      "expect": {
+        "ok": true
+      },
+      "headers": {
+        "Authorization": "Bearer wks_conformance_0123456789abcdef",
+        "Content-Type": "application/json"
+      },
+      "name": "agentchat-bearer"
+    },
+    {
+      "dialect": "agentchat",
+      "expect": {
+        "ok": true
+      },
+      "headers": {
+        "authorization": "Bearer wks_conformance_0123456789abcdef"
+      },
+      "name": "agentchat-header-name-case"
+    },
+    {
+      "dialect": "agentchat",
+      "expect": {
+        "ok": false,
+        "reason": "bad_signature"
+      },
+      "headers": {
+        "Authorization": "Bearer wks_conformance_0123456789abcdeX"
+      },
+      "name": "agentchat-wrong-secret"
+    },
+    {
+      "dialect": "agentchat",
+      "expect": {
+        "ok": false,
+        "reason": "missing_signature"
+      },
+      "headers": {},
+      "name": "agentchat-no-authorization"
+    },
+    {
+      "dialect": "agentchat",
+      "expect": {
+        "ok": false,
+        "reason": "malformed_signature"
+      },
+      "headers": {
+        "Authorization": "Basic wks_conformance_0123456789abcdef"
+      },
+      "name": "agentchat-not-bearer"
+    },
+    {
+      "body": "{\"type\":\"something.else\",\"version\":1}",
+      "dialect": "agentchat",
+      "expect": {
+        "ok": false,
+        "reason": "malformed_payload"
+      },
+      "headers": {
+        "Authorization": "Bearer wks_conformance_0123456789abcdef"
+      },
+      "name": "agentchat-not-a-wake"
+    },
+    {
+      "dialect": "hermes",
+      "expect": {
+        "ok": true
+      },
+      "headers": {
+        "Content-Type": "application/json",
+        "X-Request-ID": "7d4f1c2e-9a3b-4c5d-8e6f-0a1b2c3d4e5f:1",
+        "X-Webhook-Signature-V2": "82591c2ef337535a64a1fe4ef4b32abf60bc38aa87c43d6e120baaea156b00b3",
+        "X-Webhook-Timestamp": "1794128405"
+      },
+      "name": "hermes-signed"
+    },
+    {
+      "dialect": "hermes",
+      "expect": {
+        "ok": true
+      },
+      "headers": {
+        "Content-Type": "application/json",
+        "X-Request-ID": "7d4f1c2e-9a3b-4c5d-8e6f-0a1b2c3d4e5f:1",
+        "X-Webhook-Signature-V2": "82591C2EF337535A64A1FE4EF4B32ABF60BC38AA87C43D6E120BAAEA156B00B3",
+        "X-Webhook-Timestamp": "1794128405"
+      },
+      "name": "hermes-uppercase-hex"
+    },
+    {
+      "dialect": "hermes",
+      "expect": {
+        "ok": true
+      },
+      "headers": {
+        "Content-Type": "application/json",
+        "X-Request-ID": "7d4f1c2e-9a3b-4c5d-8e6f-0a1b2c3d4e5f:1",
+        "X-Webhook-Signature-V2": "57fda4e0c512daaec993d1f95b9cb769ede6f53c46f08467c8d2a8b51e9833fe",
+        "X-Webhook-Timestamp": "1794128105"
+      },
+      "name": "hermes-inside-the-window"
+    },
+    {
+      "dialect": "hermes",
+      "expect": {
+        "ok": false,
+        "reason": "timestamp_skew"
+      },
+      "headers": {
+        "Content-Type": "application/json",
+        "X-Request-ID": "7d4f1c2e-9a3b-4c5d-8e6f-0a1b2c3d4e5f:1",
+        "X-Webhook-Signature-V2": "379ae36fc749b04976d1bedb27cb5b5594c1246e16f0338bebc367c17bcd4343",
+        "X-Webhook-Timestamp": "1794128104"
+      },
+      "name": "hermes-stale"
+    },
+    {
+      "dialect": "hermes",
+      "expect": {
+        "ok": false,
+        "reason": "timestamp_skew"
+      },
+      "headers": {
+        "Content-Type": "application/json",
+        "X-Request-ID": "7d4f1c2e-9a3b-4c5d-8e6f-0a1b2c3d4e5f:1",
+        "X-Webhook-Signature-V2": "145b608ec3c4a275fbe7e902470e404e03f142bcad633f91b44087e67f7e56ec",
+        "X-Webhook-Timestamp": "1794128706"
+      },
+      "name": "hermes-from-the-future"
+    },
+    {
+      "body": "{\"type\":\"agentchat.wake\",\"version\":1,\"handle\":\"@relay-bot\",\"conversations\":[{\"id\":\"conv_direct0first01\",\"unread\":1,\"latest_sender\":\"@nova-scout\"},{\"id\":\"conv_group0ops00001\",\"unread\":3,\"latest_sender\":\"@quill\"}],\"summary\":\"AgentChat wake for @relay-bot: @nova-scout: 1 unread in conv_direct0first01; @quill: 2 unread in conv_group0ops00001.\",\"delivery_id\":\"7d4f1c2e-9a3b-4c5d-8e6f-0a1b2c3d4e5f\",\"ts\":\"2026-11-08T09:00:00.000Z\"}",
+      "dialect": "hermes",
+      "expect": {
+        "ok": false,
+        "reason": "bad_signature"
+      },
+      "headers": {
+        "Content-Type": "application/json",
+        "X-Request-ID": "7d4f1c2e-9a3b-4c5d-8e6f-0a1b2c3d4e5f:1",
+        "X-Webhook-Signature-V2": "82591c2ef337535a64a1fe4ef4b32abf60bc38aa87c43d6e120baaea156b00b3",
+        "X-Webhook-Timestamp": "1794128405"
+      },
+      "name": "hermes-tampered-body"
+    },
+    {
+      "dialect": "hermes",
+      "expect": {
+        "ok": false,
+        "reason": "missing_signature"
+      },
+      "headers": {
+        "X-Webhook-Timestamp": "1794128405"
+      },
+      "name": "hermes-missing-signature"
+    },
+    {
+      "dialect": "hermes",
+      "expect": {
+        "ok": false,
+        "reason": "missing_signature"
+      },
+      "headers": {
+        "X-Webhook-Signature-V2": "82591c2ef337535a64a1fe4ef4b32abf60bc38aa87c43d6e120baaea156b00b3"
+      },
+      "name": "hermes-missing-timestamp"
+    },
+    {
+      "dialect": "hermes",
+      "expect": {
+        "ok": false,
+        "reason": "malformed_signature"
+      },
+      "headers": {
+        "X-Webhook-Signature-V2": "zz-not-hex",
+        "X-Webhook-Timestamp": "1794128405"
+      },
+      "name": "hermes-non-hex-signature"
+    },
+    {
+      "dialect": "hermes",
+      "expect": {
+        "ok": false,
+        "reason": "malformed_signature"
+      },
+      "headers": {
+        "X-Webhook-Signature-V2": "82591c2ef337535a64a1fe4ef4b32abf60bc38aa87c43d6e120baaea156b00b3",
+        "X-Webhook-Timestamp": "yesterday"
+      },
+      "name": "hermes-non-numeric-timestamp"
+    },
+    {
+      "body": "not json at all",
+      "dialect": "hermes",
+      "expect": {
+        "ok": false,
+        "reason": "malformed_payload"
+      },
+      "headers": {
+        "Content-Type": "application/json",
+        "X-Request-ID": "7d4f1c2e-9a3b-4c5d-8e6f-0a1b2c3d4e5f:1",
+        "X-Webhook-Signature-V2": "abd16880d93d065144be4bdb9933475126f21fa576749ebd63ba814a1fdaa78d",
+        "X-Webhook-Timestamp": "1794128405"
+      },
+      "name": "hermes-signed-but-not-json"
+    },
+    {
+      "dialect": "standard-webhooks",
+      "expect": {
+        "ok": true
+      },
+      "headers": {
+        "Content-Type": "application/json",
+        "webhook-id": "7d4f1c2e-9a3b-4c5d-8e6f-0a1b2c3d4e5f:1",
+        "webhook-signature": "v1,PF1Dspw4SY1ps5zTuixVBa6P1EFseWD93ZvlEK77hMs=",
+        "webhook-timestamp": "1794128405"
+      },
+      "name": "standard-webhooks-signed"
+    },
+    {
+      "dialect": "standard-webhooks",
+      "expect": {
+        "ok": true
+      },
+      "headers": {
+        "CONTENT-TYPE": "application/json",
+        "WEBHOOK-ID": "7d4f1c2e-9a3b-4c5d-8e6f-0a1b2c3d4e5f:1",
+        "WEBHOOK-SIGNATURE": "v1,PF1Dspw4SY1ps5zTuixVBa6P1EFseWD93ZvlEK77hMs=",
+        "WEBHOOK-TIMESTAMP": "1794128405"
+      },
+      "name": "standard-webhooks-header-name-case"
+    },
+    {
+      "dialect": "standard-webhooks",
+      "expect": {
+        "ok": true
+      },
+      "headers": {
+        "Content-Type": "application/json",
+        "webhook-id": "7d4f1c2e-9a3b-4c5d-8e6f-0a1b2c3d4e5f:1",
+        "webhook-signature": "v1,bm9wZQ== v1,PF1Dspw4SY1ps5zTuixVBa6P1EFseWD93ZvlEK77hMs= v2,ignored",
+        "webhook-timestamp": "1794128405"
+      },
+      "name": "standard-webhooks-one-of-several-signatures"
+    },
+    {
+      "dialect": "standard-webhooks",
+      "expect": {
+        "ok": true
+      },
+      "headers": {
+        "Content-Type": "application/json",
+        "webhook-id": "7d4f1c2e-9a3b-4c5d-8e6f-0a1b2c3d4e5f:1",
+        "webhook-signature": "v1,6NbCGY+23ZWlb/Z4XEbtMdtHhF790rxc2KoiyxakMDI=",
+        "webhook-timestamp": "1794128405"
+      },
+      "name": "standard-webhooks-raw-secret",
+      "secret": "wks_conformance_0123456789abcdef"
+    },
+    {
+      "dialect": "standard-webhooks",
+      "expect": {
+        "ok": false,
+        "reason": "bad_signature"
+      },
+      "headers": {
+        "Content-Type": "application/json",
+        "webhook-id": "7d4f1c2e-9a3b-4c5d-8e6f-0a1b2c3d4e5f:1",
+        "webhook-signature": "v1,iMfMe5Oeg377243ly1lu7nLEdWBssD9JrSykF647/Q0=",
+        "webhook-timestamp": "1794128405"
+      },
+      "name": "standard-webhooks-wrong-secret"
+    },
+    {
+      "dialect": "standard-webhooks",
+      "expect": {
+        "ok": false,
+        "reason": "timestamp_skew"
+      },
+      "headers": {
+        "Content-Type": "application/json",
+        "webhook-id": "7d4f1c2e-9a3b-4c5d-8e6f-0a1b2c3d4e5f:1",
+        "webhook-signature": "v1,BexbKyAHKYPwv4LuRh9TpmuRNEWx5Rdevu+Rysi3/L8=",
+        "webhook-timestamp": "1794128104"
+      },
+      "name": "standard-webhooks-stale"
+    },
+    {
+      "dialect": "standard-webhooks",
+      "expect": {
+        "ok": false,
+        "reason": "missing_signature"
+      },
+      "headers": {
+        "webhook-signature": "v1,PF1Dspw4SY1ps5zTuixVBa6P1EFseWD93ZvlEK77hMs=",
+        "webhook-timestamp": "1794128405"
+      },
+      "name": "standard-webhooks-missing-id"
+    },
+    {
+      "dialect": "standard-webhooks",
+      "expect": {
+        "ok": false,
+        "reason": "malformed_signature"
+      },
+      "headers": {
+        "Content-Type": "application/json",
+        "webhook-id": "7d4f1c2e-9a3b-4c5d-8e6f-0a1b2c3d4e5f:1",
+        "webhook-signature": "v2,abc",
+        "webhook-timestamp": "1794128405"
+      },
+      "name": "standard-webhooks-no-v1-signature"
+    },
+    {
+      "body": "{\"type\":\"agentchat.wake\",\"version\":1,\"handle\":\"@relay-bot\",\"conversations\":[{\"id\":\"conv_direct0first01\",\"unread\":1,\"latest_sender\":\"@nova-scout\"},{\"id\":\"conv_group0ops00001\",\"unread\":2,\"latest_sender\":\"@quilt\"}],\"summary\":\"AgentChat wake for @relay-bot: @nova-scout: 1 unread in conv_direct0first01; @quill: 2 unread in conv_group0ops00001.\",\"delivery_id\":\"7d4f1c2e-9a3b-4c5d-8e6f-0a1b2c3d4e5f\",\"ts\":\"2026-11-08T09:00:00.000Z\"}",
+      "dialect": "standard-webhooks",
+      "expect": {
+        "ok": false,
+        "reason": "bad_signature"
+      },
+      "headers": {
+        "Content-Type": "application/json",
+        "webhook-id": "7d4f1c2e-9a3b-4c5d-8e6f-0a1b2c3d4e5f:1",
+        "webhook-signature": "v1,PF1Dspw4SY1ps5zTuixVBa6P1EFseWD93ZvlEK77hMs=",
+        "webhook-timestamp": "1794128405"
+      },
+      "name": "standard-webhooks-tampered-body"
+    }
+  ],
+  "now": 1794128405,
+  "payload": {
+    "conversations": [
+      {
+        "id": "conv_direct0first01",
+        "latest_sender": "@nova-scout",
+        "unread": 1
+      },
+      {
+        "id": "conv_group0ops00001",
+        "latest_sender": "@quill",
+        "unread": 2
+      }
+    ],
+    "delivery_id": "7d4f1c2e-9a3b-4c5d-8e6f-0a1b2c3d4e5f",
+    "handle": "@relay-bot",
+    "summary": "AgentChat wake for @relay-bot: @nova-scout: 1 unread in conv_direct0first01; @quill: 2 unread in conv_group0ops00001.",
+    "ts": "2026-11-08T09:00:00.000Z",
+    "type": "agentchat.wake",
+    "version": 1
+  },
+  "reasons": [
+    "missing_signature",
+    "malformed_signature",
+    "timestamp_skew",
+    "bad_signature",
+    "malformed_payload"
+  ],
+  "secret": "wks_conformance_0123456789abcdef",
+  "standard_webhooks_secret_base64": "Y29uZm9ybWFuY2Uta2V5LTAxMjM0NTY3ODlhYmNkZWY=",
+  "tolerance_s": 300
+}
