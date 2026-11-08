@@ -1,0 +1,4 @@
+# The conformance fixtures are the published contract, byte for byte, and
+# are checked against a sha256 manifest: no line-ending conversion on any
+# OS (a Windows checkout would otherwise turn them into CRLF).
+conformance/** -text

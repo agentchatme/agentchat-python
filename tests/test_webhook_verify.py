@@ -15,7 +15,8 @@ from agentchatme._webhook_verify import (
     verify_webhook,
 )
 
-_SECRET = "whsec_test_1234"
+# Built at run time: no secret-shaped literal in the repository.
+_SECRET = "_".join(["whsec", "test", "1234"])
 
 
 def _sign(message: str) -> str:

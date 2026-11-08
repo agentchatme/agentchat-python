@@ -19,7 +19,7 @@ import pytest
 from agentchatme import ConnectionError as AgentChatConnectionError
 from agentchatme import RealtimeClient, _realtime
 
-from .test_realtime import MockWebSocket, _make_client, _settle
+from .test_realtime import MockWebSocket, _flush, _make_client
 from .test_realtime_engine import connected, message_new, other_tasks
 
 # ─────────────── Fakes ───────────────
@@ -135,15 +135,15 @@ async def test_server_1008_hello_frame_required_is_transient() -> None:
     rt.on("blocked", lambda evt: blocked.append(evt))
     try:
         await rt.connect()
-        await _settle()
+        await _flush()
         await first.close(code=1008, reason="HELLO frame required")
         await _until(lambda: len(handed) >= 2)
-        await _settle()
+        await _flush()
         assert rt.state == "connecting"
         assert rt.blocked_reason is None
         assert blocked == []
         await second.push({"type": "hello.ok", "capabilities": ["ack"]})
-        await _settle()
+        await _flush()
         assert rt.state == "ready"
         assert rt.is_connected
     finally:
@@ -166,9 +166,9 @@ async def test_server_rejection_during_handshake_blocks(code: int, reason: str) 
     rt.on("blocked", lambda evt: blocked.append(evt))
     try:
         await rt.connect()
-        await _settle()
+        await _flush()
         await sock.close(code=code, reason=reason)
-        await _settle()
+        await _flush()
         assert rt.state == "blocked"
         assert rt.blocked_reason == f"{code} {reason}".strip()
         assert not rt.is_connected
@@ -196,21 +196,22 @@ async def test_blocked_retries_slowly_and_hello_ok_clears_it(
     rt._sleep = sleeper
     blocked: list[dict[str, Any]] = []
     rt.on("blocked", lambda evt: blocked.append(evt))
+    rt.on("message.new", lambda _m: None)  # so HELLO offers ack
     try:
         with caplog.at_level(logging.DEBUG, logger="agentchat.realtime"):
             await rt.connect()
-            await _settle()
+            await _flush()
             await first.close(code=1008, reason="Invalid token")
-            await _settle()
+            await _flush()
             assert rt.state == "blocked"
 
             sleeper.release()  # the first slow retry fires
             await _until(lambda: len(handed) >= 2)
-            await _settle()
+            await _flush()
             assert rt.state == "connecting"
             assert rt.blocked_reason == "1008 Invalid token"  # held until a hello.ok
             await second.close(code=1008, reason="Invalid token")
-            await _settle()
+            await _flush()
             assert rt.state == "blocked"
             assert len(blocked) == 2
             assert len(sleeper.delays) == 2
@@ -218,9 +219,9 @@ async def test_blocked_retries_slowly_and_hello_ok_clears_it(
 
             sleeper.release()  # the second slow retry fires
             await _until(lambda: len(handed) >= 3)
-            await _settle()
+            await _flush()
             await third.push({"type": "hello.ok", "capabilities": ["ack"]})
-            await _settle()
+            await _flush()
             assert rt.state == "ready"
             assert rt.blocked_reason is None
             assert rt.ack_negotiated is True
@@ -256,9 +257,9 @@ async def test_transport_failure_during_blocked_retry_takes_normal_backoff() -> 
     rt._sleep = sleeper
     try:
         await rt.connect()
-        await _settle()
+        await _flush()
         await sock.close(code=4401, reason="")
-        await _settle()
+        await _flush()
         assert rt.state == "blocked"
         sleeper.release()
         await _until(lambda: len(sleeper.delays) >= 2)
@@ -279,14 +280,14 @@ async def test_connect_while_blocked_retries_at_once() -> None:
     rt._sleep = sleeper
     try:
         await rt.connect()
-        await _settle()
+        await _flush()
         await first.close(code=1008, reason="Invalid token")
-        await _settle()
+        await _flush()
         assert rt.state == "blocked"
         timer = rt._reconnect_task
         assert timer is not None and not timer.done()
         await rt.connect()
-        await _settle()
+        await _flush()
         assert timer.done()
         assert len(handed) == 2
         assert rt.state == "connecting"
@@ -302,9 +303,9 @@ async def test_blocked_with_reconnect_off_exposes_the_verdict_without_a_timer() 
     rt.on("blocked", lambda evt: blocked.append(evt))
     try:
         await rt.connect()
-        await _settle()
+        await _flush()
         await sock.close(code=1008, reason="Invalid token")
-        await _settle()
+        await _flush()
         assert rt.state == "blocked"
         assert rt._reconnect_task is None
         assert blocked[0]["retry_in_ms"] is None
@@ -418,7 +419,7 @@ async def test_liveness_watchdog_holds_while_pings_are_answered(
     rt, handed = _client_with_sockets([sock], liveness_timeout_ms=20)
     try:
         await rt.connect()
-        await _settle()
+        await _flush()
         await sock.push({"type": "hello.ok"})
         await asyncio.sleep(0.2)
         assert sock.pings >= 2  # probed repeatedly, every probe answered
@@ -442,7 +443,7 @@ async def test_liveness_watchdog_trips_without_pongs_and_reconnects(
     rt.on_disconnect(lambda info: closes.append(info))
     try:
         await rt.connect()
-        await _settle()
+        await _flush()
         await silent.push({"type": "hello.ok"})
         await _until(lambda: len(handed) >= 2)
         assert silent.pings == 1
@@ -468,7 +469,7 @@ async def test_inbound_frames_keep_the_liveness_watchdog_quiet(
     rt.on("message.new", lambda m: None)
     try:
         await rt.connect()
-        await _settle()
+        await _flush()
         await sock.push({"type": "hello.ok"})
         for seq in range(1, 16):
             await asyncio.sleep(0.02)
@@ -496,9 +497,9 @@ async def test_liveness_watchdog_zero_disables_it_on_a_pinging_socket() -> None:
     rt, _handed = _client_with_sockets([sock], liveness_timeout_ms=0)
     try:
         await rt.connect()
-        await _settle()
+        await _flush()
         await sock.push({"type": "hello.ok"})
-        await _settle()
+        await _flush()
         assert rt.state == "ready"
         assert rt._liveness_task is None
     finally:
@@ -513,7 +514,7 @@ async def test_explicit_liveness_timeout_counts_frames_alone_without_ping() -> N
     rt, handed = _client_with_sockets([quiet, next_sock], liveness_timeout_ms=20)
     try:
         await rt.connect()
-        await _settle()
+        await _flush()
         await quiet.push({"type": "hello.ok"})
         await _until(lambda: len(handed) >= 2)
         assert quiet.closed and quiet.close_reason == "client liveness timeout"
@@ -529,18 +530,19 @@ async def test_explicit_liveness_timeout_counts_frames_alone_without_ping() -> N
 async def test_state_walks_the_lifecycle_and_ack_negotiated_tracks_the_connection() -> None:
     sock = MockWebSocket()
     rt, _handed = _client_with_sockets([sock])
+    rt.on("message.new", lambda _m: None)  # so HELLO offers ack
     assert rt.state == "idle"
     assert rt.ack_negotiated is False
     try:
         await rt.connect()
-        await _settle()
+        await _flush()
         assert rt.state == "connecting"
         await sock.push({"type": "hello.ok", "capabilities": ["ack"]})
-        await _settle()
+        await _flush()
         assert rt.state == "ready"
         assert rt.ack_negotiated is True
         await sock.close(code=1006)
-        await _settle()
+        await _flush()
         assert rt.ack_negotiated is False
         assert rt.state in ("backoff", "connecting")
     finally:
@@ -557,11 +559,11 @@ async def test_on_state_reports_every_transition_in_order() -> None:
     sleeper = ControlledSleep(hold=True)
     rt._sleep = sleeper
     await rt.connect()
-    await _settle()
+    await _flush()
     await sock.push({"type": "hello.ok"})
-    await _settle()
+    await _flush()
     await sock.close(code=1006, reason="blip")
-    await _settle()
+    await _flush()
     await rt.disconnect()
     assert seen == [
         ("idle", "connecting"),
@@ -579,11 +581,11 @@ async def test_on_disconnect_names_the_server_as_initiator_for_a_wire_close() ->
     rt.on_disconnect(lambda info: closes.append(info))
     try:
         await rt.connect()
-        await _settle()
+        await _flush()
         await sock.push({"type": "hello.ok"})
-        await _settle()
+        await _flush()
         await sock.close(code=1001, reason="Heartbeat timeout")
-        await _settle()
+        await _flush()
         assert closes == [
             {"code": 1001, "reason": "Heartbeat timeout", "was_clean": False, "initiator": "server"}
         ]
@@ -601,13 +603,13 @@ async def test_server_frames_typed_like_local_events_are_dropped() -> None:
     rt.on("stopped", lambda evt: stopped.append(evt))
     try:
         await rt.connect()
-        await _settle()
+        await _flush()
         await sock.push({"type": "hello.ok"})
-        await _settle()
+        await _flush()
         await sock.push({"type": "blocked", "code": 4401, "reason": "spoofed"})
         await sock.push({"type": "stopped"})
         await sock.push({"type": "state", "state": "stopped", "previous": "ready"})
-        await _settle()
+        await _flush()
         assert blocked == []
         assert stopped == []
         assert rt.state == "ready"
@@ -626,9 +628,9 @@ async def test_disconnect_from_blocked_stops_with_no_task_left() -> None:
     stopped: list[dict[str, Any]] = []
     rt.on("stopped", lambda evt: stopped.append(evt))
     await rt.connect()
-    await _settle()
+    await _flush()
     await sock.close(code=1008, reason="Invalid token")
-    await _settle()
+    await _flush()
     assert rt.state == "blocked"
 
     await rt.disconnect()
@@ -658,11 +660,11 @@ async def test_disconnect_from_pending_backoff_stops_with_no_task_left() -> None
 
     rt.on("stopped", on_stopped)
     await rt.connect()
-    await _settle()
+    await _flush()
     await sock.push({"type": "hello.ok"})
-    await _settle()
+    await _flush()
     await sock.close(code=1006, reason="blip")
-    await _settle()
+    await _flush()
     assert rt.state == "backoff"
 
     await rt.disconnect()
@@ -681,9 +683,9 @@ async def test_disconnect_during_a_connected_session_releases_the_idle_watchdog(
     sock = PingingWebSocket(pong=True)
     rt, _handed = _client_with_sockets([sock])
     await rt.connect()
-    await _settle()
+    await _flush()
     await sock.push({"type": "hello.ok"})
-    await _settle()
+    await _flush()
     assert rt._liveness_task is not None and not rt._liveness_task.done()
     await rt.disconnect()
     assert other_tasks() - baseline == set()
@@ -696,9 +698,9 @@ async def test_on_disconnect_names_the_client_as_initiator_for_disconnect() -> N
     closes: list[dict[str, Any]] = []
     rt.on_disconnect(lambda info: closes.append(info))
     await rt.connect()
-    await _settle()
+    await _flush()
     await sock.push({"type": "hello.ok"})
-    await _settle()
+    await _flush()
     await rt.disconnect()
     assert sock.closed and sock.close_code == 1000 and sock.close_reason == "client disconnect"
     assert closes == [
@@ -724,17 +726,17 @@ async def test_connect_from_on_disconnect_reopens_with_reconnect_off() -> None:
     rt.on_disconnect(reopen)
     try:
         await rt.connect()
-        await _settle()
+        await _flush()
         await first.push({"type": "hello.ok"})
-        await _settle()
+        await _flush()
         await first.close(code=1006, reason="blip")
         await asyncio.wait_for(reopened.wait(), timeout=2.0)
-        await _settle()
+        await _flush()
         assert handed == [first, second]
         assert rt.state == "connecting"  # not parked in idle by the old close
         assert rt._reconnect_task is None
         await second.push({"type": "hello.ok"})
-        await _settle()
+        await _flush()
         assert rt.state == "ready"
     finally:
         await rt.disconnect()
@@ -747,9 +749,9 @@ async def test_connect_from_on_disconnect_with_reconnect_on_arms_no_second_timer
     rt.on_disconnect(lambda _info: rt.connect())
     try:
         await rt.connect()
-        await _settle()
+        await _flush()
         await first.push({"type": "hello.ok"})
-        await _settle()
+        await _flush()
         await first.close(code=1006, reason="blip")
         await asyncio.sleep(0.1)
         assert handed == [first, second]
@@ -773,9 +775,9 @@ async def test_disconnect_from_a_state_handler_on_backoff_arms_no_timer() -> Non
 
     rt.on("state", stop_on_backoff)
     await rt.connect()
-    await _settle()
+    await _flush()
     await sock.push({"type": "hello.ok"})
-    await _settle()
+    await _flush()
     await sock.close(code=1006, reason="blip")
     await asyncio.sleep(0.05)
     assert rt.state == "stopped"
@@ -799,9 +801,9 @@ async def test_on_error_fires_once_per_blocked_run_while_blocked_fires_per_rejec
         await rt.connect()
         for i in range(3):
             await _until(lambda i=i: len(handed) >= i + 1)
-            await _settle()
+            await _flush()
             await socks[i].close(code=1008, reason="Invalid token")
-            await _settle()
+            await _flush()
             assert rt.state == "blocked"
             sleeper.release()
         await _until(lambda: len(handed) >= 4)
@@ -809,10 +811,10 @@ async def test_on_error_fires_once_per_blocked_run_while_blocked_fires_per_rejec
         assert len([e for e in errors if "auth rejection" in str(e)]) == 1
         # A hello.ok ends the run; the next rejection is a new run.
         await socks[3].push({"type": "hello.ok"})
-        await _settle()
+        await _flush()
         assert rt.state == "ready"
         await socks[3].close(code=1008, reason="Invalid token")  # after hello.ok: eviction
-        await _settle()
+        await _flush()
         assert rt.state == "backoff"
     finally:
         await rt.disconnect()
@@ -858,7 +860,7 @@ async def test_raising_on_error_at_the_liveness_deadline_still_closes_and_reconn
     rt.on_error(_raising)
     try:
         await rt.connect()
-        await _settle()
+        await _flush()
         await silent.push({"type": "hello.ok"})
         await _until(lambda: len(handed) >= 2)
         assert silent.closed and silent.close_reason == "client liveness timeout"
@@ -903,9 +905,9 @@ async def test_raising_on_error_when_entering_blocked_still_arms_the_slow_retry(
     rt.on_error(_raising)
     try:
         await rt.connect()
-        await _settle()
+        await _flush()
         await sock.close(code=1008, reason="Invalid token")
-        await _settle()
+        await _flush()
         assert rt.state == "blocked"
         assert rt._reconnect_task is not None and not rt._reconnect_task.done()
         assert len(sleeper.delays) == 1 and 600.0 <= sleeper.delays[0] <= 900.0

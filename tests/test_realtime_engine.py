@@ -16,7 +16,7 @@ import pytest
 from agentchatme import RealtimeClient, _realtime
 from agentchatme.types.ws import WakePayload
 
-from .test_realtime import MockAsyncClient, MockWebSocket, _ack_frames, _make_client, _settle
+from .test_realtime import MockAsyncClient, MockWebSocket, _ack_frames, _flush, _make_client
 
 WAKE: dict[str, Any] = {
     "type": "wake",
@@ -36,18 +36,41 @@ def message_new(conversation_id: str, seq: int, **payload: Any) -> dict[str, Any
     return {"type": "message.new", "payload": body}
 
 
+def _noop(_message: dict[str, Any]) -> None:
+    return None
+
+
 async def connected(
-    *, capabilities: list[str] | None = None, **opts: Any
+    *,
+    capabilities: list[str] | None = None,
+    with_handler: bool = True,
+    offer: dict[str, bool] | None = None,
+    **opts: Any,
 ) -> tuple[RealtimeClient, MockWebSocket]:
+    """A client past hello.ok. HELLO offers ``ack`` only while a
+    ``message.new`` handler is attached, so a no-op one is attached first
+    (``with_handler=False`` for a handler-less client). ``capabilities`` is
+    what the server echoes; ``offer`` the client's capability options."""
+    if offer is not None:
+        opts["capabilities"] = offer
     rt, ws = _make_client(**opts)
+    if with_handler:
+        rt.on("message.new", _noop)
     await rt.connect()
-    await _settle()
+    await _flush()
     hello_ok: dict[str, Any] = {"type": "hello.ok"}
     if capabilities is not None:
         hello_ok["capabilities"] = capabilities
     await ws.push(hello_ok)
-    await _settle()
+    await _flush()
     return rt, ws
+
+
+def _connector(sock: MockWebSocket) -> Any:
+    async def connect(_url: str, **_kw: Any) -> MockWebSocket:
+        return sock
+
+    return connect
 
 
 def other_tasks() -> set[asyncio.Task[Any]]:
@@ -70,7 +93,7 @@ async def test_wake_frame_is_dispatched_to_wake_handlers_with_its_payload() -> N
     rt.on("wake", on_wake)
     try:
         await ws.push(WAKE)
-        await _settle()
+        await _flush()
         assert seen == ["reminder:conv_1:2"]
     finally:
         await rt.disconnect()
@@ -85,7 +108,7 @@ async def test_wake_is_never_acked_and_never_reaches_message_handlers() -> None:
     rt.on("wake", lambda m: wakes.append(m))
     try:
         await ws.push(WAKE)
-        await _settle()
+        await _flush()
         assert messages == []
         assert wakes == [WAKE]
         assert _ack_frames(ws) == []
@@ -105,7 +128,7 @@ async def test_malformed_wake_is_surfaced_through_on_error_not_dispatched() -> N
         await ws.push({"type": "wake", "payload": "soon"})
         await ws.push({"type": "wake"})
         await ws.push({"type": "wake", "payload": {**WAKE["payload"], "step": "1"}})
-        await _settle()
+        await _flush()
         assert wakes == []
         assert len(errors) == 4
         assert all("wake frame failed validation" in str(e) for e in errors)
@@ -121,7 +144,7 @@ async def test_frame_types_without_a_subscriber_are_still_ignored() -> None:
     try:
         await ws.push({"type": "something.new", "payload": {"x": 1}})
         await ws.push(WAKE)  # no wake handler registered either
-        await _settle()
+        await _flush()
         assert errors == []
         assert _ack_frames(ws) == []
     finally:
@@ -136,7 +159,7 @@ async def test_wake_handler_unsubscribes() -> None:
     off()
     try:
         await ws.push(WAKE)
-        await _settle()
+        await _flush()
         assert wakes == []
     finally:
         await rt.disconnect()
@@ -152,7 +175,7 @@ async def test_ack_on_receipt_acks_before_any_handler_runs_and_exactly_once() ->
     rt.on("message.new", lambda m: acks_when_handler_ran.append(len(_ack_frames(ws))))
     try:
         await ws.push(message_new("c", 1))
-        await _settle()
+        await _flush()
         assert acks_when_handler_ran == [1]
         assert _ack_frames(ws) == ["msg_1"]
     finally:
@@ -169,7 +192,7 @@ async def test_ack_on_receipt_acks_even_when_the_handler_raises() -> None:
     rt.on("message.new", boom)
     try:
         await ws.push(message_new("c", 1))
-        await _settle()
+        await _flush()
         assert _ack_frames(ws) == ["msg_1"]
     finally:
         await rt.disconnect()
@@ -183,12 +206,12 @@ async def test_ack_on_receipt_acks_a_parked_frame_at_receipt_not_at_dispatch() -
     try:
         await ws.push(message_new("c", 1))
         await ws.push(message_new("c", 3))  # parked until seq 2 arrives
-        await _settle()
+        await _flush()
         assert dispatched == [1]
         assert _ack_frames(ws) == ["msg_1", "msg_3"]
 
         await ws.push(message_new("c", 2))
-        await _settle()
+        await _flush()
         assert dispatched == [1, 2, 3]
         # No second ack for seq 3 once it leaves the buffer.
         assert _ack_frames(ws) == ["msg_1", "msg_3", "msg_2"]
@@ -203,10 +226,10 @@ async def test_ack_on_receipt_acks_a_redelivered_duplicate_without_redispatch() 
     rt.on("message.new", lambda m: handled.append(m["payload"]["id"]))
     try:
         await ws.push(message_new("c", 1))
-        await _settle()
+        await _flush()
         # Same message id in another conversation/seq: dedup is by id.
         await ws.push(message_new("d", 7, id="msg_1"))
-        await _settle()
+        await _flush()
         assert handled == ["msg_1"]
         assert _ack_frames(ws) == ["msg_1", "msg_1"]
     finally:
@@ -219,14 +242,14 @@ async def test_ack_on_receipt_sends_nothing_without_a_negotiated_ack() -> None:
     rt.on("message.new", lambda m: None)
     try:
         await ws.push(message_new("c", 1))
-        await _settle()
+        await _flush()
         assert _ack_frames(ws) == []
     finally:
         await rt.disconnect()
 
 
 @pytest.mark.asyncio
-async def test_default_mode_still_acks_after_handlers_settle() -> None:
+async def test_default_mode_still_acks_after_handlers_finish() -> None:
     rt, ws = await connected(capabilities=["ack"])
     release = asyncio.Event()
 
@@ -236,10 +259,10 @@ async def test_default_mode_still_acks_after_handlers_settle() -> None:
     rt.on("message.new", slow)
     try:
         await ws.push(message_new("c", 1))
-        await _settle()
+        await _flush()
         assert _ack_frames(ws) == []
         release.set()
-        await _settle()
+        await _flush()
         assert _ack_frames(ws) == ["msg_1"]
     finally:
         await rt.disconnect()
@@ -261,7 +284,7 @@ async def test_ack_on_receipt_acks_gap_fill_rows_when_fetched(
         await ws.push(message_new("c", 1))
         await ws.push(message_new("c", 3))
         await asyncio.sleep(0.12)
-        await _settle()
+        await _flush()
         assert dispatched == [1, 2, 3]
         # Live frames at receipt, the gap-fill row at fetch, each exactly once.
         assert _ack_frames(ws) == ["msg_1", "msg_3", "msg_2"]
@@ -284,11 +307,11 @@ async def test_ack_on_receipt_flushes_acked_parked_frames_when_the_socket_closes
         await ws.push(message_new("c", 1))
         await ws.push(message_new("c", 4))
         await ws.push(message_new("c", 3))
-        await _settle()
+        await _flush()
         assert dispatched == [1]
         assert _ack_frames(ws) == ["msg_1", "msg_4", "msg_3"]
         await ws.close(code=1006, reason="dropped")
-        await _settle()
+        await _flush()
         assert dispatched == [1, 3, 4]
         assert [g.reason for g in gaps] == ["connection_closed"]
         assert gaps[0].recovered is False and gaps[0].buffered_seq == 3
@@ -308,14 +331,14 @@ async def test_default_mode_acks_a_below_anchor_repeat_it_already_handled() -> N
     try:
         await ws.push(message_new("c", 1))
         await ws.push(message_new("c", 3))
-        await _settle()
+        await _flush()
         await ws.push(message_new("c", 1))
-        await _settle()
+        await _flush()
         assert handled == ["msg_1"]
         assert _ack_frames(ws) == ["msg_1", "msg_1"]
 
         await ws.push(message_new("c", 2))
-        await _settle()
+        await _flush()
         assert handled == ["msg_1", "msg_2", "msg_3"]
         assert _ack_frames(ws) == ["msg_1", "msg_1", "msg_2", "msg_3"]
     finally:
@@ -323,20 +346,21 @@ async def test_default_mode_acks_a_below_anchor_repeat_it_already_handled() -> N
 
 
 @pytest.mark.asyncio
-async def test_default_mode_never_acks_a_below_anchor_frame_nobody_handled() -> None:
+async def test_default_mode_delivers_a_below_anchor_frame_nobody_handled_late() -> None:
     # Live seq 5 anchors before the server's reconnect backlog brings the
-    # stored seq 3. Unseen and unacked, it stays `stored` for the next drain.
+    # stored seq 3. Nobody has seen it: handed over late (out of order, never
+    # stalled) and acked once handled.
     rt, ws = await connected(capabilities=["ack"])
     handled: list[str] = []
     rt.on("message.new", lambda m: handled.append(m["payload"]["id"]))
     try:
         await ws.push(message_new("c", 5))
         await ws.push(message_new("c", 7))
-        await _settle()
+        await _flush()
         await ws.push(message_new("c", 3))
-        await _settle()
-        assert handled == ["msg_5"]
-        assert _ack_frames(ws) == ["msg_5"]
+        await _flush()
+        assert handled == ["msg_5", "msg_3"]
+        assert _ack_frames(ws) == ["msg_5", "msg_3"]
     finally:
         await rt.disconnect()
 
@@ -350,9 +374,9 @@ async def test_default_mode_leaves_unacked_parked_frames_to_the_next_drain() -> 
     try:
         await ws.push(message_new("c", 1))
         await ws.push(message_new("c", 3))
-        await _settle()
+        await _flush()
         await ws.close(code=1006, reason="dropped")
-        await _settle()
+        await _flush()
         # Not acked, so not flushed: the server re-offers seq 3 in order.
         assert dispatched == [1]
         assert _ack_frames(ws) == ["msg_1"]
@@ -374,12 +398,12 @@ async def test_ack_on_receipt_delivers_a_below_anchor_frame_it_already_acked() -
         await ws.push(message_new("c", 5))
         await ws.push(message_new("c", 3))
         await ws.push(message_new("c", 4))
-        await _settle()
+        await _flush()
         assert dispatched == [5, 3, 4]
         assert _ack_frames(ws) == ["msg_5", "msg_3", "msg_4"]
 
         await ws.push(message_new("c", 3))  # server double-publish
-        await _settle()
+        await _flush()
         assert dispatched == [5, 3, 4]
         assert _ack_frames(ws) == ["msg_5", "msg_3", "msg_4", "msg_3"]
     finally:
@@ -400,7 +424,7 @@ async def test_default_mode_acks_gap_fill_rows_after_dispatch(
         await ws.push(message_new("c", 1))
         await ws.push(message_new("c", 3))
         await asyncio.sleep(0.12)
-        await _settle()
+        await _flush()
         assert dispatched == [1, 2, 3]
         # The fetched row rides the live ack path: acked once dispatched.
         assert _ack_frames(ws) == ["msg_1", "msg_2", "msg_3"]
@@ -456,13 +480,14 @@ async def test_a_drain_repeat_of_a_running_message_is_not_dispatched_and_never_w
     try:
         await ws.push(message_new("c", 1))
         await ws.push(message_new("c", 2))  # in order; its handler is slow
-        await _settle()
+        await _flush()
         await asyncio.wait_for(rt.drain_offline_envelopes(), timeout=1.0)
+        await _flush()  # the other row's handler runs as its own task
         assert calls == ["msg_1", "msg_2", "msg_d1"]
         assert api.sync_ack_calls == []
 
         release.set()
-        await _settle()
+        await _flush()
         assert _ack_frames(ws) == ["msg_1", "msg_2"]
         await asyncio.wait_for(rt.drain_offline_envelopes(), timeout=1.0)
         assert calls == ["msg_1", "msg_2", "msg_d1"]
@@ -488,12 +513,12 @@ async def test_a_live_repeat_of_a_first_copy_that_failed_is_never_acked() -> Non
     rt.on("message.new", fails)
     try:
         drain = asyncio.create_task(rt.drain_offline_envelopes())
-        await _settle()
+        await _flush()
         await ws.push(message_new("c", 1))
-        await _settle()
+        await _flush()
         release.set()
         await asyncio.wait_for(drain, timeout=1.0)
-        await _settle()
+        await _flush()
         assert _ack_frames(ws) == []
         assert api.sync_ack_calls == []
     finally:
@@ -502,32 +527,43 @@ async def test_a_live_repeat_of_a_first_copy_that_failed_is_never_acked() -> Non
 
 
 @pytest.mark.asyncio
-async def test_a_copy_on_a_later_connection_is_dispatched_afresh_while_the_first_runs() -> None:
-    # Adoption is per connection: a handler that never finishes must not
-    # swallow every re-offer of its message.
-    rt, _ws = await connected(capabilities=["ack"])
-    entered = asyncio.Event()
+async def test_a_copy_on_a_later_connection_adopts_the_first_copy_still_running() -> None:
+    # In-flight dedupe holds across reconnects: the server re-offers an
+    # unacked frame on the next connection while its first handler may still
+    # run. The re-offer is not dispatched again; it takes the first copy's
+    # outcome without waiting, and is acked once that copy finished cleanly.
+    rt, ws = await connected(capabilities=["ack"])
+    release = asyncio.Event()
     calls: list[str] = []
 
-    async def first_hangs(m: dict[str, Any]) -> None:
+    async def slow(m: dict[str, Any]) -> None:
         calls.append(m["payload"]["id"])
-        if len(calls) == 1:
-            entered.set()
-            await asyncio.Event().wait()
+        await release.wait()
 
-    rt.on("message.new", first_hangs)
-    first = asyncio.create_task(rt._deliver_message_new(message_new("c", 1), ws_ack=False))
+    rt.on("message.new", slow)
     try:
-        await entered.wait()
-        repeat = rt._deliver_message_new(message_new("c", 1), ws_ack=False)
-        assert await asyncio.wait_for(repeat, timeout=1.0) is False
-        assert calls == ["msg_1"]  # same connection: adopted, not waited for
-        rt._generation += 1  # what a socket close does
-        later = rt._deliver_message_new(message_new("c", 1), ws_ack=False)
-        assert await asyncio.wait_for(later, timeout=1.0) is True
-        assert calls == ["msg_1", "msg_1"]
+        await ws.push(message_new("c", 1))
+        await _flush()
+        assert calls == ["msg_1"]
+        await ws.close(code=1006, reason="dropped")  # the first handler still runs
+        await _flush()
+        ws2 = MockWebSocket()
+        rt._websocket_connect = _connector(ws2)
+        await rt.connect()
+        await ws2.push({"type": "hello.ok", "capabilities": ["ack"]})
+        await ws2.push(message_new("c", 1))  # the server's re-offer
+        await _flush()
+        assert calls == ["msg_1"]
+        assert _ack_frames(ws2) == []
+        release.set()
+        await _flush()
+        assert calls == ["msg_1"]
+        # The first copy's outcome and the adopted re-offer each ack on
+        # the current socket (the TypeScript SDK's behaviour; the server
+        # takes a repeated ack as a no-op).
+        assert _ack_frames(ws2) == ["msg_1", "msg_1"]
     finally:
-        first.cancel()
+        release.set()
         await rt.disconnect()
 
 
@@ -550,17 +586,17 @@ async def test_a_live_repeat_below_the_anchor_never_holds_up_the_socket() -> Non
     rt.on("message.new", slow)
     try:
         drain = asyncio.create_task(rt.drain_offline_envelopes())
-        await _settle()
+        await _flush()
         assert calls == ["msg_1"]
         await ws.push(message_new("c", 1))  # the same message, live
         await ws.push(message_new("other", 9, id="msg_other"))
-        await _settle()
+        await _flush()
         assert calls == ["msg_1", "msg_other"]
         assert _ack_frames(ws) == ["msg_other"]
 
         release.set()
         await asyncio.wait_for(drain, timeout=1.0)
-        await _settle()
+        await _flush()
         assert calls == ["msg_1", "msg_other"]
         assert _ack_frames(ws) == ["msg_other", "msg_1"]
         assert api.sync_ack_calls == ["del_1"]
@@ -586,12 +622,12 @@ async def test_a_failed_first_copy_leaves_the_repeat_unacked_and_a_later_copy_is
     try:
         await ws.push(message_new("c", 1))
         await ws.push(message_new("c", 2))
-        await _settle()
+        await _flush()
         drain = asyncio.create_task(rt.drain_offline_envelopes())
-        await _settle()
+        await _flush()
         release.set()
         await asyncio.wait_for(drain, timeout=1.0)
-        await _settle()
+        await _flush()
         # Neither copy is acknowledged: the server re-offers the message.
         assert calls == ["msg_1", "msg_2"]
         assert api.sync_ack_calls == []
@@ -599,7 +635,7 @@ async def test_a_failed_first_copy_leaves_the_repeat_unacked_and_a_later_copy_is
 
         # The re-offer is a fresh attempt.
         await ws.push(message_new("c", 2))
-        await _settle()
+        await _flush()
         assert calls == ["msg_1", "msg_2", "msg_2"]
         assert _ack_frames(ws) == ["msg_1", "msg_2"]
     finally:
@@ -619,11 +655,14 @@ async def test_a_cancelled_first_copy_counts_as_not_handled() -> None:
     rt.on("message.new", hangs)
     try:
         frame = message_new("c", 1)
-        first = asyncio.create_task(rt._deliver_message_new(frame, ws_ack=True))
+        outcome = await rt._deliver_message_new(frame, ws_ack=True)
         await entered.wait()
-        assert rt._adopt_in_flight(dict(frame), ws_ack=True) is True
-        first.cancel()
-        await _settle()
+        assert rt._adopt_in_flight(dict(frame), ws_ack=True) is not None
+        run = rt._lanes["conversation:c"].jobs[0].run
+        assert run is not None
+        run.cancel()  # what disconnect() does after its grace
+        await _flush()
+        assert outcome.done() and outcome.result() is False
         assert _ack_frames(ws) == []
         assert rt._inflight == {}
     finally:
@@ -647,10 +686,14 @@ async def test_with_the_dedup_cache_off_every_copy_is_dispatched() -> None:
             asyncio.create_task(rt._deliver_message_new(dict(frame), ws_ack=False))
             for _ in range(2)
         ]
-        await _settle()
-        assert calls == ["msg_1", "msg_1"]
+        await _flush()
+        # Both copies are dispatched (no dedup), one after the other: one
+        # handler at a time per conversation.
+        assert calls == ["msg_1"]
         release.set()
         await asyncio.gather(*tasks)
+        await _flush()
+        assert calls == ["msg_1", "msg_1"]
     finally:
         release.set()
         await rt.disconnect()
@@ -718,7 +761,7 @@ async def test_a_frame_that_parks_while_a_resolved_gap_is_handled_is_dispatched(
         await ws.push(message_new("c", 3))
         await asyncio.wait_for(entered.wait(), timeout=1.0)  # gap lapsed; 3 handed over
         await ws.push(message_new("c", 5))
-        await _settle()
+        await _flush()
         release.set()
         await asyncio.sleep(0.2)
         assert seen == [1, 3, 5]
@@ -757,7 +800,7 @@ async def test_the_missing_seq_arriving_while_a_resolved_gap_is_handled_is_not_a
         await ws.push(message_new("c", 4))
         await asyncio.wait_for(entered.wait(), timeout=1.0)
         await ws.push(message_new("c", 2))
-        await _settle()
+        await _flush()
         release.set()
         await asyncio.sleep(0.2)
         assert sorted(seen) == [1, 2, 3, 4]
@@ -788,11 +831,11 @@ async def test_disconnect_takes_no_frame_in_once_it_began() -> None:
     rt.on("message.new", slow)
     await ws.push(message_new("c", 1))
     await ws.push(message_new("c", 3))
-    await _settle()
+    await _flush()
     stopping = asyncio.create_task(rt.disconnect())
     await asyncio.wait_for(entered.wait(), timeout=1.0)
     await ws.push(message_new("c", 6))
-    await _settle()
+    await _flush()
     release.set()
     await asyncio.wait_for(stopping, timeout=3.0)
     assert seen == [1, 3]
@@ -811,7 +854,7 @@ async def test_disconnect_returns_promptly_while_frames_keep_arriving(ack_on_rec
     await ws.push(message_new("c", 1))
     await asyncio.sleep(0.05)
     await ws.push(message_new("c", 3))  # parks on the hole at 2
-    await _settle()
+    await _flush()
     started = time.monotonic()
     stopping = asyncio.create_task(rt.disconnect())
     seq = 4
@@ -845,10 +888,13 @@ async def test_a_handler_that_disconnects_while_a_repeat_of_its_message_arrives_
     await ws.push(message_new("c", 3))
     await asyncio.wait_for(entered.wait(), timeout=1.0)  # the lapsed gap handed 3 over
     await ws.push(message_new("c", 3))  # the server repeats it while its handler runs
-    await _settle()
+    await _flush()
     go.set()
     await asyncio.wait_for(returned.wait(), timeout=2.0)
     assert rt.state == "stopped"
+    # The handler's own dispatch finishes once it returns (it ran off the
+    # receive loop; disconnect() skipped the task calling it).
+    await _flush()
     assert rt._inflight == {}
 
 
@@ -888,7 +934,7 @@ async def test_a_gap_fill_that_returns_during_disconnect_acks_nothing(
     stopping = asyncio.create_task(rt.disconnect())
     await asyncio.wait_for(entered.wait(), timeout=1.0)  # the flush hands 3 over
     fetch_gate.set()  # the fetch returns mid-shutdown
-    await _settle()
+    await _flush()
     release.set()
     await asyncio.wait_for(stopping, timeout=3.0)
     assert "msg_2" not in _ack_frames(ws)
@@ -919,20 +965,24 @@ async def test_an_adopted_in_order_repeat_moves_the_cursor_on(
     rt.on("message.new", slow)
     try:
         await ws.push(message_new("c", 1))
-        await _settle()
+        await _flush()
         drain = asyncio.create_task(rt.drain_offline_envelopes())
-        await _settle()
+        await _flush()
         assert seen == [1, 2]  # the drain row's handler is running
         await ws.push(message_new("c", 2))  # live repeat: adopted
         await ws.push(message_new("c", 3))
-        await _settle()
-        assert seen == [1, 2, 3]
+        await _flush()
+        # Seq 3 is taken in order (no gap) and waits for seq 2's handler: one
+        # handler at a time per conversation.
+        assert seen == [1, 2]
         await asyncio.sleep(0.2)  # well past the gap window
         assert gaps == []
         assert api.get_messages_calls == []
         release.set()
+        await _flush()
+        assert seen == [1, 2, 3]
         await asyncio.wait_for(drain, timeout=1.0)
-        await _settle()
+        await _flush()
         assert sorted(_ack_frames(ws)) == ["msg_1", "msg_2", "msg_3"]
     finally:
         release.set()
@@ -944,8 +994,9 @@ async def test_a_frame_behind_a_new_hole_gets_its_own_gap_window(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     # While a lapsed gap's handler for seq 3 runs, seq 4 arrives in order and
-    # seq 6 behind a new hole. Seq 4 is dispatched at once by the receive
-    # loop; seq 6 waits for its own gap window and its own report.
+    # seq 6 behind a new hole. Seq 4 is taken in order and handed over once
+    # seq 3's handler is done; seq 6 waits for its own gap window and its own
+    # report.
     monkeypatch.setattr("agentchatme._realtime._GAP_FILL_WINDOW_S", 0.1)
     gaps: list[Any] = []
     rt, ws = await connected(capabilities=["ack"], on_sequence_gap=gaps.append)
@@ -966,10 +1017,12 @@ async def test_a_frame_behind_a_new_hole_gets_its_own_gap_window(
         await asyncio.wait_for(entered.wait(), timeout=1.0)
         await ws.push(message_new("c", 4))
         await ws.push(message_new("c", 6))
-        await _settle()
-        assert seen == [1, 3, 4]
+        await _flush()
+        # Seq 4 is taken in order at once and waits for seq 3's handler (one
+        # at a time per conversation); seq 6 parks behind the new hole.
+        assert seen == [1, 3]
         release.set()
-        await _settle()
+        await _flush()
         assert seen == [1, 3, 4]
         assert [g.expected_seq for g in gaps] == [2]
         await asyncio.sleep(0.3)
@@ -1011,10 +1064,10 @@ async def test_two_instances_run_side_by_side_and_closing_one_leaves_the_other_u
 
     await a.connect()
     await b.connect()
-    await _settle()
+    await _flush()
     await ws_a.push({"type": "hello.ok", "capabilities": ["ack"]})
     await ws_b.push({"type": "hello.ok", "capabilities": ["ack"]})
-    await _settle()
+    await _flush()
     assert a.is_connected and b.is_connected
     # Each socket authenticated with its own key.
     assert json.loads(ws_a.sent[0])["api_key"] == "ka"
@@ -1023,7 +1076,7 @@ async def test_two_instances_run_side_by_side_and_closing_one_leaves_the_other_u
     # Park a frame on a seq gap in a, so a owns a gap timer too.
     await ws_a.push(message_new("c", 1))
     await ws_a.push(message_new("c", 3))
-    await _settle()
+    await _flush()
 
     await a.disconnect()
     assert ws_a.closed and not ws_b.closed
@@ -1033,7 +1086,7 @@ async def test_two_instances_run_side_by_side_and_closing_one_leaves_the_other_u
 
     # b still receives, dedups and acks on its own socket.
     await ws_b.push(message_new("c", 1))
-    await _settle()
+    await _flush()
     assert seen_b == ["msg_1"]
     assert _ack_frames(ws_b) == ["msg_1"]
     assert _ack_frames(ws_a) == ["msg_1", "msg_3"]
@@ -1044,7 +1097,7 @@ async def test_two_instances_run_side_by_side_and_closing_one_leaves_the_other_u
     assert b.is_connected
 
     await b.disconnect()
-    await _settle()
+    await _flush()
     # Every task either instance owned is gone from the loop.
     assert other_tasks() - baseline == set()
 
@@ -1065,11 +1118,11 @@ async def test_disconnect_releases_a_pending_reconnect_task() -> None:
         websocket_connect=fake_connect,
     )
     await rt.connect()
-    await _settle()
+    await _flush()
     await sock.push({"type": "hello.ok"})
-    await _settle()
+    await _flush()
     await sock.close(code=1006, reason="blip")  # schedules a reconnect
-    await _settle()
+    await _flush()
     assert rt._reconnect_task is not None and not rt._reconnect_task.done()
 
     await rt.disconnect()
@@ -1083,7 +1136,7 @@ async def test_disconnect_releases_the_hello_ack_timer_mid_handshake() -> None:
     baseline = other_tasks()
     rt, _ws = _make_client()
     await rt.connect()  # HELLO sent, 15 s handshake watchdog armed, no hello.ok
-    await _settle()
+    await _flush()
     assert rt._handshake_task is not None and not rt._handshake_task.done()
     await rt.disconnect()
     assert other_tasks() - baseline == set()
@@ -1114,7 +1167,7 @@ async def test_disconnect_releases_an_in_flight_gap_fill_task(
     await rt.disconnect()
     assert other_tasks() - baseline == set()
     release.set()
-    await _settle()
+    await _flush()
     assert other_tasks() - baseline == set()
 
 
@@ -1140,10 +1193,10 @@ async def test_two_instances_from_one_options_object_do_not_interfere() -> None:
     b = RealtimeClient(shared, websocket_connect=connector("b"))
     await a.connect()
     await b.connect()
-    await _settle()
+    await _flush()
     await sockets["a"].push({"type": "hello.ok"})
     await sockets["b"].push({"type": "hello.ok"})
-    await _settle()
+    await _flush()
 
     await a.disconnect()
     # The caller's object is untouched, and so is b.
@@ -1170,6 +1223,6 @@ async def test_disconnect_from_inside_a_handler_is_safe() -> None:
     rt.on("message.new", close_from_handler)
     await ws.push(message_new("c", 1))
     await asyncio.wait_for(done.wait(), timeout=2.0)
-    await _settle()
+    await _flush()
     assert not rt.is_connected
     assert ws.closed

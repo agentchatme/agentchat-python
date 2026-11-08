@@ -16,21 +16,13 @@ import pytest
 from agentchatme import RealtimeClient, gate
 from agentchatme.types import AckFrame, InboxTray, WakeFrame
 
-from .test_realtime import MockWebSocket, _ack_frames, _make_client, _settle
+from ._texts import GATE_TEXTS
+from .test_realtime import MockWebSocket, _ack_frames, _flush, _make_client
 
 FIXTURES = Path(__file__).resolve().parent.parent / "conformance" / "v1"
-NAMES = [
-    "ack-frame.json",
-    "engine-scenarios.json",
-    "gate-prompt.expected.txt",
-    "tray.sample.json",
-    "verdict-parse.cases.json",
-    "wake-frame.json",
-]
-
-
 def raw(name: str) -> str:
-    return (FIXTURES / name).read_text(encoding="utf-8")
+    # Bytes, decoded: no newline translation, so the text is the file's.
+    return (FIXTURES / name).read_bytes().decode("utf-8")
 
 
 def load(name: str) -> Any:
@@ -44,27 +36,6 @@ def tray() -> dict[str, Any]:
 
 
 # ─────────────── Canonical form ───────────────
-
-
-def test_ships_exactly_the_six_named_files() -> None:
-    assert sorted(p.name for p in FIXTURES.iterdir()) == NAMES
-
-
-@pytest.mark.parametrize(
-    "name",
-    [
-        "tray.sample.json",
-        "verdict-parse.cases.json",
-        "wake-frame.json",
-        "ack-frame.json",
-        "engine-scenarios.json",
-    ],
-)
-def test_json_fixture_has_sorted_keys_two_space_indent_and_one_trailing_newline(
-    name: str,
-) -> None:
-    text = raw(name)
-    assert text == gate.canonical_json(json.loads(text)) + "\n"
 
 
 def test_expected_prompt_ends_with_exactly_one_newline() -> None:
@@ -106,14 +77,17 @@ def test_tray_parses_into_the_typed_model_and_round_trips(tray: dict[str, Any]) 
 
 def test_build_prompt_renders_the_sample_tray_to_the_expected_text(tray: dict[str, Any]) -> None:
     expected = raw("gate-prompt.expected.txt")
-    assert gate.build_prompt(tray) + "\n" == expected
+    assert gate.build_prompt(tray, texts=GATE_TEXTS) + "\n" == expected
     # The typed model renders the same bytes as the raw JSON.
-    assert gate.build_prompt(InboxTray.model_validate(tray)) + "\n" == expected
+    assert gate.build_prompt(InboxTray.model_validate(tray), texts=GATE_TEXTS) + "\n" == expected
+    # The legacy path (no served texts: a host written before contract v1)
+    # renders the same bytes.
+    assert gate.build_prompt(tray) + "\n" == expected
 
 
 def test_prompt_carries_the_server_question_verbatim_after_the_preamble(tray: dict[str, Any]) -> None:
-    prompt = gate.build_prompt(tray)
-    assert prompt.startswith(gate.prompt_preamble() + "\n\n")
+    prompt = gate.build_prompt(tray, texts=GATE_TEXTS)
+    assert prompt.startswith(GATE_TEXTS["gate_call_preamble"] + "\n\n")
     assert "\n\n" + tray["question"] + "\n\n" in prompt
 
 
@@ -145,10 +119,12 @@ def test_verdict_case(case: dict[str, Any], tray: dict[str, Any]) -> None:
 
 async def _connected(**opts: Any) -> tuple[RealtimeClient, MockWebSocket]:
     rt, ws = _make_client(**opts)
+    # HELLO offers ack only while a message.new handler is attached.
+    rt.on("message.new", lambda _m: None)
     await rt.connect()
-    await _settle()
+    await _flush()
     await ws.push({"type": "hello.ok", "capabilities": ["ack"]})
-    await _settle()
+    await _flush()
     return rt, ws
 
 
@@ -161,7 +137,7 @@ async def test_wake_frame_reaches_wake_handlers_as_is_and_is_never_acked() -> No
     rt.on("wake", lambda m: seen.append(m))
     try:
         await ws.push(raw("wake-frame.json"))
-        await _settle()
+        await _flush()
         assert seen == [frame]
         assert _ack_frames(ws) == []
     finally:
@@ -185,7 +161,7 @@ async def test_ack_frame_is_what_the_client_sends_for_a_delivered_message() -> N
                 },
             }
         )
-        await _settle()
+        await _flush()
         sent = [json.loads(s) for s in ws.sent]
         assert ack in sent
         assert _ack_frames(ws) == [ack["message_id"]]

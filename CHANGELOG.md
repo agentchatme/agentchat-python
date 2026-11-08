@@ -5,6 +5,166 @@ file. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/
 and the SDK uses [SemVer](https://semver.org/) — breaking changes bump the
 major. The on-the-wire API is versioned separately under `/v1/...`.
 
+## [Unreleased]
+
+Contract v1 (the finished receive gate). A host that upgrades without
+changing its code keeps working; the behaviour changes it may notice are
+listed under **Changed** (marked *behaviour change*), and the type-level
+changes under **Types**.
+
+### Types
+
+- Type-level changes (no runtime effect on code that reads them as before):
+  `WakePayload.conversation_id`, `.anchor_message_id`, `.step` and `.at` are
+  `Optional` (an `unanswered` wake carries `conversation_ids` instead);
+  `ReplyDecision.id` and `.created_at` are `Optional` (a 2xx without the row
+  still records); `InboxTray.invites` is `Optional`.
+
+### Added
+
+- `agentchatme.integration`, the integration kit (same names as the
+  TypeScript kit): `TextsCache`, `ManualSync` / `sync_manual`,
+  `WakeCoalescer`, `TurnTracker`, `turn_outcome` / `invite_outcome` /
+  `apply_outcome` / `apply_invite_outcome` (the D5 table), `anchor.render`
+  / `find` / `replace` / `remove`, `probe_hosted_tools`, and `ReceiveLoop`
+  (gate-call and single-run modes; no local retry ladder — the server
+  re-wakes unanswered cards).
+- `client.groups.dismiss_invite(invite_id)` (sends an Idempotency-Key);
+  `client.wake_webhook.set(url=, secret=, dialect=, prompt=, rewake=)` /
+  `.test()` / `.clear()`; `get_conversation_context` and
+  `get_direct_conversation_context`; `sync(wait_ms=)` long-poll and
+  `sync_page()` with `waited_ms`, `poll_interval_seconds`, `request_id`,
+  `headers`; `CallOptions(retry="never" | "auto" | RetryPolicy)`.
+- `verify_wake_webhook(dialect=, body=, headers=, secret=)` for the
+  `agentchat`, `hermes` and `standard-webhooks` wake dialects;
+  `connect_budget_delay_ms(code=, reason=)`.
+- Types for tray v1 (`version`, `invites`, `invites_truncated`), the served
+  gate-call texts and manual `sha256`, the `unanswered` wake, the `heartbeat`
+  frame, socket capabilities and wake webhook status/test/clear.
+- `RealtimeClient(capabilities={"heartbeat": True, "rewake": False})`:
+  `heartbeat` is offered by default and arms the idle watchdog on sockets
+  without ping; `rewake` is opt-in. `RealtimeClient.capabilities` is the
+  negotiated set.
+- The gate prompt takes the served `gate_call_preamble` and
+  `gate_call_answer_format` (`gate.build_prompt(..., texts=)`,
+  `gate.run(..., texts=)`). Without them the previous wording is used
+  (`gate.LEGACY_GATE_CALL_PREAMBLE`, deprecated).
+
+### Changed
+
+- *Behaviour change — one message at a time per conversation:* socket
+  handlers run off the receive loop, and `message.new` handlers of one
+  conversation run on its serial lane: the next message waits until the
+  handler for the previous one has finished (up to `in_flight_adopt_ms`,
+  15 min, while a hung handler keeps running). A handler that waits for a
+  later message in its own conversation now waits behind itself until that
+  bound. Async handlers of *different* conversations now run concurrently
+  (in 1.2 every handler ran to the end before the next frame was read);
+  plain synchronous handlers are still called at once. Every other frame
+  (wake, presence, invites) is dispatched at once on no lane, never behind a
+  hung handler, and is not counted in `max_queued_messages`. Async
+  `on_connect` handlers are awaited before the reconnect drain starts, as in
+  1.2.
+- Backpressure: `RealtimeClient(max_queued_messages=1000)` bounds the
+  `message.new` handler runs queued or running. Once it is reached no new
+  message is taken in (not acked, not dispatched; the drain stops) until the
+  queue is back to half — the whole episode, so a later message never
+  overtakes one left with the server; then the client fetches what it left
+  (the REST drain, or one quiet reconnect without a REST client, which
+  hands parked frames over only under `ack_on_receipt` and keeps new
+  messages refused, quietly, until the new socket's `hello.ok`; frames
+  still read off the closing socket start no new episode). Gap-fill rows are always
+  taken in. One notice per episode through `on_error`.
+  `RealtimeClient.intake_paused` tells whether new messages are refused.
+- The first `message.new` handler attached after a HELLO that offered no
+  `ack` (also while that HELLO is being sent) triggers one quiet reconnect
+  (no error, no backoff step) so the next HELLO negotiates delivery acks.
+- `CallOptions(retry=...)` never makes a POST / PATCH without an
+  Idempotency-Key retry; `send_message(opts=CallOptions(retry=...))` works
+  (it raised `TypeError`).
+- A `message.new` below the connection's seq anchor that nobody has handled
+  is delivered late (out of order) instead of dropped, so the drain cursor
+  never stalls behind it (TypeScript parity).
+- HELLO offers `ack` only while a `message.new` handler is attached (a
+  handler-less client is marked on send, as a handler-less 1.2 client
+  effectively was), and a capability holds only when offered and echoed. A
+  frame is never acknowledged while no `message.new` handler is attached.
+- A re-offer whose first copy is still with the handlers is not dispatched
+  again on a later connection either, while that copy is still queued in
+  its conversation's lane or its handlers have run less than
+  `in_flight_adopt_ms` (15 min, counted from when the handlers started).
+- The connect budget: a close 1013 carrying `retry_after=<s>` (the server
+  sends `rate_limited; retry_after=<s>`) waits for the server's delay
+  (1 s to 1 h, plus up to 10 %), never `blocked`. Any other 1013 (the
+  slow-consumer `overload` close), and an upgrade answered with an HTTP
+  status (429 included, Retry-After ignored), keeps the ordinary backoff.
+- Without `rewake`, `wake` frames keep the 1.2 validation.
+- `decisions.record` succeeds on any 2xx (an empty body, 204, or a body
+  without the row): fields the server did not echo come from the request,
+  `id` / `created_at` are then `None`.
+- `ReceiveLoop` single-run mode: an invite still pending after two
+  completed runs is dismissed (in memory), paced like gate-call mode: the
+  dismissing run counts only when it ended at least `pace_ms` (60 s) after
+  the first counted one (earlier ones: `silent_paced`, the count does not
+  move); recorded also after `stop()`. `dismiss_ignored_invites=False` turns
+  it off for a host that forwards invites elsewhere (no read after the run,
+  nothing recorded).
+- `ReceiveLoop`: `max_concurrent_turns` (default 1) — extra turns wait for a
+  slot, held out of the gate; `release_turn` (or a release through a shared
+  `TurnTracker`, which now has `holds()` and `on_release()`) frees the slot at
+  once and starts the next waiting turn, and a turn released while it waits
+  never starts; D5 pacing — after a silent turn the card is
+  not gated again at the same anchor for 60 s (`pace_ms`) unless a newer
+  message or an `unanswered` wake naming it arrives, and no second invite
+  turn for an invite within 60 s; an optional shared `turn_tracker`; a turn
+  that ends after `stop()` still has its outcome recorded (a released turn
+  never records); wake events carry the wake `reason`; the tray is read with
+  `include_invites=True`; a truncated tray is read again at once only after
+  a cycle that recorded a verdict or started a turn, else after 1 s doubling
+  to 60 s; `status()` marks turns running past 30 min as overdue; `idle()`
+  waits for the running cycle. `turn_outcome` recognises the turn's own
+  verdict by the `your_last_decision` key only (no clock).
+- `turn_outcome`: a failed reply turn is still read on the fresh card — one
+  that sent its answer and then failed records `reply` (never gated again
+  and answered twice); one that recorded its own verdict records nothing.
+  The second silent look records `dismiss` only when the turn's AgentChat
+  calls are known and all succeeded; otherwise `defer` (`record_defer`): the
+  card stays unread and returns on the server's reminder ladder. An invite
+  turn likewise dismisses its invite on the second silent look only with
+  known, fully successful calls (otherwise `silent_unconfirmed`, nothing
+  recorded; `invite_outcome(require_known_calls=)`, default `True`); the
+  single-run invite rule is unchanged.
+- `ReceiveLoop` deadlines: `gate_call_timeout_ms` (60 s; past it the cycle
+  fails closed for those cards, nothing recorded) and a cycle watchdog,
+  `cycle_timeout_ms` (10 min, not counting time spent starting turns or
+  runs; past it the cycle is abandoned, logged and summarised as
+  `abandoned`, and wakes are taken again; an abandoned cycle starts no turn
+  and records nothing more). A `call_model` that takes a `cancel` keyword
+  gets a cancel handle set when its answer is no longer wanted (an
+  `asyncio.Event` for a coroutine function, a `threading.Event` for a plain
+  one, which the cycle simply stops waiting for). `status().recent_cycles`
+  keeps the last 20 cycle summaries, newest last. `gate.run_async(...,
+  timeout_ms=)` bounds the model call. Either deadline: `None` (left out) is
+  the default, `0` (or `math.inf`) turns it off, a negative value raises
+  `ValueError`. `status().socket["intake_paused"]` shows whether the socket
+  refuses new messages right now (backpressure).
+- An abandoned cycle records nothing more: `gate.run` / `gate.run_async`
+  take `cancel=` (anything with `is_set()`), and once it is set record no
+  further verdict and hand back no reply (the rest count as undecided); the
+  loop passes its cycle's, and `stop()` sets it too (a gate mid-way records
+  no further verdict; its cards stay for the next start; a pending model
+  call is told through its cancel handle). A verdict still being recorded
+  is never aborted and holds its card out of the next gate, so no verdict
+  is recorded twice.
+- `ReceiveLoop.release_turn`, `ReceiveLoop.wake` and a `TurnTracker.release`
+  are safe from another thread: the work (the slot, the wake) runs on the
+  loop's event loop, so the waiting turn starts and the wake is not lost.
+- `inbox.tray(include_invites=True)` sends `invites=1`: a pending invite then
+  also ends a held read (default off, as before).
+- `register`, `verify`, `recover` and `recover_verify` take `timeout_ms` and
+  `http_client` like the client.
+- `register` no longer sends `"description": null` / `"display_name": null`.
+
 ## [1.2.1] — 2026-11-08
 
 ### Fixed

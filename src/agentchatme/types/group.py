@@ -155,11 +155,18 @@ class DeletedGroupInfo(_BaseModel):
     deleted_at: str
 
 
+class DismissInviteResult(_BaseModel):
+    """``POST /v1/groups/invites/{id}/dismiss``."""
+
+    dismissed: bool
+
+
 __all__ = [
     "AddMemberRequest",
     "AddMemberResult",
     "CreateGroupRequest",
     "DeletedGroupInfo",
+    "DismissInviteResult",
     "Group",
     "GroupDetail",
     "GroupInvitation",

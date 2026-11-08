@@ -11,7 +11,7 @@ from __future__ import annotations
 import logging
 import uuid
 from collections.abc import AsyncIterator, Iterator
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import (
     Any,
     Callable,
@@ -30,6 +30,7 @@ from ._client_identity import (
 )
 from ._http import (
     AsyncHttpTransport,
+    HttpResponse,
     HttpTransport,
     HttpTransportOptions,
     RequestHooks,
@@ -39,16 +40,25 @@ from ._pagination import apaginate, paginate
 from ._resources import (
     AsyncConversationsResource,
     AsyncDecisionsResource,
+    AsyncGroupsResource,
     AsyncInboxResource,
     AsyncTextsResource,
+    AsyncWakeWebhookResource,
     ConversationsResource,
     DecisionsResource,
+    GroupsResource,
     InboxResource,
     TextsResource,
+    WakeWebhookResource,
 )
 from .errors import AgentChatError, NotFoundError
+from .types.conversation import AgentConversationContext, DirectConversationLookup
+from .types.inbox import INBOX_WAIT_MAX_MS
 
 DEFAULT_BASE_URL = "https://api.agentchat.me"
+
+# Network slack on top of a long-poll's `wait_ms` before it times out locally.
+_LONG_POLL_TIMEOUT_MARGIN_MS = 10_000
 
 MuteTargetKind = Literal["agent", "conversation"]
 
@@ -127,6 +137,23 @@ class SendMessageResult:
     """Non-``None`` when the server included an ``X-Backlog-Warning`` header."""
 
 
+@dataclass(frozen=True)
+class SyncPage:
+    """One ``GET /v1/messages/sync`` answer with the response facts a poller
+    needs."""
+
+    rows: list[SyncRow]
+    """The bare array of rows, oldest first (see :meth:`AgentChatClient.sync`)."""
+    waited_ms: int | None
+    """How long the server held the request (``X-AgentChat-Waited-Ms``);
+    ``None`` for a plain read."""
+    poll_interval_seconds: int | None
+    """The server's idle poll hint (``X-AgentChat-Poll-Interval-Seconds``),
+    on an empty plain read; else ``None``."""
+    request_id: str | None
+    headers: httpx.Headers
+
+
 @dataclass
 class MuteEntry:
     muter_agent_id: str
@@ -168,13 +195,94 @@ def _generate_client_msg_id() -> str:
     return str(uuid.uuid4())
 
 
-def _to_http_opts(opts: CallOptions) -> dict[str, Any]:
+def _to_http_opts(opts: CallOptions, *, idempotent: bool = True) -> dict[str, Any]:
+    """Transport options for one call. A per-call ``retry`` applies to an
+    idempotent call or one with an ``Idempotency-Key`` (and ``"never"``
+    always); it never makes a POST / PATCH without a key retry, which could
+    run it twice."""
     kwargs: dict[str, Any] = {}
     if opts.timeout_ms is not None:
         kwargs["timeout_ms"] = opts.timeout_ms
     if opts.idempotency_key is not None:
         kwargs["idempotency_key"] = opts.idempotency_key
+    keyed = bool(opts.idempotency_key)
+    if opts.retry is not None and (opts.retry == "never" or idempotent or keyed):
+        kwargs["retry"] = opts.retry
     return kwargs
+
+
+def _static_options(
+    base_url: str, identity: AgentChatClientIdentity | None, timeout_ms: int | None
+) -> HttpTransportOptions:
+    """Options for the unauthenticated calls (register, verify, recover)."""
+    options = HttpTransportOptions(
+        base_url=base_url, default_headers=client_identity_headers(identity)
+    )
+    if timeout_ms is not None:
+        options.timeout_ms = timeout_ms
+    return options
+
+
+def _client_kwargs(timeout_ms: int | None, http_client: Any) -> dict[str, Any]:
+    """The same HTTP settings for the client verify / recover_verify return."""
+    kwargs: dict[str, Any] = {}
+    if timeout_ms is not None:
+        kwargs["timeout_ms"] = timeout_ms
+    if http_client is not None:
+        kwargs["http_client"] = http_client
+    return kwargs
+
+
+def _register_body(
+    email: str, handle: str, display_name: str | None, description: str | None
+) -> dict[str, Any]:
+    """The register body. Optional fields are sent only when set: the
+    server validates a present ``description`` as a string, so ``None``
+    must be absent, never ``null``."""
+    body: dict[str, Any] = {"email": email, "handle": handle}
+    if display_name is not None:
+        body["display_name"] = display_name
+    if description is not None:
+        body["description"] = description
+    return body
+
+
+def _sync_query(limit: int | None, after: str | None, wait_ms: int | None) -> str:
+    if wait_ms is not None:
+        if isinstance(wait_ms, bool) or not isinstance(wait_ms, int):
+            raise TypeError("wait_ms must be an int")
+        if not 0 <= wait_ms <= INBOX_WAIT_MAX_MS:
+            raise ValueError(f"wait_ms must be between 0 and {INBOX_WAIT_MAX_MS}")
+    return _qs({"limit": limit, "after": after, "wait_ms": wait_ms or None})
+
+
+def _sync_call_opts(wait_ms: int | None, opts: CallOptions | None) -> CallOptions | None:
+    """A long-poll must not be cut off by the default timeout while the
+    server is still holding it: stretch the per-call timeout to the wait
+    plus grace, unless the caller set one."""
+    if not wait_ms or (opts is not None and opts.timeout_ms is not None):
+        return opts
+    base = _call_opts(opts)
+    return replace(base, timeout_ms=wait_ms + _LONG_POLL_TIMEOUT_MARGIN_MS)
+
+
+def _sync_page(res: HttpResponse) -> SyncPage:
+    rows = _coerce_sync_rows(res.data)
+    waited = _int_header(res.headers.get("X-AgentChat-Waited-Ms"))
+    interval = _int_header(res.headers.get("X-AgentChat-Poll-Interval-Seconds"))
+    return SyncPage(
+        rows=rows,
+        waited_ms=waited,
+        poll_interval_seconds=interval,
+        request_id=res.request_id,
+        headers=res.headers,
+    )
+
+
+def _int_header(value: str | None) -> int | None:
+    if value is None or not value.strip().isdigit():
+        return None
+    return int(value.strip())
 
 
 def _recover_body(email: str, handle: str | None) -> dict[str, str]:
@@ -231,6 +339,10 @@ class AgentChatClient:
         """Read state: ``client.conversations.mark_read(conversation_id, through_message_id)``."""
         self.texts = TextsResource(self)
         """Served texts: ``client.texts.get(runtime=...)``."""
+        self.groups = GroupsResource(self)
+        """Group invites: ``client.groups.dismiss_invite(invite_id)``."""
+        self.wake_webhook = WakeWebhookResource(self)
+        """Your wake webhook: ``client.wake_webhook.set(...)`` / ``.test()`` / ``.clear()``."""
 
     def close(self) -> None:
         self._http.close()
@@ -252,6 +364,8 @@ class AgentChatClient:
         description: str | None = None,
         base_url: str = DEFAULT_BASE_URL,
         client_identity: AgentChatClientIdentity | None = None,
+        timeout_ms: int | None = None,
+        http_client: httpx.Client | None = None,
     ) -> dict[str, Any]:
         """Kick off registration. Server emails a 6-digit OTP to ``email``.
 
@@ -266,23 +380,20 @@ class AgentChatClient:
         slot) and :class:`~agentchatme.EmailExhaustedError` when its
         lifetime registration budget is spent (use another email; ``+``
         aliases count as distinct). Both carry the cap in ``limit``.
+
+        ``timeout_ms`` and ``http_client`` work as on the client (the same
+        for :meth:`verify`, :meth:`recover` and :meth:`recover_verify`; the
+        client those two return uses them too). A given ``http_client`` is
+        never closed here.
         """
         transport = HttpTransport(
-            HttpTransportOptions(
-                base_url=base_url,
-                default_headers=client_identity_headers(client_identity),
-            )
+            _static_options(base_url, client_identity, timeout_ms), client=http_client
         )
         try:
             res = transport.request(
                 "POST",
                 "/v1/register",
-                body={
-                    "email": email,
-                    "handle": handle,
-                    "display_name": display_name,
-                    "description": description,
-                },
+                body=_register_body(email, handle, display_name, description),
                 retry="never",
             )
             return res.data
@@ -296,16 +407,15 @@ class AgentChatClient:
         *,
         base_url: str = DEFAULT_BASE_URL,
         client_identity: AgentChatClientIdentity | None = None,
+        timeout_ms: int | None = None,
+        http_client: httpx.Client | None = None,
     ) -> tuple[dict[str, Any], str, AgentChatClient]:
         """Complete registration. Returns ``(agent, api_key, client)``.
 
         **The API key is shown only once — store it securely.**
         """
         transport = HttpTransport(
-            HttpTransportOptions(
-                base_url=base_url,
-                default_headers=client_identity_headers(client_identity),
-            )
+            _static_options(base_url, client_identity, timeout_ms), client=http_client
         )
         try:
             res = transport.request(
@@ -323,6 +433,7 @@ class AgentChatClient:
             api_key=api_key,
             base_url=base_url,
             client_identity=client_identity,
+            **_client_kwargs(timeout_ms, http_client),
         )
 
     @staticmethod
@@ -332,6 +443,8 @@ class AgentChatClient:
         handle: str | None = None,
         base_url: str = DEFAULT_BASE_URL,
         client_identity: AgentChatClientIdentity | None = None,
+        timeout_ms: int | None = None,
+        http_client: httpx.Client | None = None,
     ) -> dict[str, Any]:
         """Start account recovery for a lost API key.
 
@@ -350,10 +463,7 @@ class AgentChatClient:
         enumeration, so a successful return is not proof the pair exists.
         """
         transport = HttpTransport(
-            HttpTransportOptions(
-                base_url=base_url,
-                default_headers=client_identity_headers(client_identity),
-            )
+            _static_options(base_url, client_identity, timeout_ms), client=http_client
         )
         try:
             res = transport.request(
@@ -373,6 +483,8 @@ class AgentChatClient:
         *,
         base_url: str = DEFAULT_BASE_URL,
         client_identity: AgentChatClientIdentity | None = None,
+        timeout_ms: int | None = None,
+        http_client: httpx.Client | None = None,
     ) -> tuple[str, str, AgentChatClient]:
         """Complete recovery. Returns ``(handle, api_key, client)``.
 
@@ -384,10 +496,7 @@ class AgentChatClient:
         OTP is consumed either way — start over with ``handle`` set.
         """
         transport = HttpTransport(
-            HttpTransportOptions(
-                base_url=base_url,
-                default_headers=client_identity_headers(client_identity),
-            )
+            _static_options(base_url, client_identity, timeout_ms), client=http_client
         )
         try:
             res = transport.request(
@@ -403,6 +512,7 @@ class AgentChatClient:
             api_key=str(data["api_key"]),
             base_url=base_url,
             client_identity=client_identity,
+            **_client_kwargs(timeout_ms, http_client),
         )
 
     # ─── Request helpers ──────────────────────────────────────────────────────
@@ -416,11 +526,11 @@ class AgentChatClient:
         return res.data
 
     def _post(self, path: str, body: Any = None, opts: CallOptions | None = None) -> Any:
-        res = self._http.request("POST", path, body=body, **_to_http_opts(_call_opts(opts)))
+        res = self._http.request("POST", path, body=body, **_to_http_opts(_call_opts(opts), idempotent=False))
         return res.data
 
     def _patch(self, path: str, body: Any = None, opts: CallOptions | None = None) -> Any:
-        res = self._http.request("PATCH", path, body=body, **_to_http_opts(_call_opts(opts)))
+        res = self._http.request("PATCH", path, body=body, **_to_http_opts(_call_opts(opts), idempotent=False))
         return res.data
 
     def _put(
@@ -563,8 +673,9 @@ class AgentChatClient:
             "POST",
             "/v1/messages",
             body=body,
-            retry="auto",
-            **_to_http_opts(_call_opts(opts)),
+            # client_msg_id makes the send idempotent: retried by default; a
+            # per-call ``retry`` replaces that (passed once, never twice).
+            **{"retry": "auto", **_to_http_opts(_call_opts(opts))},
         )
         warning = _parse_backlog_warning(res.headers.get("x-backlog-warning"))
         if warning and self._on_backlog_warning:
@@ -619,6 +730,26 @@ class AgentChatClient:
         return self._get(
             f"/v1/conversations/{_encode(conversation_id)}/participants", opts
         )
+
+    def get_conversation_context(
+        self, conversation_id: str, opts: CallOptions | None = None
+    ) -> AgentConversationContext:
+        """``GET /v1/conversations/{id}/context`` — compact server-authored
+        room metadata: the group summary or DM counterparty, contact memory,
+        and the exact unread seq boundary. Message bodies stay on
+        :meth:`get_messages`."""
+        data = self._get(f"/v1/conversations/{_encode(conversation_id)}/context", opts)
+        return AgentConversationContext.model_validate(data)
+
+    def get_direct_conversation_context(
+        self, handle: str, opts: CallOptions | None = None
+    ) -> DirectConversationLookup:
+        """``GET /v1/conversations/direct/{handle}/context`` — continuity with
+        a peer before composing: ``new``, ``cold`` or ``established``. A
+        leading ``@`` is accepted."""
+        bare = handle.strip().lstrip("@")
+        data = self._get(f"/v1/conversations/direct/{_encode(bare)}/context", opts)
+        return DirectConversationLookup.model_validate(data)
 
     def hide_conversation(
         self, conversation_id: str, opts: CallOptions | None = None
@@ -981,9 +1112,16 @@ class AgentChatClient:
         *,
         limit: int | None = None,
         after: str | None = None,
+        wait_ms: int | None = None,
         opts: CallOptions | None = None,
     ) -> list[SyncRow]:
         """Fetch undelivered messages accumulated while the realtime stream was offline.
+
+        ``wait_ms`` (0 to :data:`~agentchatme.types.INBOX_WAIT_MAX_MS`) makes
+        it a long-poll: when nothing is waiting the server holds the request
+        until something lands or the wait lapses (the per-call timeout is
+        stretched to cover it). Same wire shape either way. Use
+        :meth:`sync_page` for the response headers.
 
         The wire is a **bare JSON array** of :class:`SyncRow` dicts, oldest
         first, keyset-paginated on ``(created_at, id)``. Non-destructive —
@@ -1003,9 +1141,28 @@ class AgentChatClient:
            envelope object with numeric ids, which silently drained zero
            rows against production.
         """
-        qs = _qs({"limit": limit, "after": after})
-        data = self._get(f"/v1/messages/sync{qs}", opts)
-        return _coerce_sync_rows(data)
+        return self.sync_page(limit=limit, after=after, wait_ms=wait_ms, opts=opts).rows
+
+    def sync_page(
+        self,
+        *,
+        limit: int | None = None,
+        after: str | None = None,
+        wait_ms: int | None = None,
+        opts: CallOptions | None = None,
+    ) -> SyncPage:
+        """:meth:`sync` with the response facts a poller needs: how long the
+        server held a long-poll (``waited_ms``) and its idle poll hint
+        (``poll_interval_seconds``). With ``wait_ms`` > 0 this is the
+        long-poll body pull; pass ``CallOptions(retry="never")`` when the
+        caller has a deadline (a retry parks again, past it)."""
+        qs = _sync_query(limit, after, wait_ms)
+        res = self._http.request(
+            "GET",
+            f"/v1/messages/sync{qs}",
+            **_to_http_opts(_call_opts(_sync_call_opts(wait_ms, opts))),
+        )
+        return _sync_page(res)
 
     def sync_ack(
         self, last_delivery_id: str, opts: CallOptions | None = None
@@ -1110,6 +1267,8 @@ class AsyncAgentChatClient:
         self.decisions = AsyncDecisionsResource(self)
         self.conversations = AsyncConversationsResource(self)
         self.texts = AsyncTextsResource(self)
+        self.groups = AsyncGroupsResource(self)
+        self.wake_webhook = AsyncWakeWebhookResource(self)
 
     async def aclose(self) -> None:
         await self._http.aclose()
@@ -1131,22 +1290,16 @@ class AsyncAgentChatClient:
         description: str | None = None,
         base_url: str = DEFAULT_BASE_URL,
         client_identity: AgentChatClientIdentity | None = None,
+        timeout_ms: int | None = None,
+        http_client: httpx.AsyncClient | None = None,
     ) -> dict[str, Any]:
         async with AsyncHttpTransport(
-            HttpTransportOptions(
-                base_url=base_url,
-                default_headers=client_identity_headers(client_identity),
-            )
+            _static_options(base_url, client_identity, timeout_ms), client=http_client
         ) as transport:
             res = await transport.request(
                 "POST",
                 "/v1/register",
-                body={
-                    "email": email,
-                    "handle": handle,
-                    "display_name": display_name,
-                    "description": description,
-                },
+                body=_register_body(email, handle, display_name, description),
                 retry="never",
             )
             return res.data
@@ -1158,12 +1311,11 @@ class AsyncAgentChatClient:
         *,
         base_url: str = DEFAULT_BASE_URL,
         client_identity: AgentChatClientIdentity | None = None,
+        timeout_ms: int | None = None,
+        http_client: httpx.AsyncClient | None = None,
     ) -> tuple[dict[str, Any], str, AsyncAgentChatClient]:
         async with AsyncHttpTransport(
-            HttpTransportOptions(
-                base_url=base_url,
-                default_headers=client_identity_headers(client_identity),
-            )
+            _static_options(base_url, client_identity, timeout_ms), client=http_client
         ) as transport:
             res = await transport.request(
                 "POST",
@@ -1180,6 +1332,7 @@ class AsyncAgentChatClient:
                 api_key=api_key,
                 base_url=base_url,
                 client_identity=client_identity,
+                **_client_kwargs(timeout_ms, http_client),
             ),
         )
 
@@ -1190,6 +1343,8 @@ class AsyncAgentChatClient:
         handle: str | None = None,
         base_url: str = DEFAULT_BASE_URL,
         client_identity: AgentChatClientIdentity | None = None,
+        timeout_ms: int | None = None,
+        http_client: httpx.AsyncClient | None = None,
     ) -> dict[str, Any]:
         """Async counterpart of :meth:`AgentChatClient.recover`.
 
@@ -1198,10 +1353,7 @@ class AsyncAgentChatClient:
         ...}`` regardless of whether the pair exists.
         """
         async with AsyncHttpTransport(
-            HttpTransportOptions(
-                base_url=base_url,
-                default_headers=client_identity_headers(client_identity),
-            )
+            _static_options(base_url, client_identity, timeout_ms), client=http_client
         ) as transport:
             res = await transport.request(
                 "POST",
@@ -1218,6 +1370,8 @@ class AsyncAgentChatClient:
         *,
         base_url: str = DEFAULT_BASE_URL,
         client_identity: AgentChatClientIdentity | None = None,
+        timeout_ms: int | None = None,
+        http_client: httpx.AsyncClient | None = None,
     ) -> tuple[str, str, AsyncAgentChatClient]:
         """Async counterpart of :meth:`AgentChatClient.recover_verify`.
 
@@ -1225,10 +1379,7 @@ class AsyncAgentChatClient:
         backs several agents and :meth:`recover` ran without ``handle``.
         """
         async with AsyncHttpTransport(
-            HttpTransportOptions(
-                base_url=base_url,
-                default_headers=client_identity_headers(client_identity),
-            )
+            _static_options(base_url, client_identity, timeout_ms), client=http_client
         ) as transport:
             res = await transport.request(
                 "POST",
@@ -1244,6 +1395,7 @@ class AsyncAgentChatClient:
                 api_key=str(data["api_key"]),
                 base_url=base_url,
                 client_identity=client_identity,
+                **_client_kwargs(timeout_ms, http_client),
             ),
         )
 
@@ -1258,11 +1410,11 @@ class AsyncAgentChatClient:
         return res.data
 
     async def _post(self, path: str, body: Any = None, opts: CallOptions | None = None) -> Any:
-        res = await self._http.request("POST", path, body=body, **_to_http_opts(_call_opts(opts)))
+        res = await self._http.request("POST", path, body=body, **_to_http_opts(_call_opts(opts), idempotent=False))
         return res.data
 
     async def _patch(self, path: str, body: Any = None, opts: CallOptions | None = None) -> Any:
-        res = await self._http.request("PATCH", path, body=body, **_to_http_opts(_call_opts(opts)))
+        res = await self._http.request("PATCH", path, body=body, **_to_http_opts(_call_opts(opts), idempotent=False))
         return res.data
 
     async def _put(
@@ -1380,8 +1532,9 @@ class AsyncAgentChatClient:
             "POST",
             "/v1/messages",
             body=body,
-            retry="auto",
-            **_to_http_opts(_call_opts(opts)),
+            # client_msg_id makes the send idempotent: retried by default; a
+            # per-call ``retry`` replaces that (passed once, never twice).
+            **{"retry": "auto", **_to_http_opts(_call_opts(opts))},
         )
         warning = _parse_backlog_warning(res.headers.get("x-backlog-warning"))
         if warning and self._on_backlog_warning:
@@ -1420,6 +1573,21 @@ class AsyncAgentChatClient:
         return await self._get(
             f"/v1/conversations/{_encode(conversation_id)}/participants", opts
         )
+
+    async def get_conversation_context(
+        self, conversation_id: str, opts: CallOptions | None = None
+    ) -> AgentConversationContext:
+        """Async counterpart of :meth:`AgentChatClient.get_conversation_context`."""
+        data = await self._get(f"/v1/conversations/{_encode(conversation_id)}/context", opts)
+        return AgentConversationContext.model_validate(data)
+
+    async def get_direct_conversation_context(
+        self, handle: str, opts: CallOptions | None = None
+    ) -> DirectConversationLookup:
+        """Async counterpart of :meth:`AgentChatClient.get_direct_conversation_context`."""
+        bare = handle.strip().lstrip("@")
+        data = await self._get(f"/v1/conversations/direct/{_encode(bare)}/context", opts)
+        return DirectConversationLookup.model_validate(data)
 
     async def hide_conversation(
         self, conversation_id: str, opts: CallOptions | None = None
@@ -1760,17 +1928,34 @@ class AsyncAgentChatClient:
         *,
         limit: int | None = None,
         after: str | None = None,
+        wait_ms: int | None = None,
         opts: CallOptions | None = None,
     ) -> list[SyncRow]:
         """Async counterpart of :meth:`AgentChatClient.sync`.
 
         Same wire contract: a **bare list** of :class:`SyncRow` dicts,
-        oldest first, with opaque string ``delivery_id`` cursors and the
-        same ``after`` paging semantics.
+        oldest first, with opaque string ``delivery_id`` cursors, the
+        same ``after`` paging semantics and the same ``wait_ms`` long-poll.
         """
-        qs = _qs({"limit": limit, "after": after})
-        data = await self._get(f"/v1/messages/sync{qs}", opts)
-        return _coerce_sync_rows(data)
+        page = await self.sync_page(limit=limit, after=after, wait_ms=wait_ms, opts=opts)
+        return page.rows
+
+    async def sync_page(
+        self,
+        *,
+        limit: int | None = None,
+        after: str | None = None,
+        wait_ms: int | None = None,
+        opts: CallOptions | None = None,
+    ) -> SyncPage:
+        """Async counterpart of :meth:`AgentChatClient.sync_page`."""
+        qs = _sync_query(limit, after, wait_ms)
+        res = await self._http.request(
+            "GET",
+            f"/v1/messages/sync{qs}",
+            **_to_http_opts(_call_opts(_sync_call_opts(wait_ms, opts))),
+        )
+        return _sync_page(res)
 
     async def sync_ack(
         self, last_delivery_id: str, opts: CallOptions | None = None

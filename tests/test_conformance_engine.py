@@ -24,9 +24,31 @@ FIXTURE = Path(__file__).resolve().parent.parent / "conformance" / "v1" / "engin
 DOC: dict[str, Any] = json.loads(FIXTURE.read_text(encoding="utf-8"))
 
 MODES = ["default", "ack_on_receipt"]
-OPS = ["close", "connect", "drain", "frame", "gap_window_lapses", "release", "wait_handler"]
+OPS = [
+    "close",
+    "connect",
+    "drain",
+    "frame",
+    "gap_window_lapses",
+    "reconnect",
+    "release",
+    "wait_handler",
+]
 EXPECTATIONS = ["cursor_acks", "dispatched", "dispatched_includes", "ws_acks"]
-INVARIANTS = ["acked_was_handled", "acks_follow_handling", "dispatched_once", "seq_order"]
+INVARIANTS = [
+    "acked_was_handled",
+    "acks_follow_handling",
+    "dispatched_once",
+    "seq_order",
+    "serial_per_conversation",
+]
+
+
+def _connector(sock: MockWebSocket) -> Any:
+    async def connect(_url: str, **_kw: Any) -> MockWebSocket:
+        return sock
+
+    return connect
 
 
 async def _idle() -> None:
@@ -88,12 +110,16 @@ async def _run(scenario: dict[str, Any], mode: str) -> _Outcome:
     async def handler(message: dict[str, Any]) -> None:
         payload = message["payload"]
         out.dispatched.append(payload)
-        hold = holds.get(payload["id"])
-        if hold is not None:
-            await hold.wait()
-        if payload["id"] in failing:
-            raise RuntimeError(f"scenario handler fails {payload['id']}")
-        out.events.append(("handled", payload["id"]))
+        out.events.append(("entered", payload["id"]))
+        try:
+            hold = holds.get(payload["id"])
+            if hold is not None:
+                await hold.wait()
+            if payload["id"] in failing:
+                raise RuntimeError(f"scenario handler fails {payload['id']}")
+            out.events.append(("handled", payload["id"]))
+        finally:
+            out.events.append(("left", payload["id"]))
 
     rt: RealtimeClient | None = None
     ws: _RecordingSocket | None = None
@@ -109,7 +135,17 @@ async def _run(scenario: dict[str, Any], mode: str) -> _Outcome:
                     auto_drain_on_connect=False,
                     ack_on_receipt=mode == "ack_on_receipt",
                 )
-                rt.on("message.new", handler)
+                if not scenario.get("no_handler"):
+                    rt.on("message.new", handler)
+                await rt.connect()
+                await _idle()
+                await ws.push({"type": "hello.ok", "capabilities": ["ack"]})
+            elif op == "reconnect":
+                # The same client on a new socket: the dedup cache and the
+                # dispatches still running carry over, the ordering does not.
+                assert rt is not None
+                ws = _RecordingSocket(out.events)
+                rt._websocket_connect = _connector(ws)
                 await rt.connect()
                 await _idle()
                 await ws.push({"type": "hello.ok", "capabilities": ["ack"]})
@@ -181,6 +217,20 @@ def _check_invariants(out: _Outcome, mode: str) -> None:
     ids = [p["id"] for p in out.dispatched]
     assert len(set(ids)) == len(ids), f"a message reached the handler twice: {ids}"
 
+    # serial_per_conversation: never entered for a message of a conversation
+    # while still running for another one of it.
+    conversation = {p["id"]: p["conversation_id"] for p in out.dispatched}
+    running: dict[str, str] = {}
+    for kind, value in out.events:
+        cid = conversation.get(value)
+        if cid is None:
+            continue
+        if kind == "entered":
+            assert cid not in running, f"{cid}: {value} entered while {running.get(cid)} runs"
+            running[cid] = value
+        elif kind == "left" and running.get(cid) == value:
+            del running[cid]
+
     # seq_order
     last: dict[str, int] = {}
     for p in out.dispatched:
@@ -207,6 +257,7 @@ def test_names_only_ops_expectations_and_invariants_this_harness_implements() ->
     assert sorted(DOC["expectations"]) == EXPECTATIONS
     assert sorted(DOC["invariants"]) == INVARIANTS
     for scenario in DOC["scenarios"]:
+        assert set(scenario) <= {"expect", "fail", "hold", "name", "no_handler", "steps", "sync_pages", "why"}
         for step in scenario["steps"]:
             assert step["op"] in OPS
         assert sorted(scenario["expect"]) == sorted(MODES)

@@ -1,0 +1,12 @@
+{
+  "payload": {
+    "at": "2026-11-08T09:01:00.000Z",
+    "conversation_ids": [
+      "conv_direct0first01",
+      "conv_group0ops00001"
+    ],
+    "reason": "unanswered",
+    "step": 1
+  },
+  "type": "wake"
+}
