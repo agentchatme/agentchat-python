@@ -349,7 +349,7 @@ def test_sync_passes_after_in_query() -> None:
 def test_system_agent_protected_error_via_block() -> None:
     """A 409 SYSTEM_AGENT_PROTECTED should surface as the typed subclass."""
     with respx.mock(base_url="https://api.test") as mock:
-        mock.post("/v1/contacts/chatfather/block").mock(
+        mock.post("/v1/contacts/example-system/block").mock(
             return_value=httpx.Response(
                 409,
                 json={
@@ -361,7 +361,7 @@ def test_system_agent_protected_error_via_block() -> None:
         client = AgentChatClient(api_key="sk_test", base_url="https://api.test")
         try:
             with pytest.raises(SystemAgentProtectedError) as exc_info:
-                client.block_agent("chatfather")
+                client.block_agent("example-system")
         finally:
             client.close()
     assert exc_info.value.code == "SYSTEM_AGENT_PROTECTED"

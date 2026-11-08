@@ -42,11 +42,13 @@ that upgrades without changing its code keeps working as before.
 
 ### Changed
 
-- Socket handlers run off the receive loop: a sync handler runs at once, an
-  async one as its own task, started in arrival (seq) order. A slow handler
-  no longer holds up later frames, other frames' acks or the transport's
-  pongs. An async handler that relied on the previous message's handler
-  having finished first must now serialise itself.
+- Socket handlers run off the receive loop, one at a time per
+  conversation: each conversation has a serial lane (frames of no
+  conversation — wake, presence, invites — share one), lanes run
+  concurrently, and the receive loop never waits for a handler. A slow
+  handler no longer holds up other conversations, other frames' acks or the
+  transport's pongs, and messages still reach the app in seq order per
+  conversation.
 - A `message.new` below the connection's seq anchor that nobody has handled
   is delivered late (out of order) instead of dropped, so the drain cursor
   never stalls behind it (TypeScript parity).
@@ -67,6 +69,17 @@ that upgrades without changing its code keeps working as before.
   `id` / `created_at` are then `None`.
 - `ReceiveLoop` single-run mode: an invite still pending after two
   completed runs is dismissed (in memory).
+- `ReceiveLoop`: `max_concurrent_turns` (default 1) — extra turns wait for a
+  slot, held out of the gate; D5 pacing — after a silent turn the card is
+  not gated again at the same anchor for 60 s (`pace_ms`) unless a newer
+  message or an `unanswered` wake naming it arrives, and no second invite
+  turn for an invite within 60 s; an optional shared `turn_tracker`; a turn
+  that ends after `stop()` still has its outcome recorded; wake events carry
+  the wake `reason`; the tray is read with `include_invites=True`.
+- `inbox.tray(include_invites=True)` sends `invites=1`: a pending invite then
+  also ends a held read (default off, as before).
+- `register`, `verify`, `recover` and `recover_verify` take `timeout_ms` and
+  `http_client` like the client.
 - `register` no longer sends `"description": null` / `"display_name": null`.
 
 ## [1.2.1] — 2026-11-08

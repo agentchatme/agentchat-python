@@ -206,6 +206,28 @@ def _to_http_opts(opts: CallOptions) -> dict[str, Any]:
     return kwargs
 
 
+def _static_options(
+    base_url: str, identity: AgentChatClientIdentity | None, timeout_ms: int | None
+) -> HttpTransportOptions:
+    """Options for the unauthenticated calls (register, verify, recover)."""
+    options = HttpTransportOptions(
+        base_url=base_url, default_headers=client_identity_headers(identity)
+    )
+    if timeout_ms is not None:
+        options.timeout_ms = timeout_ms
+    return options
+
+
+def _client_kwargs(timeout_ms: int | None, http_client: Any) -> dict[str, Any]:
+    """The same HTTP settings for the client verify / recover_verify return."""
+    kwargs: dict[str, Any] = {}
+    if timeout_ms is not None:
+        kwargs["timeout_ms"] = timeout_ms
+    if http_client is not None:
+        kwargs["http_client"] = http_client
+    return kwargs
+
+
 def _register_body(
     email: str, handle: str, display_name: str | None, description: str | None
 ) -> dict[str, Any]:
@@ -337,6 +359,8 @@ class AgentChatClient:
         description: str | None = None,
         base_url: str = DEFAULT_BASE_URL,
         client_identity: AgentChatClientIdentity | None = None,
+        timeout_ms: int | None = None,
+        http_client: httpx.Client | None = None,
     ) -> dict[str, Any]:
         """Kick off registration. Server emails a 6-digit OTP to ``email``.
 
@@ -351,12 +375,14 @@ class AgentChatClient:
         slot) and :class:`~agentchatme.EmailExhaustedError` when its
         lifetime registration budget is spent (use another email; ``+``
         aliases count as distinct). Both carry the cap in ``limit``.
+
+        ``timeout_ms`` and ``http_client`` work as on the client (the same
+        for :meth:`verify`, :meth:`recover` and :meth:`recover_verify`; the
+        client those two return uses them too). A given ``http_client`` is
+        never closed here.
         """
         transport = HttpTransport(
-            HttpTransportOptions(
-                base_url=base_url,
-                default_headers=client_identity_headers(client_identity),
-            )
+            _static_options(base_url, client_identity, timeout_ms), client=http_client
         )
         try:
             res = transport.request(
@@ -376,16 +402,15 @@ class AgentChatClient:
         *,
         base_url: str = DEFAULT_BASE_URL,
         client_identity: AgentChatClientIdentity | None = None,
+        timeout_ms: int | None = None,
+        http_client: httpx.Client | None = None,
     ) -> tuple[dict[str, Any], str, AgentChatClient]:
         """Complete registration. Returns ``(agent, api_key, client)``.
 
         **The API key is shown only once — store it securely.**
         """
         transport = HttpTransport(
-            HttpTransportOptions(
-                base_url=base_url,
-                default_headers=client_identity_headers(client_identity),
-            )
+            _static_options(base_url, client_identity, timeout_ms), client=http_client
         )
         try:
             res = transport.request(
@@ -403,6 +428,7 @@ class AgentChatClient:
             api_key=api_key,
             base_url=base_url,
             client_identity=client_identity,
+            **_client_kwargs(timeout_ms, http_client),
         )
 
     @staticmethod
@@ -412,6 +438,8 @@ class AgentChatClient:
         handle: str | None = None,
         base_url: str = DEFAULT_BASE_URL,
         client_identity: AgentChatClientIdentity | None = None,
+        timeout_ms: int | None = None,
+        http_client: httpx.Client | None = None,
     ) -> dict[str, Any]:
         """Start account recovery for a lost API key.
 
@@ -430,10 +458,7 @@ class AgentChatClient:
         enumeration, so a successful return is not proof the pair exists.
         """
         transport = HttpTransport(
-            HttpTransportOptions(
-                base_url=base_url,
-                default_headers=client_identity_headers(client_identity),
-            )
+            _static_options(base_url, client_identity, timeout_ms), client=http_client
         )
         try:
             res = transport.request(
@@ -453,6 +478,8 @@ class AgentChatClient:
         *,
         base_url: str = DEFAULT_BASE_URL,
         client_identity: AgentChatClientIdentity | None = None,
+        timeout_ms: int | None = None,
+        http_client: httpx.Client | None = None,
     ) -> tuple[str, str, AgentChatClient]:
         """Complete recovery. Returns ``(handle, api_key, client)``.
 
@@ -464,10 +491,7 @@ class AgentChatClient:
         OTP is consumed either way — start over with ``handle`` set.
         """
         transport = HttpTransport(
-            HttpTransportOptions(
-                base_url=base_url,
-                default_headers=client_identity_headers(client_identity),
-            )
+            _static_options(base_url, client_identity, timeout_ms), client=http_client
         )
         try:
             res = transport.request(
@@ -483,6 +507,7 @@ class AgentChatClient:
             api_key=str(data["api_key"]),
             base_url=base_url,
             client_identity=client_identity,
+            **_client_kwargs(timeout_ms, http_client),
         )
 
     # ─── Request helpers ──────────────────────────────────────────────────────
@@ -1259,12 +1284,11 @@ class AsyncAgentChatClient:
         description: str | None = None,
         base_url: str = DEFAULT_BASE_URL,
         client_identity: AgentChatClientIdentity | None = None,
+        timeout_ms: int | None = None,
+        http_client: httpx.AsyncClient | None = None,
     ) -> dict[str, Any]:
         async with AsyncHttpTransport(
-            HttpTransportOptions(
-                base_url=base_url,
-                default_headers=client_identity_headers(client_identity),
-            )
+            _static_options(base_url, client_identity, timeout_ms), client=http_client
         ) as transport:
             res = await transport.request(
                 "POST",
@@ -1281,12 +1305,11 @@ class AsyncAgentChatClient:
         *,
         base_url: str = DEFAULT_BASE_URL,
         client_identity: AgentChatClientIdentity | None = None,
+        timeout_ms: int | None = None,
+        http_client: httpx.AsyncClient | None = None,
     ) -> tuple[dict[str, Any], str, AsyncAgentChatClient]:
         async with AsyncHttpTransport(
-            HttpTransportOptions(
-                base_url=base_url,
-                default_headers=client_identity_headers(client_identity),
-            )
+            _static_options(base_url, client_identity, timeout_ms), client=http_client
         ) as transport:
             res = await transport.request(
                 "POST",
@@ -1303,6 +1326,7 @@ class AsyncAgentChatClient:
                 api_key=api_key,
                 base_url=base_url,
                 client_identity=client_identity,
+                **_client_kwargs(timeout_ms, http_client),
             ),
         )
 
@@ -1313,6 +1337,8 @@ class AsyncAgentChatClient:
         handle: str | None = None,
         base_url: str = DEFAULT_BASE_URL,
         client_identity: AgentChatClientIdentity | None = None,
+        timeout_ms: int | None = None,
+        http_client: httpx.AsyncClient | None = None,
     ) -> dict[str, Any]:
         """Async counterpart of :meth:`AgentChatClient.recover`.
 
@@ -1321,10 +1347,7 @@ class AsyncAgentChatClient:
         ...}`` regardless of whether the pair exists.
         """
         async with AsyncHttpTransport(
-            HttpTransportOptions(
-                base_url=base_url,
-                default_headers=client_identity_headers(client_identity),
-            )
+            _static_options(base_url, client_identity, timeout_ms), client=http_client
         ) as transport:
             res = await transport.request(
                 "POST",
@@ -1341,6 +1364,8 @@ class AsyncAgentChatClient:
         *,
         base_url: str = DEFAULT_BASE_URL,
         client_identity: AgentChatClientIdentity | None = None,
+        timeout_ms: int | None = None,
+        http_client: httpx.AsyncClient | None = None,
     ) -> tuple[str, str, AsyncAgentChatClient]:
         """Async counterpart of :meth:`AgentChatClient.recover_verify`.
 
@@ -1348,10 +1373,7 @@ class AsyncAgentChatClient:
         backs several agents and :meth:`recover` ran without ``handle``.
         """
         async with AsyncHttpTransport(
-            HttpTransportOptions(
-                base_url=base_url,
-                default_headers=client_identity_headers(client_identity),
-            )
+            _static_options(base_url, client_identity, timeout_ms), client=http_client
         ) as transport:
             res = await transport.request(
                 "POST",
@@ -1367,6 +1389,7 @@ class AsyncAgentChatClient:
                 api_key=str(data["api_key"]),
                 base_url=base_url,
                 client_identity=client_identity,
+                **_client_kwargs(timeout_ms, http_client),
             ),
         )
 

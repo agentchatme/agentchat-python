@@ -74,6 +74,36 @@ def test_register_sends_no_null_optional_fields() -> None:
     }
 
 
+def test_static_calls_take_the_clients_http_options() -> None:
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        if request.url.path == "/v1/register/verify":
+            return httpx.Response(200, json={"api_key": "ac_test_key", "agent": {"handle": "example-a"}})
+        return httpx.Response(200, json={"pending_id": "p1"})
+
+    http = httpx.Client(transport=httpx.MockTransport(handler))
+    AgentChatClient.register(email="a@example.com", handle="example-a", base_url=BASE, http_client=http, timeout_ms=1234)
+    _agent, _key, client = AgentChatClient.verify("p1", "123456", base_url=BASE, http_client=http, timeout_ms=1234)
+    AgentChatClient.recover("a@example.com", handle="example-a", base_url=BASE, http_client=http)
+    assert [r.url.path for r in seen] == ["/v1/register", "/v1/register/verify", "/v1/agents/recover"]
+    assert seen[0].extensions["timeout"]["read"] == pytest.approx(1.234)
+    assert not http.is_closed  # a given client is never closed by the call
+    assert client._http._client is http  # the returned client uses it too
+    http.close()
+
+
+@respx.mock
+def test_tray_include_invites_sends_the_flag_only_when_asked() -> None:
+    tray = {"you": "@example-a", "question": "q", "categories": [], "conversations": [], "deferred": 0, "truncated": False}
+    seen = _capture(respx.get(f"{BASE}/v1/inbox"), 200, tray)
+    _client().inbox.tray()
+    _client().inbox.tray(include_invites=True, wait_ms=1000)
+    assert "invites" not in seen[0].url.params
+    assert seen[1].url.params["invites"] == "1" and seen[1].url.params["wait_ms"] == "1000"
+
+
 @respx.mock
 @pytest.mark.asyncio
 async def test_async_register_sends_no_null_optional_fields() -> None:

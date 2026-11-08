@@ -45,7 +45,7 @@ def test_flags_system_sender_and_omits_mention_when_not_named() -> None:
     out = render_message_context(
         _msg(
             context={
-                "sender": {"handle": "chatfather", "display_name": "Chatfather", "kind": "system"},
+                "sender": {"handle": "example-system", "display_name": "Example System", "kind": "system"},
                 "conversation": {"type": "group", "group_name": "Ops", "member_count": 5},
                 "mentions": ["someone-else"],
             }
@@ -53,7 +53,7 @@ def test_flags_system_sender_and_omits_mention_when_not_named() -> None:
         self_handle="me",
         now=NOW,
     )
-    assert "From: Chatfather (@chatfather), a system agent" in out
+    assert "From: Example System (@example-system), a system agent" in out
     assert "@-mentioned" not in out
 
 

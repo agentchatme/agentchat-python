@@ -34,6 +34,17 @@ not be read, the model failed, a turn was refused or failed) leaves the
 cards on the tray and does nothing more: the server re-wakes unanswered
 cards on its own durable ladder (D3).
 
+Pacing (D5): after a silent turn (it looked and did nothing) the same
+conversation at the same anchor is not gated again for ``pace_ms`` (60 s)
+unless a newer message moves its anchor or an ``unanswered`` wake names it;
+after an invite turn that left the invite pending, no second invite turn for
+it within ``pace_ms`` unless an ``unanswered`` wake arrives. In memory.
+
+Turns: at most ``max_concurrent_turns`` (default 1) reply and invite turns
+run at once; the rest wait for a slot, held out of the gate meanwhile (their
+cards stay on the tray; nothing is recorded for them). A turn that ends
+after :meth:`ReceiveLoop.stop` still has its outcome recorded.
+
 The runtime's callbacks may be coroutine functions or plain functions. A
 plain ``call_model``, ``start_turn``, ``start_run`` or ``readiness`` runs in
 a worker thread, so a blocking runtime never holds up the socket: a plain
@@ -49,7 +60,7 @@ import contextlib
 import inspect
 import logging
 import time
-from collections import OrderedDict
+from collections import OrderedDict, deque
 from collections.abc import Awaitable, Mapping
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -74,6 +85,9 @@ _log = logging.getLogger("agentchat.integration")
 
 TRAY_LIMIT = 50
 """Largest tray the server builds: the loop always reads all of it."""
+PACE_MS = 60_000
+"""D5 pacing: how long a silent turn's card (or an invite after its turn) is
+not gated again at the same anchor."""
 _SILENT_MEMORY = 1_000
 """Silent-turn memory (D5 "second time for the same anchor"), bounded."""
 
@@ -183,8 +197,12 @@ class CycleSummary:
     record_failures: int = 0
     turns_started: int = 0
     turns_refused: int = 0
+    turns_queued: int = 0
+    """Reply or invite turns waiting for a slot (``max_concurrent_turns``)."""
     held_by_turns: int = 0
     """Cards left out because a turn for their conversation is running."""
+    paced: int = 0
+    """Cards and invites left out by D5 pacing (a recent silent turn)."""
     truncated: bool = False
     failure: str | None = None
 
@@ -268,6 +286,38 @@ def _api_key_of(client: Any) -> str | None:
     return key if isinstance(key, str) and key else None
 
 
+class _Pacer:
+    """D5 pacing, in memory: a key (``conversation:<id>`` / ``invite:<id>``)
+    held until a time, for one anchor."""
+
+    def __init__(self, pace_ms: float, now: Callable[[], float]) -> None:
+        self._pace_ms = pace_ms
+        self._now = now
+        self._until: dict[str, tuple[str | None, float]] = {}
+
+    def hold(self, key: str, anchor: str | None) -> None:
+        self._until[key] = (anchor, self._now() + self._pace_ms)
+        if len(self._until) > _SILENT_MEMORY:
+            self._until.pop(next(iter(self._until)))
+
+    def held(self, key: str, anchor: str | None) -> bool:
+        entry = self._until.get(key)
+        if entry is None:
+            return False
+        held_anchor, until = entry
+        if held_anchor != anchor or self._now() >= until:
+            del self._until[key]
+            return False
+        return True
+
+    def release(self, key: str) -> None:
+        self._until.pop(key, None)
+
+    def release_invites(self) -> None:
+        for key in [k for k in self._until if k.startswith("invite:")]:
+            del self._until[key]
+
+
 class ReceiveLoop:
     """See the module docstring.
 
@@ -280,7 +330,9 @@ class ReceiveLoop:
     ``capabilities={"rewake": True}``; the loop attaches its handlers and
     connects and disconnects it), ``"auto"`` (default: built from the
     client's key and base URL) or ``None`` (no socket: wakes only through
-    :meth:`wake`).
+    :meth:`wake`). ``turn_tracker`` shares a
+    :class:`~agentchatme.integration.TurnTracker` with the host (turns it
+    tracks itself are kept out of the gate too).
     """
 
     def __init__(
@@ -300,6 +352,9 @@ class ReceiveLoop:
         quiet_ms: float | None = None,
         max_ms: float | None = None,
         on_event: Callable[[ReceiveLoopEvent], Any] | None = None,
+        max_concurrent_turns: int = 1,
+        pace_ms: float = PACE_MS,
+        turn_tracker: TurnTracker | None = None,
         now: Callable[[], float] | None = None,
         set_timer: SetTimer | None = None,
     ) -> None:
@@ -309,6 +364,8 @@ class ReceiveLoop:
             raise ValueError("ReceiveLoop: gate_call mode needs call_model and start_turn")
         if mode == "single_run" and start_run is None:
             raise ValueError("ReceiveLoop: single_run mode needs start_run")
+        if not isinstance(max_concurrent_turns, int) or max_concurrent_turns < 1:
+            raise ValueError("ReceiveLoop: max_concurrent_turns must be an int >= 1")
         self._client = client
         self._texts: Any = _StaticTexts(texts) if isinstance(texts, Texts) else texts
         self._mode: ReceiveLoopMode = mode
@@ -321,7 +378,12 @@ class ReceiveLoop:
         self._on_event = on_event
         self._now = now or (lambda: time.time() * 1000.0)
         self._handle = normalize_handle(handle) if handle else None
-        self._tracker = TurnTracker(now=self._now)
+        self._tracker = turn_tracker if turn_tracker is not None else TurnTracker(now=self._now)
+        self._pacer = _Pacer(pace_ms, self._now)
+        self._max_turns = max_concurrent_turns
+        self._active_turns = 0
+        # Turns waiting for a slot: (their tracker handle, the admission).
+        self._waiting: deque[tuple[TurnHandle, Callable[[], Awaitable[bool]]]] = deque()
         coalescer_options: dict[str, Any] = {}
         if quiet_ms is not None:
             coalescer_options["quiet_ms"] = quiet_ms
@@ -349,6 +411,7 @@ class ReceiveLoop:
             "echoes": 0,
             "turns_started": 0,
             "turns_refused": 0,
+            "turns_queued": 0,
             "invite_turns_started": 0,
             "runs_started": 0,
             "runs_completed": 0,
@@ -421,14 +484,21 @@ class ReceiveLoop:
 
     async def stop(self) -> None:
         """Stop: no new cycles or turns, the socket closed, running turns and
-        runs told through ``stopping``. Returns when the running cycle and
-        any recording already under way have finished; it does not wait for
-        turns the runtime has not ended (they record nothing once stopped)."""
+        runs told through ``stopping``, turns waiting for a slot dropped
+        (nothing recorded; their cards stay on the tray). Returns when the
+        running cycle and any recording already under way have finished; it
+        does not wait for turns the runtime has not ended — when one ends
+        later, its outcome is still recorded (the client must still be
+        open)."""
         if self._stopped:
             return
         self._stopped = True
         self._coalescer.stop()
         self._stopping.set()
+        # Turns that never got a slot never start; their cards stay on the tray.
+        while self._waiting:
+            handle, _admit = self._waiting.popleft()
+            self._tracker.end(handle)
         for off in self._unsubscribe:
             with contextlib.suppress(Exception):
                 off()
@@ -484,7 +554,12 @@ class ReceiveLoop:
             },
             last_cycle=self._last_cycle,
             turns=self._tracker.running(),
-            counters={**self._counts, "outcomes": dict(self._outcomes)},
+            counters={
+                **self._counts,
+                "turns_active": self._active_turns,
+                "turns_waiting": len(self._waiting),
+                "outcomes": dict(self._outcomes),
+            },
             last_error=self._last_error,
         )
 
@@ -508,19 +583,38 @@ class ReceiveLoop:
     def _on_wake_frame(self, frame: dict[str, Any]) -> None:
         self._counts["frames"] += 1
         payload = frame.get("payload")
-        cid = payload.get("conversation_id") if isinstance(payload, dict) else None
-        self._wake_from("wake_frame", cid if isinstance(cid, str) else None)
+        data = payload if isinstance(payload, dict) else {}
+        cid = data.get("conversation_id")
+        reason = data.get("reason") if isinstance(data.get("reason"), str) else None
+        ids = data.get("conversation_ids")
+        named = [i for i in ids if isinstance(i, str)] if isinstance(ids, list) else []
+        if reason == "unanswered":
+            # The server says these are still unanswered: pacing yields.
+            for conversation_id in named:
+                self._pacer.release(f"conversation:{conversation_id}")
+            self._pacer.release_invites()
+        extra: dict[str, Any] = {"reason": reason}
+        if named:
+            extra["conversation_ids"] = named
+        self._wake_from("wake_frame", cid if isinstance(cid, str) else None, extra)
 
     def _on_invite_frame(self, _frame: dict[str, Any]) -> None:
         self._counts["frames"] += 1
         self._wake_from("invite")
 
-    def _wake_from(self, source: WakeSource, conversation_id: str | None = None) -> None:
+    def _wake_from(
+        self,
+        source: WakeSource,
+        conversation_id: str | None = None,
+        extra: dict[str, Any] | None = None,
+    ) -> None:
         if self._stopped:
             return
         event: ReceiveLoopEvent = {"type": "wake", "source": source}
         if conversation_id:
             event["conversation_id"] = conversation_id
+        if extra:
+            event.update(extra)
         self._emit(event)
         self._coalescer.wake()
 
@@ -539,7 +633,9 @@ class ReceiveLoop:
 
     async def _read_tray(self) -> dict[str, Any] | None:
         try:
-            tray = await self._client.inbox.tray(wait_ms=0, limit=TRAY_LIMIT)
+            # The loop shows the tray's invites (invite turns, the single-run
+            # invite rule), so it says so to the server.
+            tray = await self._client.inbox.tray(wait_ms=0, limit=TRAY_LIMIT, include_invites=True)
         except Exception as err:
             if not self._stopped:
                 self._fail(err)
@@ -579,16 +675,24 @@ class ReceiveLoop:
             return self._summary("tray_failed", failure=self._last_error)
         cards = _gate.cards_of(tray)
         invites = _tray_invites(tray)
-        gate_cards = self._tracker.without_running(cards)
-        held = len(cards) - len(gate_cards)
+        unheld = self._tracker.without_running(cards)
+        held = len(cards) - len(unheld)
         if held > 0:
             self._held_while_running = True
+        gate_cards = [
+            card
+            for card in unheld
+            if not self._pacer.held(f"conversation:{card['conversation_id']}", _gate.anchor_of(card))
+        ]
+        open_invites = [i for i in invites if not self._tracker.invite_running(i["invite_id"])]
+        owed_invites = [i for i in open_invites if not self._pacer.held(f"invite:{i['invite_id']}", None)]
+        paced = (len(unheld) - len(gate_cards)) + (len(open_invites) - len(owed_invites))
         owed_cards = [card for card in gate_cards if card.get("muted") is not True]
-        owed_invites = [i for i in invites if not self._tracker.invite_running(i["invite_id"])]
         base: dict[str, Any] = {
             "cards": len(cards),
             "invites": len(invites),
             "held_by_turns": held,
+            "paced": paced,
             "truncated": tray.get("truncated") is True,
         }
         if not cards and not invites:
@@ -612,6 +716,7 @@ class ReceiveLoop:
             "record_failures": 0,
             "turns_started": 0,
             "turns_refused": 0,
+            "turns_queued": 0,
         }
         outcome: CycleOutcome = "invites_only"
         failure: str | None = None
@@ -636,17 +741,11 @@ class ReceiveLoop:
                 for reply in result.reply:
                     if self._stopped:
                         break
-                    if await self._start_reply_turn(reply, texts):
-                        tally["turns_started"] += 1
-                    else:
-                        tally["turns_refused"] += 1
+                    tally[f"turns_{await self._start_reply_turn(reply, texts)}"] += 1
         for invite in owed_invites:
             if self._stopped:
                 break
-            if await self._start_invite_turn_for(invite, texts):
-                tally["turns_started"] += 1
-            else:
-                tally["turns_refused"] += 1
+            tally[f"turns_{await self._start_invite_turn_for(invite, texts)}"] += 1
         # More conversations wait than one tray shows: read again for the rest.
         if tray.get("truncated") is True and outcome == "decided":
             self._wake_from("more")
@@ -717,12 +816,14 @@ class ReceiveLoop:
 
     # ─── turns (gate-call mode) ──────────────────────────────────────────
 
-    async def _start_reply_turn(self, reply: Any, texts: Texts) -> bool:
+    async def _start_reply_turn(
+        self, reply: Any, texts: Texts
+    ) -> Literal["started", "refused", "queued"]:
         card = reply.card if isinstance(reply.card, dict) else reply.card.model_dump(mode="json", exclude_unset=True)
         anchor = _gate.anchor_of(card)
         handle = self._tracker.begin(TrackedTurn.reply(reply.conversation_id, anchor))
         if handle is None:
-            return False
+            return "refused"
         request = TurnRequest(
             kind="reply",
             prompt=reply_prompt(texts, reply.conversation_id),
@@ -733,30 +834,65 @@ class ReceiveLoop:
             anchor=anchor,
             category=reply.category,
         )
-        assert self._start_turn is not None
-        admission = await self._admit(self._start_turn, request)
-        if not admission.started or admission.done is None:
-            self._tracker.end(handle)
-            self._counts["turns_refused"] += 1
-            self._emit(
-                {"type": "turn_refused", "kind": "reply", "id": reply.conversation_id, "error": admission.error}
-            )
-            return False
-        self._counts["turns_started"] += 1
-        self._emit({"type": "turn_started", "request": request})
-        self._spawn_turn(self._after_reply_turn(handle, card, reply.category, admission.done))
-        return True
+
+        async def admit() -> bool:
+            assert self._start_turn is not None
+            admission = await self._admit(self._start_turn, request)
+            if not admission.started or admission.done is None:
+                self._tracker.end(handle)
+                self._counts["turns_refused"] += 1
+                self._emit(
+                    {"type": "turn_refused", "kind": "reply", "id": reply.conversation_id, "error": admission.error}
+                )
+                return False
+            self._counts["turns_started"] += 1
+            self._emit({"type": "turn_started", "request": request})
+            self._spawn_turn(self._after_reply_turn(handle, card, reply.category, admission.done))
+            return True
+
+        return await self._launch(handle, admit)
+
+    async def _launch(
+        self, handle: TurnHandle, admit: Callable[[], Awaitable[bool]]
+    ) -> Literal["started", "refused", "queued"]:
+        """Start a turn now when a slot is free, else let it wait for one
+        (held out of the gate by its tracker entry meanwhile)."""
+        if self._active_turns >= self._max_turns:
+            self._waiting.append((handle, admit))
+            self._counts["turns_queued"] += 1
+            return "queued"
+        self._active_turns += 1
+        if await admit():
+            return "started"
+        self._active_turns -= 1
+        return "refused"
+
+    async def _pump(self) -> None:
+        """A slot freed: start the turns waiting for one."""
+        while self._waiting and self._active_turns < self._max_turns and not self._stopped:
+            _handle, admit = self._waiting.popleft()
+            self._active_turns += 1
+            if not await admit():
+                self._active_turns -= 1
+
+    def _slot_freed(self) -> None:
+        self._active_turns = max(0, self._active_turns - 1)
+        if self._waiting and not self._stopped:
+            self._spawn_turn(self._pump())
 
     async def _after_reply_turn(
         self, handle: TurnHandle, card: dict[str, Any], category: str | None, done: Awaitable[TurnEnd]
     ) -> None:
         try:
             end = await self._tracker.confirmed_end(handle, done)
-            if end is None or self._stopped:
-                return  # released, or stopping: nothing recorded
+            if end is None:
+                return  # released: nothing recorded
+            # Recorded also when the turn ends after stop(): what it did is
+            # a fact either way.
             await self._track(self._record_reply_outcome(handle, card, category, end))
         finally:
             self._tracker.end(handle)
+            self._slot_freed()
             self._after_turn_ended()
 
     async def _record_reply_outcome(
@@ -777,10 +913,12 @@ class ReceiveLoop:
         self._count(outcome.reason)
         if outcome.reason == "silent_first":
             self._remember(key, silent_before + 1)
+            # D5 pacing: not gated again at this anchor for a while.
+            self._pacer.hold(f"conversation:{conversation_id}", _gate.anchor_of(card))
         elif outcome.reason in ("card_left_tray", "turn_recorded_verdict"):
             self._silent.pop(key, None)
         recorded = False
-        if outcome.action != "none" and not self._stopped:
+        if outcome.action != "none":
             try:
                 recorded = await apply_outcome_async(self._client, outcome)
                 self._silent.pop(key, None)
@@ -789,10 +927,12 @@ class ReceiveLoop:
                 self._fail(err)
         self._emit({"type": "turn_outcome", "outcome": outcome, "recorded": recorded})
 
-    async def _start_invite_turn_for(self, invite: dict[str, Any], texts: Texts) -> bool:
+    async def _start_invite_turn_for(
+        self, invite: dict[str, Any], texts: Texts
+    ) -> Literal["started", "refused", "queued"]:
         handle = self._tracker.begin(TrackedTurn.invite(invite["invite_id"]))
         if handle is None:
-            return False
+            return "refused"
         request = TurnRequest(
             kind="invite",
             prompt=f"{texts.invite_prompt.strip()}\n\ninvite_id: {invite['invite_id']}",
@@ -800,30 +940,38 @@ class ReceiveLoop:
             stopping=self._stopping,
             invite=invite,
         )
-        assert self._start_invite_turn is not None
-        admission = await self._admit(self._start_invite_turn, request)
-        if not admission.started or admission.done is None:
-            self._tracker.end(handle)
-            self._counts["turns_refused"] += 1
-            self._emit(
-                {"type": "turn_refused", "kind": "invite", "id": invite["invite_id"], "error": admission.error}
-            )
-            return False
-        self._counts["invite_turns_started"] += 1
-        self._emit({"type": "turn_started", "request": request})
-        self._spawn_turn(self._after_invite_turn(handle, invite, admission.done))
-        return True
+
+        async def admit() -> bool:
+            assert self._start_invite_turn is not None
+            admission = await self._admit(self._start_invite_turn, request)
+            if not admission.started or admission.done is None:
+                self._tracker.end(handle)
+                self._counts["turns_refused"] += 1
+                self._emit(
+                    {"type": "turn_refused", "kind": "invite", "id": invite["invite_id"], "error": admission.error}
+                )
+                return False
+            self._counts["invite_turns_started"] += 1
+            self._emit({"type": "turn_started", "request": request})
+            self._spawn_turn(self._after_invite_turn(handle, invite, admission.done))
+            return True
+
+        return await self._launch(handle, admit)
 
     async def _after_invite_turn(
         self, handle: TurnHandle, invite: dict[str, Any], done: Awaitable[TurnEnd]
     ) -> None:
         try:
             end = await self._tracker.confirmed_end(handle, done)
-            if end is None or self._stopped:
+            if end is None:
                 return
             await self._track(self._record_invite_outcome(invite, end))
+            # D5 pacing: no second invite turn for it for a while (an
+            # answered invite has left the tray anyway).
+            self._pacer.hold(f"invite:{invite['invite_id']}", None)
         finally:
             self._tracker.end(handle)
+            self._slot_freed()
             self._after_turn_ended()
 
     async def _after_run_invites(self, invites: list[dict[str, Any]], end: RunEnd) -> None:
@@ -854,7 +1002,7 @@ class ReceiveLoop:
         elif outcome.reason == "invite_answered":
             self._silent.pop(key, None)
         recorded = False
-        if outcome.action != "none" and not self._stopped:
+        if outcome.action != "none":
             try:
                 recorded = await apply_invite_outcome_async(self._client, outcome)
                 self._silent.pop(key, None)

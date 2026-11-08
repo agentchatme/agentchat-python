@@ -139,7 +139,7 @@ def test_tray_card_fields_are_typed() -> None:
     assert crew.your_last_decision is not None and crew.your_last_decision.decision == "dismiss"
     gone = tray.conversations[3]
     assert gone.group is not None and gone.group.deleted is not None
-    assert gone.group.deleted.by == "@mike-asst"
+    assert gone.group.deleted.by == SAMPLE_TRAY["conversations"][-1]["group"]["deleted"]["by"]
 
 
 def test_tray_tolerates_server_additive_fields() -> None:

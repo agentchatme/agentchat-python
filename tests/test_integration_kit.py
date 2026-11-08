@@ -484,8 +484,9 @@ class _Inbox:
         self.trays = list(trays)
         self.reads = 0
 
-    async def tray(self, *, wait_ms: int = 0, limit: int | None = None) -> Any:
+    async def tray(self, *, wait_ms: int = 0, limit: int | None = None, include_invites: bool = False) -> Any:
         self.reads += 1
+        self.include_invites = include_invites
         tray = self.trays.pop(0) if len(self.trays) > 1 else self.trays[0]
         if isinstance(tray, Exception):
             raise tray
@@ -551,6 +552,16 @@ def _loop(client: _LoopClient, **kwargs: Any) -> ReceiveLoop:
     kwargs.setdefault("quiet_ms", 0)
     kwargs.setdefault("max_ms", 0)
     return ReceiveLoop(client, Texts.model_validate(texts_body()), kwargs.pop("mode", "gate_call"), **kwargs)
+
+
+@pytest.mark.asyncio
+async def test_the_loop_reads_the_tray_with_invites() -> None:
+    client = _LoopClient([_tray([])])
+    loop = _loop(client, call_model=lambda _p: "", start_turn=_Turns())
+    await loop.start()
+    await _cycle(loop)
+    assert client.inbox.include_invites is True
+    await loop.stop()
 
 
 def test_receive_loop_needs_its_callbacks() -> None:
@@ -628,7 +639,7 @@ async def test_looked_and_did_nothing_is_dismissed_the_second_time_for_the_same_
     tray = _tray([_card("c1", "m1")])
     client = _LoopClient([tray])
     turns = _Turns()
-    loop = _loop(client, call_model=lambda _p: _answer(("c1", "reply")), start_turn=turns)
+    loop = _loop(client, call_model=lambda _p: _answer(("c1", "reply")), start_turn=turns, pace_ms=0)
     await loop.start()
     for index in range(2):
         await _cycle(loop)
@@ -681,7 +692,7 @@ async def test_invites_get_one_turn_each_and_are_dismissed_after_two_silent_turn
     client = _LoopClient([_tray([], [invite])])
     turns = _Turns()
     calls: list[str] = []
-    loop = _loop(client, call_model=lambda p: calls.append(p) or "", start_turn=turns)
+    loop = _loop(client, call_model=lambda p: calls.append(p) or "", start_turn=turns, pace_ms=0)
     await loop.start()
     for index in range(2):
         await _cycle(loop)
@@ -749,8 +760,9 @@ async def test_served_texts_without_gate_call_fields_gate_with_the_legacy_wordin
 
 
 @pytest.mark.asyncio
-async def test_stop_tells_running_turns() -> None:
-    client = _LoopClient([_tray([_card("c1", "m1")])])
+async def test_stop_tells_running_turns_and_an_outcome_after_stop_is_still_recorded() -> None:
+    sent = _tray([_card("c1", "m1", you_owe_reply=False)])
+    client = _LoopClient([_tray([_card("c1", "m1")]), sent])
     turns = _Turns()
     loop = _loop(client, call_model=lambda _p: _answer(("c1", "reply")), start_turn=turns)
     await loop.start()
@@ -759,8 +771,178 @@ async def test_stop_tells_running_turns() -> None:
     await loop.stop()
     assert turns.requests[0].stopping.is_set()
     turns.ends[0].set_result(TurnEnd(status="completed"))
-    await asyncio.sleep(0.01)
-    assert client.decisions.recorded == []  # nothing recorded once stopped
+    await asyncio.sleep(0.02)
+    # The turn ended after stop(): what it did is still recorded.
+    assert client.decisions.recorded == [
+        {"conversation_id": "c1", "decision": "reply", "through_message_id": "m1"}
+    ]
+
+
+# ─────────────── max_concurrent_turns ───────────────
+
+
+@pytest.mark.asyncio
+async def test_at_most_max_concurrent_turns_run_and_the_rest_wait_for_a_slot() -> None:
+    tray = _tray([_card("c1", "m1"), _card("c2", "m2"), _card("c3", "m3")])
+    client = _LoopClient([tray])
+    turns = _Turns()
+    calls: list[str] = []
+
+    def call_model(prompt: str) -> str:
+        calls.append(prompt)
+        return _answer(("c1", "reply"), ("c2", "reply"), ("c3", "reply"))
+
+    loop = _loop(client, call_model=call_model, start_turn=turns)  # default: 1 at a time
+    await loop.start()
+    await _cycle(loop)
+    assert [r.conversation_id for r in turns.requests] == ["c1"]
+    summary = loop.status().last_cycle
+    assert summary is not None and summary.turns_started == 1 and summary.turns_queued == 2
+    assert loop.status().counters["turns_waiting"] == 2
+    await _cycle(loop)  # waiting turns are held out of the gate: no second model call
+    assert len(calls) == 1
+    turns.ends[0].set_result(TurnEnd(status="failed"))
+    await asyncio.sleep(0.02)
+    assert [r.conversation_id for r in turns.requests] == ["c1", "c2"]
+    turns.ends[1].set_result(TurnEnd(status="failed"))
+    await asyncio.sleep(0.02)
+    assert [r.conversation_id for r in turns.requests] == ["c1", "c2", "c3"]
+    await loop.stop()
+
+
+@pytest.mark.asyncio
+async def test_two_slots_run_two_turns_at_once() -> None:
+    tray = _tray([_card("c1", "m1"), _card("c2", "m2"), _card("c3", "m3")])
+    turns = _Turns()
+    loop = _loop(
+        _LoopClient([tray]),
+        call_model=lambda _p: _answer(("c1", "reply"), ("c2", "reply"), ("c3", "reply")),
+        start_turn=turns,
+        max_concurrent_turns=2,
+    )
+    await loop.start()
+    await _cycle(loop)
+    assert [r.conversation_id for r in turns.requests] == ["c1", "c2"]
+    await loop.stop()
+    with pytest.raises(ValueError):
+        _loop(_LoopClient([tray]), call_model=lambda _p: "", start_turn=turns, max_concurrent_turns=0)
+
+
+# ─────────────── D5 pacing ───────────────
+
+PACING_CASES: list[dict[str, Any]] = [
+    {
+        "name": "a-silent-turn-is-not-gated-again-within-the-window",
+        "second_tray_anchor": "m1",
+        "advance_ms": 30_000,
+        "unanswered_names_it": False,
+        "gated_again": False,
+    },
+    {
+        "name": "after-the-window-it-is-gated-again",
+        "second_tray_anchor": "m1",
+        "advance_ms": 60_000,
+        "unanswered_names_it": False,
+        "gated_again": True,
+    },
+    {
+        "name": "a-newer-message-moves-the-anchor-and-it-is-gated-at-once",
+        "second_tray_anchor": "m2",
+        "advance_ms": 1_000,
+        "unanswered_names_it": False,
+        "gated_again": True,
+    },
+    {
+        "name": "an-unanswered-wake-naming-it-lifts-the-pacing",
+        "second_tray_anchor": "m1",
+        "advance_ms": 1_000,
+        "unanswered_names_it": True,
+        "gated_again": True,
+    },
+]
+
+
+@pytest.mark.parametrize("case", PACING_CASES, ids=[c["name"] for c in PACING_CASES])
+@pytest.mark.asyncio
+async def test_d5_pacing_after_a_silent_turn(case: dict[str, Any]) -> None:
+    clock = {"now": 1_000_000.0}
+    first = _tray([_card("c1", "m1")])
+    second = _tray([_card("c1", case["second_tray_anchor"])])
+    client = _LoopClient([first, first, second])  # gate, re-read after the turn, next cycle
+    turns = _Turns()
+    calls: list[str] = []
+    loop = _loop(
+        client,
+        call_model=lambda p: calls.append(p) or _answer(("c1", "reply")),
+        start_turn=turns,
+        now=lambda: clock["now"],
+    )
+    await loop.start()
+    await _cycle(loop)
+    turns.ends[0].set_result(TurnEnd(status="completed"))  # looked, did nothing
+    await asyncio.sleep(0.02)
+    assert loop.status().counters["outcomes"] == {"silent_first": 1}
+    clock["now"] += case["advance_ms"]
+    if case["unanswered_names_it"]:
+        loop._on_wake_frame(
+            {"type": "wake", "payload": {"reason": "unanswered", "conversation_ids": ["c1"], "step": 1, "at": "t"}}
+        )
+    await _cycle(loop)
+    assert (len(calls) == 2) is case["gated_again"]
+    if not case["gated_again"]:
+        summary = loop.status().last_cycle
+        assert summary is not None and summary.outcome == "nothing_owed" and summary.paced == 1
+    await loop.stop()
+
+
+@pytest.mark.asyncio
+async def test_d5_pacing_after_an_invite_turn() -> None:
+    clock = {"now": 1_000_000.0}
+    invite = {"invite_id": "gri_1", "group": {"id": "g", "name": "n", "member_count": 1}, "invited_by": "@p", "at": "t"}
+    client = _LoopClient([_tray([], [invite])])
+    turns = _Turns()
+    loop = _loop(client, call_model=lambda _p: "", start_turn=turns, now=lambda: clock["now"])
+    await loop.start()
+    await _cycle(loop)
+    turns.ends[0].set_result(TurnEnd(status="completed"))
+    await asyncio.sleep(0.02)
+    clock["now"] += 30_000
+    await _cycle(loop)
+    assert len(turns.requests) == 1  # no second invite turn within the window
+    loop._on_wake_frame({"type": "wake", "payload": {"reason": "unanswered", "conversation_ids": [], "step": 2, "at": "t"}})
+    await _cycle(loop)
+    assert len(turns.requests) == 2  # an unanswered wake lifts it
+    await loop.stop()
+
+
+@pytest.mark.asyncio
+async def test_a_shared_turn_tracker_holds_the_hosts_own_turns_out_of_the_gate() -> None:
+    tracker = TurnTracker()
+    assert tracker.begin(TrackedTurn.reply("c1", "m1")) is not None
+    calls: list[str] = []
+    loop = _loop(
+        _LoopClient([_tray([_card("c1", "m1")])]),
+        call_model=lambda p: calls.append(p) or "",
+        start_turn=_Turns(),
+        turn_tracker=tracker,
+    )
+    await loop.start()
+    await _cycle(loop)
+    assert calls == [] and loop.status().last_cycle.held_by_turns == 1  # type: ignore[union-attr]
+    await loop.stop()
+
+
+@pytest.mark.asyncio
+async def test_the_wake_event_carries_the_wake_reason() -> None:
+    events: list[dict[str, Any]] = []
+    loop = _loop(_LoopClient([_tray([])]), call_model=lambda _p: "", start_turn=_Turns(), on_event=events.append)
+    await loop.start()
+    loop._on_wake_frame(
+        {"type": "wake", "payload": {"reason": "unanswered", "conversation_ids": ["c1", "c2"], "step": 1, "at": "t"}}
+    )
+    wakes = [e for e in events if e["type"] == "wake"]
+    assert wakes[-1]["reason"] == "unanswered" and wakes[-1]["conversation_ids"] == ["c1", "c2"]
+    await loop.stop()
 
 
 @pytest.mark.asyncio

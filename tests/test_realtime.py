@@ -117,7 +117,7 @@ def _sync_row(
         "id": msg_id,
         "conversation_id": conversation_id,
         "delivery_id": delivery_id,
-        "sender": "mike-asst",
+        "sender": "example-mike",
         "type": "text",
         "content": {"text": f"row {msg_id}"},
         "created_at": "2026-07-12T18:04:11.000Z",

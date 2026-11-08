@@ -35,15 +35,20 @@ _LONG_POLL_TIMEOUT_MARGIN_MS = 10_000
 _VERDICTS: frozenset[str] = frozenset(get_args(ReplyDecisionVerdict))
 
 
-def _tray_query(wait_ms: int, limit: int | None) -> dict[str, Any]:
+def _tray_query(wait_ms: int, limit: int | None, include_invites: bool = False) -> dict[str, Any]:
     if isinstance(wait_ms, bool) or not isinstance(wait_ms, int):
         raise TypeError("wait_ms must be an int")
     if not 0 <= wait_ms <= INBOX_WAIT_MAX_MS:
         raise ValueError(f"wait_ms must be between 0 and {INBOX_WAIT_MAX_MS}")
     if limit is not None and not 1 <= limit <= INBOX_TRAY_MAX_LIMIT:
         raise ValueError(f"limit must be between 1 and {INBOX_TRAY_MAX_LIMIT}")
-    # A plain read sends no query at all; `wait_ms` only when long-polling.
-    return {"wait_ms": wait_ms if wait_ms > 0 else None, "limit": limit}
+    # A plain read sends no query at all; `wait_ms` only when long-polling,
+    # `invites=1` only when the caller shows invites.
+    return {
+        "wait_ms": wait_ms if wait_ms > 0 else None,
+        "limit": limit,
+        "invites": 1 if include_invites else None,
+    }
 
 
 def _tray_opts(wait_ms: int, opts: CallOptions | None) -> CallOptions | None:
@@ -165,9 +170,15 @@ class InboxResource:
         *,
         wait_ms: int = 0,
         limit: int | None = None,
+        include_invites: bool = False,
         opts: CallOptions | None = None,
     ) -> InboxTray:
         """``GET /v1/inbox`` — one card per conversation with unread messages.
+
+        ``include_invites=True`` (``invites=1`` on the wire) says this caller
+        shows the tray's pending group invites: a pending invite then also
+        ends (or short-circuits) a ``wait_ms`` hold. Without it a held read
+        waits for messages only, as before.
 
         ``wait_ms`` > 0 asks the server to hold the request until something
         is on the tray or the hold lapses (long-poll, at most
@@ -176,7 +187,7 @@ class InboxResource:
         ``limit`` caps the cards (server default 20, max 50); ``truncated``
         on the tray says when the cap bit. Reading the tray marks nothing.
         """
-        query = _tray_query(wait_ms, limit)
+        query = _tray_query(wait_ms, limit, include_invites)
         data = self._client._get(f"/v1/inbox{_qs(query)}", _tray_opts(wait_ms, opts))
         return InboxTray.model_validate(data)
 
@@ -333,9 +344,10 @@ class AsyncInboxResource:
         *,
         wait_ms: int = 0,
         limit: int | None = None,
+        include_invites: bool = False,
         opts: CallOptions | None = None,
     ) -> InboxTray:
-        query = _tray_query(wait_ms, limit)
+        query = _tray_query(wait_ms, limit, include_invites)
         data = await self._client._get(f"/v1/inbox{_qs(query)}", _tray_opts(wait_ms, opts))
         return InboxTray.model_validate(data)
 
