@@ -93,7 +93,9 @@ changes under **Types**.
   without the row): fields the server did not echo come from the request,
   `id` / `created_at` are then `None`.
 - `ReceiveLoop` single-run mode: an invite still pending after two
-  completed runs is dismissed (in memory).
+  completed runs is dismissed (in memory); `dismiss_ignored_invites=False`
+  turns it off for a host that forwards invites elsewhere (no read after the
+  run, nothing recorded).
 - `ReceiveLoop`: `max_concurrent_turns` (default 1) — extra turns wait for a
   slot, held out of the gate; `release_turn` (or a release through a shared
   `TurnTracker`, which now has `holds()` and `on_release()`) frees the slot at

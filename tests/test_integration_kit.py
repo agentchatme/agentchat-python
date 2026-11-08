@@ -1406,6 +1406,28 @@ async def test_single_run_dismisses_an_invite_left_pending_after_two_completed_r
 
 
 @pytest.mark.asyncio
+async def test_single_run_with_dismiss_ignored_invites_off_never_dismisses_and_records_no_outcome() -> None:
+    invite = {"invite_id": "gri_1", "group": {"id": "g", "name": "n", "member_count": 1}, "invited_by": "@p", "at": "t"}
+    events: list[dict[str, Any]] = []
+    runs: list[Any] = []
+
+    def start_run(request: Any) -> RunEnd:
+        runs.append(request)
+        return RunEnd(status="completed")
+
+    client = _LoopClient([_tray([], [invite])])
+    loop = _loop(client, mode="single_run", start_run=start_run, dismiss_ignored_invites=False, on_event=events.append)
+    await loop.start()
+    for _ in range(3):
+        await _cycle(loop)
+    assert len(runs) == 3
+    assert client.groups.dismissed == [] and client.decisions.recorded == []
+    assert [e for e in events if e["type"] == "invite_outcome"] == []
+    assert client.inbox.reads == 3  # no read after the runs
+    await loop.stop()
+
+
+@pytest.mark.asyncio
 async def test_single_run_starts_even_when_the_tray_cannot_be_read() -> None:
     runs: list[Any] = []
     client = _LoopClient([OSError("down")])

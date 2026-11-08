@@ -18,7 +18,7 @@ Two modes (contract v1, D5):
   nothing for cards. An invite still pending and undismissed after two
   completed runs is dismissed (seen, left pending, not shown again), so an
   ignored invite does not cost a run on every wake; the count is in memory
-  only.
+  only (``dismiss_ignored_invites=False`` turns this off).
 
 Wakes: a ``message.new`` frame that is not the echo of the agent's own send,
 a ``wake`` frame (a reminder, or unanswered cards), every accepted HELLO (a
@@ -360,7 +360,11 @@ class ReceiveLoop:
     client's key and base URL) or ``None`` (no socket: wakes only through
     :meth:`wake`). ``turn_tracker`` shares a
     :class:`~agentchatme.integration.TurnTracker` with the host (turns it
-    tracks itself are kept out of the gate too).
+    tracks itself are kept out of the gate too). ``dismiss_ignored_invites``
+    (single-run mode, default ``True``) dismisses an invite still pending
+    after two completed runs that left it; ``False`` leaves every invite to
+    the runs (a host that forwards invites elsewhere): no read after the run
+    and nothing recorded for them.
     """
 
     def __init__(
@@ -385,6 +389,7 @@ class ReceiveLoop:
         gate_call_timeout_ms: float = GATE_CALL_TIMEOUT_MS,
         cycle_timeout_ms: float = CYCLE_TIMEOUT_MS,
         turn_tracker: TurnTracker | None = None,
+        dismiss_ignored_invites: bool = True,
         now: Callable[[], float] | None = None,
         set_timer: SetTimer | None = None,
     ) -> None:
@@ -411,6 +416,7 @@ class ReceiveLoop:
         self._tracker = turn_tracker if turn_tracker is not None else TurnTracker(now=self._now)
         self._pacer = _Pacer(pace_ms, self._now)
         self._max_turns = max_concurrent_turns
+        self._dismiss_ignored_invites = dismiss_ignored_invites is not False
         # Turns holding a slot right now.
         self._active: set[TurnHandle] = set()
         # Turns waiting for a slot: (their tracker handle, the admission).
@@ -945,7 +951,9 @@ class ReceiveLoop:
         # it. Invites sit on the tray until answered, so one the run ignored
         # would cost a run on every wake: the D5 rule of an invite turn —
         # pending after the second completed run → dismissed.
-        started_with = _tray_invites(tray) if tray is not None else []
+        started_with = (
+            _tray_invites(tray) if tray is not None and self._dismiss_ignored_invites else []
+        )
         if started_with and not self._stopped:
             await self._track(self._after_run_invites(started_with, end))
         outcome: CycleOutcome = (
