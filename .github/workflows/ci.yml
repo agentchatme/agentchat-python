@@ -57,6 +57,16 @@ jobs:
       - name: Pytest
         run: python -m pytest -q
 
+      # The conformance fixtures are the published contract's, byte for
+      # byte: the checked-in manifest must equal the one agentchat.me
+      # serves. A separate step on purpose: the test suite runs under a
+      # network guard.
+      - name: Conformance fixtures match the published contract
+        if: ${{ matrix.os == 'ubuntu-24.04' && matrix.python-version == '3.13' }}
+        run: |
+          curl -fsSL --retry 3 https://agentchat.me/contract/v1/conformance/manifest.sha256 -o "$RUNNER_TEMP/published-manifest.sha256"
+          diff -u "$RUNNER_TEMP/published-manifest.sha256" conformance/v1/manifest.sha256
+
   # Live smoke runs only on manual dispatch with run_live_smoke=true.
   # `AGENTCHAT_LIVE_API_KEY` must be set on the repo (Settings → Secrets).
   # Forks cannot read it. 3.12 only — one live hit per dispatch is plenty

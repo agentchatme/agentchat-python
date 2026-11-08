@@ -38,7 +38,9 @@ Pacing (D5): after a silent turn (it looked and did nothing) the same
 conversation at the same anchor is not gated again for ``pace_ms`` (60 s)
 unless a newer message moves its anchor or an ``unanswered`` wake names it;
 after an invite turn that left the invite pending, no second invite turn for
-it within ``pace_ms`` unless an ``unanswered`` wake arrives. In memory.
+it within ``pace_ms`` unless an ``unanswered`` wake arrives. In single-run
+mode the run that would dismiss an ignored invite counts only when it ended
+at least ``pace_ms`` after the first counted one. In memory.
 
 Deadlines: one gate call may take ``gate_call_timeout_ms`` (60 s); past it
 the cycle fails closed for those cards (nothing recorded; the next wake
@@ -46,8 +48,11 @@ retries). A whole cycle may take ``cycle_timeout_ms`` (10 min), not counting
 time spent starting turns or running a run; past it the cycle is abandoned
 (logged, summarised as ``abandoned``) and wakes are taken again, so a cycle
 that never finishes cannot leave the loop looking healthy while it
-processes nothing. ``status().recent_cycles`` holds the last outcomes for a
-host to alarm on.
+processes nothing; an abandoned cycle records nothing more (a verdict
+already on its way is left to finish, and its card is held out of the next
+gate until it answers). ``status().recent_cycles`` holds the last outcomes
+for a host to alarm on. Either deadline: ``None`` is the default, ``0``
+turns it off.
 
 Turns: at most ``max_concurrent_turns`` (default 1) reply and invite turns
 run at once; the rest wait for a slot, held out of the gate meanwhile (their
@@ -75,6 +80,7 @@ from collections import OrderedDict, deque
 from collections.abc import Awaitable, Iterator, Mapping
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
+from types import SimpleNamespace
 from typing import Any, Callable, Literal
 
 from .. import gate as _gate
@@ -84,6 +90,7 @@ from ..types.texts import Texts
 from .anchor import normalize_handle
 from .coalescer import SetTimer, TimerHandle, WakeCoalescer, _loop_timer
 from .outcome import (
+    InviteOutcome,
     TurnEnd,
     apply_invite_outcome_async,
     apply_outcome_async,
@@ -296,6 +303,36 @@ def _ws_base(http_base: str | None) -> str:
     return base
 
 
+def _consume_outcome(task: asyncio.Future[Any]) -> None:
+    """A shielded record whose caller went away: its failure is not lost
+    in the log (the gate saw it, or the cycle was abandoned)."""
+    if not task.cancelled():
+        task.exception()
+
+
+def _timeout_option(value: float | None, default: float, name: str) -> float:
+    """A timeout option in ms: ``None`` → the default, ``0`` → off (returned
+    as 0), a positive number → itself; anything else raises."""
+    if value is None:
+        return float(default)
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or value != value or value < 0:
+        raise ValueError(f"ReceiveLoop: {name} must be 0 (off) or a positive number")
+    if value == float("inf"):
+        return 0.0
+    return float(value)
+
+
+class _StaleFlag:
+    """``is_set()`` once a cycle has gone stale (abandoned or stopped): the
+    gate's cancel handle."""
+
+    def __init__(self, stale: Callable[[], bool]) -> None:
+        self._stale = stale
+
+    def is_set(self) -> bool:
+        return self._stale()
+
+
 def _tray_invites(tray: Mapping[str, Any]) -> list[dict[str, Any]]:
     raw = tray.get("invites")
     if not isinstance(raw, list):
@@ -386,8 +423,8 @@ class ReceiveLoop:
         on_event: Callable[[ReceiveLoopEvent], Any] | None = None,
         max_concurrent_turns: int = 1,
         pace_ms: float = PACE_MS,
-        gate_call_timeout_ms: float = GATE_CALL_TIMEOUT_MS,
-        cycle_timeout_ms: float = CYCLE_TIMEOUT_MS,
+        gate_call_timeout_ms: float | None = None,
+        cycle_timeout_ms: float | None = None,
         turn_tracker: TurnTracker | None = None,
         dismiss_ignored_invites: bool = True,
         now: Callable[[], float] | None = None,
@@ -414,6 +451,7 @@ class ReceiveLoop:
         self._now = now or (lambda: time.time() * 1000.0)
         self._handle = normalize_handle(handle) if handle else None
         self._tracker = turn_tracker if turn_tracker is not None else TurnTracker(now=self._now)
+        self._pace_ms = pace_ms
         self._pacer = _Pacer(pace_ms, self._now)
         self._max_turns = max_concurrent_turns
         self._dismiss_ignored_invites = dismiss_ignored_invites is not False
@@ -423,7 +461,7 @@ class ReceiveLoop:
         self._waiting: deque[tuple[TurnHandle, Callable[[], Awaitable[bool]]]] = deque()
         # A released turn (here, or by the host through a shared tracker)
         # frees its slot at once; one released while it waits is dropped.
-        self._unsubscribe_release = self._tracker.on_release(self._on_turn_released)
+        self._unsubscribe_release = self._tracker.on_release(self._on_release_any_thread)
         coalescer_options: dict[str, Any] = {}
         if quiet_ms is not None:
             coalescer_options["quiet_ms"] = quiet_ms
@@ -442,6 +480,15 @@ class ReceiveLoop:
         self._stopping = asyncio.Event()
         self._unsubscribe: list[Callable[[], Any]] = []
         self._silent: OrderedDict[str, int] = OrderedDict()
+        # When a single-run invite's silent run was counted (D5 pacing in
+        # single-run mode).
+        self._silent_at: dict[str, float] = {}
+        # Conversations whose verdict a gate call is recording right now (an
+        # abandoned cycle's included): held out of the next gate.
+        self._records_in_flight: set[str] = set()
+        # The event loop the loop runs on (set by start()): a release from
+        # another thread is handed over to it.
+        self._event_loop: asyncio.AbstractEventLoop | None = None
         self._pending_work: set[asyncio.Future[Any]] = set()
         self._turn_tasks: set[asyncio.Future[Any]] = set()
         self._started = False
@@ -454,8 +501,13 @@ class ReceiveLoop:
         self._cycle_token = 0
         self._cycle_cancel = asyncio.Event()
         self._cycle_cancel_thread = threading.Event()
-        self._gate_call_timeout_ms = gate_call_timeout_ms
-        self._cycle_timeout_s = max(0.0, cycle_timeout_ms / 1000.0)
+        # None: the default; 0: no deadline; a negative value is an error.
+        self._gate_call_timeout_ms = _timeout_option(
+            gate_call_timeout_ms, GATE_CALL_TIMEOUT_MS, "gate_call_timeout_ms"
+        )
+        self._cycle_timeout_s = (
+            _timeout_option(cycle_timeout_ms, CYCLE_TIMEOUT_MS, "cycle_timeout_ms") / 1000.0
+        )
         # Time spent starting turns / runs (excluded from the cycle watchdog).
         self._turn_depth = 0
         self._turn_since = 0.0
@@ -513,6 +565,7 @@ class ReceiveLoop:
         if self._started or self._stopped:
             return
         self._started = True
+        self._event_loop = asyncio.get_running_loop()
         rt = self._realtime
         if rt is None:
             return
@@ -805,7 +858,15 @@ class ReceiveLoop:
             return self._summary("tray_failed", failure=self._last_error)
         cards = _gate.cards_of(tray)
         invites = _tray_invites(tray)
-        unheld = self._tracker.without_running(cards)
+        # Held out of this gate: a running or waiting turn, or a verdict still
+        # being recorded (an abandoned cycle's last call): gating it again
+        # could record the same verdict twice (a second defer climbs the
+        # ladder).
+        unheld = [
+            card
+            for card in self._tracker.without_running(cards)
+            if card["conversation_id"] not in self._records_in_flight
+        ]
         held = len(cards) - len(unheld)
         if held > 0:
             self._held_while_running = True
@@ -860,9 +921,10 @@ class ReceiveLoop:
             result = await _gate.run_async(
                 {**tray, "conversations": gate_cards},
                 self._model_call(),
-                self._client,
+                self._recording_client(token),
                 tool_namer=self._tool_namer,
                 texts=texts,
+                cancel=_StaleFlag(lambda: self._stale(token)),
             )
             if self._stale(token):
                 return self._summary("abandoned", **base)
@@ -954,7 +1016,8 @@ class ReceiveLoop:
         started_with = (
             _tray_invites(tray) if tray is not None and self._dismiss_ignored_invites else []
         )
-        if started_with and not self._stopped:
+        if started_with:
+            # Recorded also after stop(): what the run did is a fact.
             await self._track(self._after_run_invites(started_with, end))
         outcome: CycleOutcome = (
             "run_completed"
@@ -1027,6 +1090,20 @@ class ReceiveLoop:
             self._active.add(handle)
             if not await admit():
                 self._active.discard(handle)
+
+    def _on_release_any_thread(self, handle: TurnHandle) -> None:
+        """A tracker release, from whichever thread called it: the slot work
+        runs on the loop's own event loop."""
+        loop = self._event_loop
+        try:
+            running: asyncio.AbstractEventLoop | None = asyncio.get_running_loop()
+        except RuntimeError:
+            running = None
+        if loop is None or running is loop:
+            self._on_turn_released(handle)
+            return
+        with contextlib.suppress(RuntimeError):  # the event loop has closed
+            loop.call_soon_threadsafe(self._on_turn_released, handle)
 
     def _on_turn_released(self, handle: TurnHandle) -> None:
         waiting = [entry for entry in self._waiting if entry[0] is not handle]
@@ -1146,8 +1223,9 @@ class ReceiveLoop:
             else TurnEnd(status="failed", detail=end.detail)
         )
         for invite in invites:
-            # A run reports no call counts: the single-run invite rule applies.
-            await self._finish_invite(invite, turn, fresh, require_known_calls=False)
+            # A run reports no call counts: the single-run invite rule
+            # applies, paced.
+            await self._finish_invite(invite, turn, fresh, require_known_calls=False, paced=True)
 
     async def _record_invite_outcome(
         self, invite: dict[str, Any], end: TurnEnd, handle: TurnHandle
@@ -1164,6 +1242,7 @@ class ReceiveLoop:
         fresh: dict[str, Any] | None,
         *,
         require_known_calls: bool = True,
+        paced: bool = False,
     ) -> None:
         """The D5 rule for one invite after a turn or a run, and the one call
         it asks for."""
@@ -1176,16 +1255,30 @@ class ReceiveLoop:
             silent_before=silent_before,
             require_known_calls=require_known_calls,
         )
+        # D5 paces both modes: in single-run mode the run that would dismiss
+        # counts only when it ended at least pace_ms after the first counted
+        # one.
+        counted_at = self._silent_at.get(key)
+        if (
+            paced
+            and outcome.reason == "silent_again"
+            and counted_at is not None
+            and self._now() - counted_at < self._pace_ms
+        ):
+            outcome = InviteOutcome(action="none", reason="silent_paced", invite_id=outcome.invite_id)
         self._count(f"invite_{outcome.reason}")
         if outcome.reason == "silent_first":
             self._remember(key, silent_before + 1)
+            self._silent_at[key] = self._now()
         elif outcome.reason == "invite_answered":
             self._silent.pop(key, None)
+            self._silent_at.pop(key, None)
         recorded = False
         if outcome.action != "none":
             try:
                 recorded = await apply_invite_outcome_async(self._client, outcome)
                 self._silent.pop(key, None)
+                self._silent_at.pop(key, None)
             except Exception as err:
                 self._counts["outcome_record_failures"] += 1
                 self._fail(err)
@@ -1258,6 +1351,29 @@ class ReceiveLoop:
 
     # ─── small things ────────────────────────────────────────────────────
 
+    def _recording_client(self, token: int) -> Any:
+        """The gate's view of the client: a verdict in flight is known until
+        it answers (its card is held out of the next gate). It is never
+        aborted with an abandoned cycle (shielded): the server may already
+        have taken it, and a second one could climb the defer ladder twice."""
+        loop = self
+        decisions = self._client.decisions
+
+        async def record(conversation_id: str, **kwargs: Any) -> Any:
+            loop._records_in_flight.add(conversation_id)
+            call = asyncio.ensure_future(decisions.record(conversation_id, **kwargs))
+
+            def done(_task: asyncio.Future[Any]) -> None:
+                loop._records_in_flight.discard(conversation_id)
+                if loop._stale(token):
+                    loop._after_turn_ended()  # a card held for it is read again
+
+            call.add_done_callback(done)
+            call.add_done_callback(_consume_outcome)
+            return await asyncio.shield(call)
+
+        return SimpleNamespace(decisions=SimpleNamespace(record=record))
+
     def _model_call(self) -> Callable[[str], Any]:
         """The runtime's model call, bounded by ``gate_call_timeout_ms`` (and
         by the cycle's own abandonment). A ``call_model`` that takes a
@@ -1323,7 +1439,8 @@ class ReceiveLoop:
         self._silent.pop(key, None)
         self._silent[key] = count
         while len(self._silent) > _SILENT_MEMORY:
-            self._silent.popitem(last=False)
+            oldest, _ = self._silent.popitem(last=False)
+            self._silent_at.pop(oldest, None)
 
     def _count(self, reason: str) -> None:
         self._outcomes[reason] = self._outcomes.get(reason, 0) + 1

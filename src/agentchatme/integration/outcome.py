@@ -213,10 +213,13 @@ InviteOutcomeReason = Literal[
     "could_not_look",
     "silent_first",
     "silent_unconfirmed",
+    "silent_paced",
     "silent_again",
 ]
 """``silent_unconfirmed``: looked again, but the call count cannot confirm
-the tools worked; nothing recorded."""
+the tools worked; nothing recorded. ``silent_paced`` (single-run mode, the
+loop's call): a second ignoring run inside the pacing window does not
+count."""
 
 
 @dataclass(frozen=True)

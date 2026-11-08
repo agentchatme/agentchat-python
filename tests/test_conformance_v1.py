@@ -23,6 +23,8 @@ from agentchatme import (
 from agentchatme._realtime import wake_payload_problem
 from agentchatme.integration import (
     AgentChatCallCount,
+    ReceiveLoop,
+    RunEnd,
     TurnEnd,
     WakeCoalescer,
     anchor,
@@ -31,6 +33,7 @@ from agentchatme.integration import (
 )
 from agentchatme.types import HeartbeatFrame, InboxTray, Texts, WakeFrame, WakeWebhookPayload
 
+from ._texts import texts as texts_body
 from .test_realtime import _flush
 from .test_realtime_engine import connected
 
@@ -252,27 +255,52 @@ def test_turn_outcome_case_names_are_unique() -> None:
     OUTCOMES["single_run_invite_cases"],
     ids=[c["name"] for c in OUTCOMES["single_run_invite_cases"]],
 )
-def test_single_run_invite_case(case: dict[str, Any]) -> None:
-    # The loop's rule after each run (see single_run_invite_cases_about):
-    # completed → a completed turn with unknown calls and the fresh tray;
-    # failed / not_started → a failed turn, no tray read; silent_before
-    # counts the earlier silent_first outcomes; a run reports no counts, so
-    # require_known_calls is off.
-    silent = 0
-    got: list[dict[str, Any]] = []
+@pytest.mark.asyncio
+async def test_single_run_invite_case(case: dict[str, Any]) -> None:
+    # Through the loop (see single_run_invite_cases_about): each run starts
+    # from a tray holding the invite; a completed run is followed by the
+    # case's tray (null: the read fails). The loop's clock reads each run's
+    # ended_at_ms; pacing is single_run_pace_ms.
+    from .test_integration_kit import _cycle, _LoopClient, _tray
+
+    answers: list[Any] = []
     for run in case["runs"]:
-        completed = run["status"] == "completed"
-        outcome = invite_outcome(
-            turn=TurnEnd(status="completed") if completed else TurnEnd(status="failed"),
-            invite=case["invite"],
-            fresh_tray=run["fresh_tray"] if completed else None,
-            silent_before=silent,
-            require_known_calls=False,
-        )
-        if outcome.reason == "silent_first":
-            silent += 1
-        got.append({"action": outcome.action, "reason": outcome.reason})
+        answers.append(_tray([], [case["invite"]]))
+        if run["status"] == "completed":
+            fresh = run["fresh_tray"]
+            answers.append(RuntimeError("read failed") if fresh is None else _tray([], **fresh))
+    answers.append(_tray([]))
+    client = _LoopClient(answers)
+    statuses = [run["status"] for run in case["runs"]]
+    clock = [0.0]
+    got: list[dict[str, Any]] = []
+
+    def on_event(event: dict[str, Any]) -> None:
+        if event["type"] == "invite_outcome":
+            got.append({"action": event["outcome"].action, "reason": event["outcome"].reason})
+
+    loop = ReceiveLoop(
+        client,
+        Texts.model_validate(texts_body()),
+        "single_run",
+        start_run=lambda _r: RunEnd(status=statuses.pop(0)),
+        socket=None,
+        quiet_ms=0,
+        max_ms=0,
+        pace_ms=OUTCOMES["single_run_pace_ms"],
+        now=lambda: clock[0],
+        on_event=on_event,
+    )
+    await loop.start()
+    for index, run in enumerate(case["runs"]):
+        clock[0] = float(run["ended_at_ms"])  # the loop's clock when the run ends
+        await _cycle(loop)
+        assert len(got) == index + 1
     assert got == case["expect"]
+    dismissals = sum(1 for e in case["expect"] if e["action"] == "dismiss_invite")
+    assert len(client.groups.dismissed) == dismissals
+    assert client.decisions.recorded == []  # cards: the run's own verdicts only
+    await loop.stop()
 
 
 @pytest.mark.parametrize("case", OUTCOMES["cases"], ids=[c["name"] for c in OUTCOMES["cases"]])

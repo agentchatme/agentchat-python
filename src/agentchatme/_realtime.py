@@ -280,21 +280,26 @@ class RealtimeOptions:
     ``reason="connection_closed"``."""
     max_queued_messages: int = _DEFAULT_MAX_QUEUED_MESSAGES
     """Backpressure: how many ``message.new`` handler runs may be queued or
-    running at once, across every conversation. Past it the client takes no
-    new message in: a live frame is neither acknowledged (not even with
-    ``ack_on_receipt``) nor dispatched, the offline drain stops at that row
-    and gap-fill rows are not taken in, so the server keeps them ``stored``.
-    Once the queue is back to half, the client fetches what it left (the REST
-    drain when a ``client`` is configured, else one quiet reconnect, after
-    which the server re-offers its backlog). A frame already acknowledged on
-    receipt and parked on a seq gap still reaches the handlers. One notice
-    through ``on_error`` per episode. Default 1000."""
+    running at once, across every conversation. Once it is reached the
+    client takes no new message in until the queue is back to half (the
+    whole episode, so a conversation's later message never overtakes one
+    left behind): a live frame is neither acknowledged (not even with
+    ``ack_on_receipt``) nor dispatched and the offline drain stops at that
+    row, so the server keeps them ``stored``. Gap-fill rows are always taken
+    in (they fill a hole in order). Once the queue is back to half, the
+    client fetches what it left (the REST drain when a ``client`` is
+    configured, else one quiet reconnect, after which the server re-offers
+    its backlog). A frame already acknowledged on receipt and parked on a
+    seq gap still reaches the handlers. One notice through ``on_error`` per
+    episode. Default 1000."""
     in_flight_adopt_ms: int = 15 * 60_000
     """A re-offer of a message whose first copy is still with the handlers
     takes that copy's outcome instead of being dispatched again — on the same
-    connection always, on a later connection while the first copy has run
-    less than this. Past it a handler that never finishes does not swallow
-    every re-offer. Default 15 minutes."""
+    connection always, on a later connection while the first copy is still
+    queued or its handlers have run less than this (the clock starts when
+    its conversation's lane starts the handlers, not when it was queued).
+    Past it a handler that never finishes does not swallow every re-offer.
+    Default 15 minutes."""
     capabilities: SocketCapabilityOptions | None = None
     """Socket capabilities to offer in HELLO besides ``ack`` (offered while a
     ``message.new`` handler is attached); the server echoes what it accepted
@@ -548,13 +553,15 @@ class _BoundedLruSet:
 
 @dataclass
 class _InFlight:
-    """A ``message.new`` whose handlers are running: the future its outcome
-    lands on (``True`` = every handler finished cleanly), the connection
-    generation it was dispatched on, and when (monotonic seconds)."""
+    """A ``message.new`` with the handlers: the future its outcome lands on
+    (``True`` = every handler finished cleanly), the connection generation
+    it was dispatched on, and when its lane started the handlers (monotonic
+    seconds; ``None`` while it is still queued behind its conversation's
+    earlier message)."""
 
     outcome: asyncio.Future[bool]
     generation: int
-    started_at: float
+    started_at: float | None = None
 
 
 @dataclass
@@ -742,7 +749,10 @@ class RealtimeClient:
         # the one quiet reconnect that renegotiates ack (see
         # _maybe_renegotiate_ack).
         self._hello_sent = False
-        self._quiet_reconnect = False
+        # Why the next close is a quiet reconnect: "renegotiate" (the first
+        # message.new handler came after a HELLO without ack) or
+        # "backpressure" (fetch what shedding left with the server).
+        self._quiet_reconnect: Literal["renegotiate", "backpressure"] | None = None
         # Set when the server's last close or upgrade answer was the connect
         # budget (D8): the delay it asked for, until the next hello.ok.
         self._rate_limited_ms: int | None = None
@@ -894,27 +904,27 @@ class RealtimeClient:
         self._close_initiated_locally = False
         self._hello_sent = False
 
+        hello = json.dumps(
+            {
+                "type": "hello",
+                "api_key": self._opts.api_key,
+                # Advertised capabilities; the server ignores unknown
+                # strings and echoes the accepted subset on hello.ok.
+                "capabilities": self._advertised_capabilities(),
+                "client": self._opts.client_identity.name,
+                **(
+                    {"client_version": self._opts.client_identity.version}
+                    if self._opts.client_identity.version
+                    else {}
+                ),
+            }
+        )
+        # Before the awaited send: a message.new handler attached while the
+        # HELLO is on its way (offered without ack) still triggers the
+        # renegotiation.
+        self._hello_sent = True
         try:
-            await ws.send(
-                json.dumps(
-                    {
-                        "type": "hello",
-                        "api_key": self._opts.api_key,
-                        # Advertised capabilities; the server ignores unknown
-                        # strings and echoes the accepted subset on hello.ok.
-                        "capabilities": self._advertised_capabilities(),
-                        "client": self._opts.client_identity.name,
-                        **(
-                            {
-                                "client_version": self._opts.client_identity.version
-                            }
-                            if self._opts.client_identity.version
-                            else {}
-                        ),
-                    }
-                )
-            )
-            self._hello_sent = True
+            await ws.send(hello)
         except Exception as err:
             # A socket we cannot write HELLO to is useless; drop it as our
             # own close and take the normal backoff rather than sit on it.
@@ -947,7 +957,7 @@ class RealtimeClient:
         def renegotiate() -> None:
             if self._ws is not ws or self._disposed or not self._has_message_handler():
                 return
-            self._quiet_reconnect = True
+            self._quiet_reconnect = "renegotiate"
             self._spawn(self._close_socket(ws, 1000, "client reconnects to negotiate delivery acks"))
 
         loop.call_soon(renegotiate)
@@ -1248,10 +1258,12 @@ class RealtimeClient:
 
                 frame_type = message.get("type")
                 if frame_type == "message.new":
-                    if self._queue_full():
+                    if self._refusing_intake():
                         # Backpressure: the handlers are this far behind, so
                         # the frame is not taken in — not acked, not
-                        # dispatched — and the server keeps it.
+                        # dispatched — and the server keeps it. For the
+                        # whole episode (until the queue is back to half),
+                        # so a later message never overtakes one left behind.
                         self._start_shedding()
                         continue
                     if self._opts.ack_on_receipt and self._has_message_handler():
@@ -1311,7 +1323,7 @@ class RealtimeClient:
             self._close_initiated_locally = False
             handshake_done = self._authenticated
             quiet_reconnect = self._quiet_reconnect
-            self._quiet_reconnect = False
+            self._quiet_reconnect = None
             self._hello_sent = False
 
             if self._handshake_task is not None:
@@ -1367,10 +1379,11 @@ class RealtimeClient:
             # parked frames to the handlers now, in seq order, before the
             # state goes. Default mode skips this: its parked frames are
             # unacked and come back in order on the next drain.
-            # A quiet reconnect (to renegotiate ack, or to fetch what
-            # backpressure left with the server): hand parked frames over —
-            # nothing would re-offer a frame of a socket marked on send.
-            if self._opts.ack_on_receipt or quiet_reconnect:
+            # A quiet reconnect to renegotiate ack: hand parked frames over —
+            # nothing would re-offer a frame of a socket marked on send. A
+            # backpressure reconnect does not: its parked frames are unacked
+            # and come back in order with what shedding left behind.
+            if self._opts.ack_on_receipt or quiet_reconnect == "renegotiate":
                 await self._flush_parked_frames("connection_closed")
             self._reset_order_states()
             self._generation += 1
@@ -1510,7 +1523,7 @@ class RealtimeClient:
             for envelope in envelopes:
                 if self._disposed:
                     break
-                if self._queue_full():
+                if self._refusing_intake():
                     # Backpressure: rows past a full queue are not handed
                     # over; the cursor stops at the first of them and the
                     # drain ends after this page.
@@ -1746,16 +1759,20 @@ class RealtimeClient:
         when the ``heartbeat`` capability was negotiated (informational: the
         idle watchdog already counts them).
 
-        Server-frame handlers (``message.new``, ``wake``, everything the
-        server sends) run off the receive loop: a sync handler runs at once,
-        an async one is started at once and runs as its own task, so a slow
-        handler never holds up the next frame, another frame's ack, or the
-        transport's pongs. Handlers are started in arrival order (per
-        conversation: seq order); an async handler that needs the previous
-        message's handler finished first serialises itself. A ``message.new``
-        is acknowledged once every handler for it finished cleanly (unless
-        ``ack_on_receipt``), and never when no ``message.new`` handler is
-        attached.
+        Server-frame handlers run off the receive loop, so a slow handler
+        never holds up the next frame, another frame's ack, or the
+        transport's pongs. ``message.new`` is dispatched serially per
+        conversation: one message's handlers at a time, in seq order, the
+        next message of the same conversation once they finished (or after
+        ``in_flight_adopt_ms`` at most, while a hung handler keeps running);
+        conversations run concurrently. On an idle conversation a sync
+        handler runs at once; an async one runs inside its conversation's
+        lane. A ``message.new`` is acknowledged once every handler for it
+        finished cleanly (unless ``ack_on_receipt``), and never when no
+        ``message.new`` handler is attached. Every other server frame
+        (``wake``, presence, invites, ...) is dispatched at once, on no lane:
+        a sync handler runs now, an async one as its own task, so it never
+        waits behind a hung ``message.new`` handler.
 
         Three events are raised by the client itself, in the same shape (a
         server frame carrying one of these types is dropped, never dispatched):
@@ -2010,15 +2027,25 @@ class RealtimeClient:
             await _invoke(h, message)
 
     def _dispatch_frame(self, message: dict[str, Any]) -> None:
-        """Hand a server frame (not ``message.new``) to its handlers on its
-        lane, without waiting for them. Failures are logged."""
+        """Hand a server frame (not ``message.new``: a wake, presence, an
+        invite, ...) to its handlers at once, never on a lane: it is not
+        counted in the queue bound and never waits behind a conversation's
+        hung ``message.new`` handler. A sync handler runs now; an async one
+        runs as its own task. Failures are logged."""
         event = message.get("type")
         if not isinstance(event, str):
             return
-        handlers = list(self._handlers.get(event, ()))
-        if not handlers:
-            return
-        self._submit(_lane_of(message), _Job(message=message, handlers=handlers))
+        for handler in list(self._handlers.get(event, ())):
+            try:
+                result = handler(message)
+            except Exception:
+                _log.warning("realtime handler raised", exc_info=True)
+                continue
+            if inspect.isawaitable(result):
+                task = asyncio.ensure_future(result)
+                self._dispatch_tasks.add(task)
+                task.add_done_callback(self._dispatch_tasks.discard)
+                task.add_done_callback(_log_handler_failure)
 
     # ─── Lanes ───────────────────────────────────────────────────────
 
@@ -2041,6 +2068,7 @@ class RealtimeClient:
     def _run_inline(self, job: _Job) -> bool:
         """Call the job's handlers now, in order, until one is async: that
         one is started as a task the lane's worker will wait for."""
+        _mark_started(job)
         while job.next_index < len(job.handlers):
             handler = job.handlers[job.next_index]
             job.next_index += 1
@@ -2089,6 +2117,7 @@ class RealtimeClient:
         try:
             while lane.jobs:
                 job = lane.jobs[0]
+                _mark_started(job)
                 run: asyncio.Future[None] = asyncio.ensure_future(self._finish_job(job))
                 job.run = run
                 self._dispatch_tasks.add(run)
@@ -2121,6 +2150,11 @@ class RealtimeClient:
     def _queue_full(self) -> bool:
         return self._queued_messages >= self._opts.max_queued_messages
 
+    def _refusing_intake(self) -> bool:
+        """No new message is taken in: the queue is full, or a shedding
+        episode has not ended (the queue is not back to half yet)."""
+        return self._shedding or self._queue_full()
+
     def _start_shedding(self) -> None:
         """The queue is full: messages are left with the server from here
         (one notice per episode)."""
@@ -2150,7 +2184,7 @@ class RealtimeClient:
         if self._opts.client is not None:
             self._spawn(self.drain_offline_envelopes())
         elif self._ws is not None and self._authenticated:
-            self._quiet_reconnect = True
+            self._quiet_reconnect = "backpressure"
             self._spawn(
                 self._close_socket(
                     self._ws, 1000, "client reconnects to fetch messages it left with the server"
@@ -2233,7 +2267,7 @@ class RealtimeClient:
 
         own: _InFlight | None = None
         if message_id is not None and self._dedup.enabled:
-            own = _InFlight(loop.create_future(), self._generation, time.monotonic())
+            own = _InFlight(loop.create_future(), self._generation)
             self._inflight[message_id] = own
 
         job = _Job(
@@ -2310,8 +2344,8 @@ class RealtimeClient:
         running = self._inflight.get(message_id)
         if running is None:
             return None
-        if running.generation == self._generation:
-            return running
+        if running.generation == self._generation or running.started_at is None:
+            return running  # this connection's, or queued and not started yet
         age_ms = (time.monotonic() - running.started_at) * 1000.0
         return running if age_ms < self._opts.in_flight_adopt_ms else None
 
@@ -2528,11 +2562,9 @@ class RealtimeClient:
             )
             return
 
-        if self._queue_full():
-            # Backpressure: the fetched rows are not taken in (nothing marks
-            # them on the server); the gap resolves without them.
-            self._start_shedding()
-            fetched = []
+        # Gap-fill rows are always taken in, backpressure or not: they fill
+        # a hole in seq order, and dropping them would let the frames parked
+        # behind it overtake them.
 
         for row in fetched or []:
             if not isinstance(row, dict):
@@ -2814,16 +2846,28 @@ def _discard_awaitable(awaitable: Any) -> None:
         awaitable.cancel()
 
 
+def _log_handler_failure(task: asyncio.Future[Any]) -> None:
+    if task.cancelled():
+        return
+    error = task.exception()
+    if error is not None:
+        _log.warning("realtime handler raised", exc_info=error)
+
+
+def _mark_started(job: _Job) -> None:
+    """The lane starts the job's handlers now: the in-flight adoption clock
+    starts here, not when the job was queued."""
+    if job.own is not None and job.own.started_at is None:
+        job.own.started_at = time.monotonic()
+
+
 def _lane_of(message: dict[str, Any]) -> str:
-    """The dispatch lane of a frame: its conversation (``message.new`` and
-    every frame that names one), or the one lane for frames of no
-    conversation. A ``wake`` is a tray-level signal: the no-conversation
-    lane, whatever conversation it names."""
-    if message.get("type") != "wake":
-        payload = message.get("payload")
-        cid = payload.get("conversation_id") if isinstance(payload, dict) else None
-        if isinstance(cid, str) and cid:
-            return f"conversation:{cid}"
+    """The dispatch lane of a ``message.new``: its conversation, or one lane
+    for a message that names none. (Other frames take no lane.)"""
+    payload = message.get("payload")
+    cid = payload.get("conversation_id") if isinstance(payload, dict) else None
+    if isinstance(cid, str) and cid:
+        return f"conversation:{cid}"
     return _NO_CONVERSATION_LANE
 
 

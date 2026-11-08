@@ -477,3 +477,48 @@ async def test_run_async_accepts_a_sync_model_call_and_fails_closed_on_raise() -
     assert failed.outcome == "fail_closed"
     assert failed.failure is not None and "provider down" in failed.failure
     assert len(decisions.calls) == 1
+
+
+# ─────────────── cancel ───────────────
+
+
+def test_a_cancel_set_before_the_model_answers_records_nothing() -> None:
+    import threading
+
+    cancel = threading.Event()
+    decisions = FakeDecisions()
+
+    def call_model(_prompt: str, *, cancel: threading.Event) -> str:
+        cancel.set()  # stopped while the model ran
+        return answer([{"conversation_id": IDS["crew"], "decision": "dismiss"}])
+
+    result = gate.run(sample_tray(), call_model, FakeClient(decisions), texts=GATE_TEXTS, cancel=cancel)  # type: ignore[arg-type]
+    assert result.outcome == "fail_closed" and result.failure == "the gate was stopped"
+    assert decisions.calls == [] and result.reply == []
+
+
+@pytest.mark.asyncio
+async def test_a_cancel_set_mid_recording_records_nothing_more_and_hands_back_no_reply() -> None:
+    cancel = asyncio.Event()
+
+    class StopAfterFirst(FakeAsyncDecisions):
+        async def record(self, conversation_id: str, **kwargs: Any) -> ReplyDecision:  # type: ignore[override]
+            result = await super().record(conversation_id, **kwargs)
+            cancel.set()
+            return result
+
+    decisions = StopAfterFirst()
+    text = answer(
+        [
+            {"conversation_id": IDS["crew"], "decision": "dismiss", "category": "no_action_needed"},
+            {"conversation_id": IDS["ops"], "decision": "defer"},
+            {"conversation_id": IDS["direct"], "decision": "reply", "category": "open_request"},
+        ]
+    )
+    result = await gate.run_async(
+        sample_tray(), lambda _p: text, FakeClient(decisions), texts=GATE_TEXTS, cancel=cancel  # type: ignore[arg-type]
+    )
+    assert [c for c, _ in decisions.calls] == [IDS["crew"]]
+    assert result.outcome == "decided" and result.recorded == 1 and result.reply == []
+    assert IDS["ops"] in result.undecided and IDS["direct"] in result.undecided
+    assert IDS["crew"] not in result.undecided

@@ -78,7 +78,7 @@ import json
 import re
 from collections.abc import Awaitable, Mapping
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Callable, Generic, Literal, TypeVar, Union
+from typing import TYPE_CHECKING, Any, Callable, Generic, Literal, Protocol, TypeVar, Union
 
 from .types.decision import ReplyDecision, ReplyDecisionCategory, ReplyDecisionVerdict
 from .types.inbox import InboxCard, InboxTray
@@ -579,6 +579,7 @@ def run(
     *,
     tool_namer: ToolNamer | None = None,
     texts: TextsLike | None = None,
+    cancel: CancelHandle | None = None,
 ) -> GateResult[GateReply]:
     """Decide every card on the tray. Never raises: model and network
     failures land in the result. ``texts`` are the served texts the prompt
@@ -589,6 +590,11 @@ def run(
     at most 50 cards), each anchored to its card. ``reply`` is handed back
     in :attr:`GateResult.reply`; the host runs the turn and calls
     ``entry.record()`` once it has completed.
+
+    ``cancel`` (anything with ``is_set()``, e.g. a :class:`threading.Event`)
+    stops the gate: once set, no further verdict is recorded and no reply is
+    handed back (the cards not yet recorded count as undecided). A
+    ``call_model`` that takes a ``cancel`` keyword is handed it too.
     """
     prepared = _prepare(tray)
     if not prepared.ids:
@@ -598,10 +604,18 @@ def run(
         prompt = build_prompt(prepared.data, tool_namer, texts=texts)
     except ValueError as err:
         return _closed("fail_closed", prepared.ids, str(err))
+    if _cancelled(cancel):
+        return _closed("fail_closed", prepared.ids, _STOPPED)
     try:
-        text = call_model(prompt)
+        text = (
+            call_model(prompt, cancel=cancel)  # type: ignore[call-arg]
+            if cancel is not None and _accepts_cancel(call_model)
+            else call_model(prompt)
+        )
     except Exception as err:
         return _closed("fail_closed", prepared.ids, f"model call failed: {err}")
+    if _cancelled(cancel):
+        return _closed("fail_closed", prepared.ids, _STOPPED)
 
     usable = _usable(text, prepared)
     if isinstance(usable, GateResult):
@@ -610,8 +624,14 @@ def run(
     reply: list[GateReply] = []
     recorded = 0
     failures: list[GateRecordFailure] = []
+    stopped: set[str] = set()
     for verdict in usable:
         anchor = prepared.anchors.get(verdict.conversation_id)
+        if _cancelled(cancel):
+            # Stopped: nothing more is recorded or handed back; the rest
+            # stay on the tray.
+            stopped.add(verdict.conversation_id)
+            continue
         if verdict.decision == "reply":
             reply.append(
                 GateReply(
@@ -633,7 +653,7 @@ def run(
             recorded += 1
         except Exception as err:
             failures.append(GateRecordFailure(verdict.conversation_id, err))
-    return _finish(usable, prepared.ids, reply, recorded, failures)
+    return _finish(usable, prepared.ids, reply, recorded, failures, stopped, _cancelled(cancel))
 
 
 async def run_async(
@@ -644,6 +664,7 @@ async def run_async(
     tool_namer: ToolNamer | None = None,
     texts: TextsLike | None = None,
     timeout_ms: float | None = None,
+    cancel: CancelHandle | None = None,
 ) -> GateResult[AsyncGateReply]:
     """Async counterpart of :func:`run`. ``call_model`` may be sync or async;
     reply entries are recorded with ``await entry.record()``.
@@ -651,7 +672,10 @@ async def run_async(
     ``timeout_ms`` bounds the model call: past it the gate fails closed for
     every card on the tray (nothing recorded; the next wake asks again). A
     sync ``call_model`` cannot be interrupted: it is left to finish, unheard.
-    ``None`` (default): no bound."""
+    ``None`` (default): no bound. ``cancel`` (anything with ``is_set()``,
+    e.g. an :class:`asyncio.Event`) stops the gate as in :func:`run`; the
+    :class:`~agentchatme.integration.ReceiveLoop` passes its cycle's, so an
+    abandoned cycle records nothing more."""
     prepared = _prepare(tray)
     if not prepared.ids:
         return _closed("empty", [], None)
@@ -660,8 +684,14 @@ async def run_async(
         prompt = build_prompt(prepared.data, tool_namer, texts=texts)
     except ValueError as err:
         return _closed("fail_closed", prepared.ids, str(err))
+    if _cancelled(cancel):
+        return _closed("fail_closed", prepared.ids, _STOPPED)
     try:
-        result = call_model(prompt)
+        result = (
+            call_model(prompt, cancel=cancel)  # type: ignore[call-arg]
+            if cancel is not None and _accepts_cancel(call_model)
+            else call_model(prompt)
+        )
         if inspect.isawaitable(result):
             text = (
                 await asyncio.wait_for(result, timeout_ms / 1000.0)
@@ -677,6 +707,8 @@ async def run_async(
         return _closed("fail_closed", prepared.ids, f"model call timed out: {detail}")
     except Exception as err:
         return _closed("fail_closed", prepared.ids, f"model call failed: {err}")
+    if _cancelled(cancel):
+        return _closed("fail_closed", prepared.ids, _STOPPED)
 
     usable = _usable(text, prepared)
     if isinstance(usable, GateResult):
@@ -685,8 +717,12 @@ async def run_async(
     reply: list[AsyncGateReply] = []
     recorded = 0
     failures: list[GateRecordFailure] = []
+    stopped: set[str] = set()
     for verdict in usable:
         anchor = prepared.anchors.get(verdict.conversation_id)
+        if _cancelled(cancel):
+            stopped.add(verdict.conversation_id)
+            continue
         if verdict.decision == "reply":
             reply.append(
                 AsyncGateReply(
@@ -708,7 +744,33 @@ async def run_async(
             recorded += 1
         except Exception as err:
             failures.append(GateRecordFailure(verdict.conversation_id, err))
-    return _finish(usable, prepared.ids, reply, recorded, failures)
+    return _finish(usable, prepared.ids, reply, recorded, failures, stopped, _cancelled(cancel))
+
+
+_STOPPED = "the gate was stopped"
+
+
+class CancelHandle(Protocol):
+    """What ``cancel`` takes: anything with ``is_set()`` (an
+    :class:`asyncio.Event`, a :class:`threading.Event`)."""
+
+    def is_set(self) -> bool: ...
+
+
+def _cancelled(cancel: CancelHandle | None) -> bool:
+    return cancel is not None and bool(cancel.is_set())
+
+
+def _accepts_cancel(fn: Callable[..., Any]) -> bool:
+    try:
+        parameters = inspect.signature(fn).parameters.values()
+    except (TypeError, ValueError):
+        return False
+    return any(
+        p.kind is inspect.Parameter.VAR_KEYWORD
+        or (p.name == "cancel" and p.kind in (p.KEYWORD_ONLY, p.POSITIONAL_OR_KEYWORD))
+        for p in parameters
+    )
 
 
 def _recorder(
@@ -745,8 +807,14 @@ def _finish(
     reply: list[ReplyT],
     recorded: int,
     failures: list[GateRecordFailure],
+    stopped: set[str],
+    cancelled: bool,
 ) -> GateResult[ReplyT]:
-    decided = {verdict.conversation_id for verdict in verdicts}
+    if cancelled:
+        # Stopped: no reply is handed back; what was not recorded is undecided.
+        reply = []
+        stopped = stopped | {v.conversation_id for v in verdicts if v.decision == "reply"}
+    decided = {verdict.conversation_id for verdict in verdicts} - stopped
     return GateResult(
         outcome="decided",
         reply=reply,
@@ -763,6 +831,7 @@ __all__ = [
     "AsyncCallModel",
     "AsyncGateReply",
     "CallModel",
+    "CancelHandle",
     "GateOutcome",
     "GateRecordFailure",
     "GateReply",

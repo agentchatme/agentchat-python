@@ -763,6 +763,84 @@ async def test_a_turn_that_sent_and_then_failed_records_reply_and_is_not_gated_a
     await loop.stop()
 
 
+@pytest.mark.parametrize("record_ms", [30, 100])
+@pytest.mark.asyncio
+async def test_an_abandoned_cycle_records_nothing_more_and_each_conversation_once(record_ms: int) -> None:
+    # The watchdog abandons cycles mid-recording. A verdict in flight is not
+    # aborted (the server may have it) and its card is held out of the next
+    # gate until it answers: every conversation is recorded exactly once.
+    cards = [_card(f"c{i}", f"m{i}") for i in range(4)]
+    recorded: set[str] = set()
+    calls: list[str] = []
+
+    class SlowInbox:
+        async def tray(self, **_kw: Any) -> Any:
+            return _tray([c for c in cards if c["conversation_id"] not in recorded])
+
+    class SlowDecisions:
+        async def record(self, conversation_id: str, **_kw: Any) -> Any:
+            calls.append(conversation_id)
+            await asyncio.sleep(record_ms / 1000.0)
+            recorded.add(conversation_id)
+            return {"id": "d"}
+
+    client = _LoopClient([_tray([])])
+    client.inbox = SlowInbox()  # type: ignore[assignment]
+    client.decisions = SlowDecisions()  # type: ignore[assignment]
+
+    def call_model(prompt: str) -> str:
+        ids = [c["conversation_id"] for c in cards if c["conversation_id"] in prompt]
+        return json.dumps({"decisions": [{"conversation_id": i, "decision": "defer"} for i in ids]})
+
+    loop = _loop(client, call_model=call_model, start_turn=_Turns(), cycle_timeout_ms=50)
+    await loop.start()
+    loop.wake()
+    await asyncio.sleep(0.06)
+    for _ in range(6):
+        loop.wake()
+        await asyncio.sleep(0.12)
+    await loop.idle()
+    per: dict[str, int] = {}
+    for c in calls:
+        per[c] = per.get(c, 0) + 1
+    assert per == {"c0": 1, "c1": 1, "c2": 1, "c3": 1}
+    assert loop.status().recent_cycles[0].outcome == "abandoned"
+    await loop.stop()
+
+
+@pytest.mark.asyncio
+async def test_a_release_from_another_thread_starts_the_waiting_turn() -> None:
+    import threading
+
+    client = _LoopClient([_tray([_card("c1", "m1"), _card("c2", "m2")])])
+    turns = _Turns()
+    loop = _loop(client, call_model=lambda _p: _answer(("c1", "reply"), ("c2", "reply")), start_turn=turns)
+    await loop.start()
+    await _cycle(loop)
+    assert len(turns.requests) == 1 and loop.status().counters["turns_waiting"] == 1
+    released: list[bool] = []
+    worker = threading.Thread(target=lambda: released.append(loop._tracker.release("conversation:c1")))
+    worker.start()
+    worker.join()
+    await asyncio.sleep(0.05)
+    assert released == [True]
+    assert len(turns.requests) == 2 and loop.status().counters["turns_waiting"] == 0
+    await loop.stop()
+
+
+@pytest.mark.parametrize("name", ["gate_call_timeout_ms", "cycle_timeout_ms"])
+def test_timeouts_none_is_the_default_zero_is_off_negative_is_an_error(name: str) -> None:
+    client = _LoopClient([_tray([])])
+    default = _loop(client, call_model=lambda _p: "", start_turn=_Turns())
+    off = _loop(client, call_model=lambda _p: "", start_turn=_Turns(), **{name: 0})
+    if name == "gate_call_timeout_ms":
+        assert default._gate_call_timeout_ms == 60_000 and off._gate_call_timeout_ms == 0
+    else:
+        assert default._cycle_timeout_s == 600 and off._cycle_timeout_s == 0
+    with pytest.raises(ValueError):
+        _loop(client, call_model=lambda _p: "", start_turn=_Turns(), **{name: -1})
+
+
 @pytest.mark.asyncio
 async def test_a_refused_turn_records_nothing_and_a_sync_turn_runs_in_a_thread() -> None:
     client = _LoopClient([_tray([_card("c1", "m1")])])
@@ -1420,9 +1498,11 @@ async def test_single_run_dismisses_an_invite_left_pending_after_two_completed_r
     invite = {"invite_id": "gri_1", "group": {"id": "g", "name": "n", "member_count": 1}, "invited_by": "@p", "at": "t"}
     ends = [RunEnd(status="failed"), RunEnd(status="completed"), RunEnd(status="completed")]
     client = _LoopClient([_tray([], [invite])])
-    loop = _loop(client, mode="single_run", start_run=lambda _r: ends.pop(0))
+    clock = [0.0]
+    loop = _loop(client, mode="single_run", start_run=lambda _r: ends.pop(0), now=lambda: clock[0])
     await loop.start()
-    for _ in range(3):
+    for ended_at in (0.0, 0.0, 61_000.0):  # D5 pacing: the dismissing run a window later
+        clock[0] = ended_at
         await _cycle(loop)
     assert client.groups.dismissed == ["gri_1"]
     assert client.decisions.recorded == []

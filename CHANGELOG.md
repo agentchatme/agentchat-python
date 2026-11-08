@@ -52,24 +52,30 @@ changes under **Types**.
 
 ### Changed
 
-- *Behaviour change:* socket handlers run off the receive loop, one at a
-  time per conversation: each conversation has a serial lane (frames of no
-  conversation — wake, presence, invites — share one), and the receive loop
-  never waits for a handler. Within a conversation messages still reach the
-  app one at a time, in seq order; async handlers of *different*
-  conversations now run concurrently (in 1.2 every handler ran to the end
-  before the next frame was read). A handler that never finishes holds its
-  conversation at most `in_flight_adopt_ms` (15 min). Async `on_connect`
-  handlers are awaited before the reconnect drain starts, as in 1.2.
+- *Behaviour change — one message at a time per conversation:* socket
+  handlers run off the receive loop, and `message.new` handlers of one
+  conversation run on its serial lane: the next message waits until the
+  handler for the previous one has finished (up to `in_flight_adopt_ms`,
+  15 min, while a hung handler keeps running). A handler that waits for a
+  later message in its own conversation now waits behind itself until that
+  bound. Async handlers of *different* conversations now run concurrently
+  (in 1.2 every handler ran to the end before the next frame was read);
+  plain synchronous handlers are still called at once. Every other frame
+  (wake, presence, invites) is dispatched at once on no lane, never behind a
+  hung handler, and is not counted in `max_queued_messages`. Async
+  `on_connect` handlers are awaited before the reconnect drain starts, as in
+  1.2.
 - Backpressure: `RealtimeClient(max_queued_messages=1000)` bounds the
-  `message.new` handler runs queued or running. Past it a new message is not
-  taken in (not acked, not dispatched; the drain and gap fill stop) and
-  stays on the server; once the queue is back to half, the client fetches
-  it again (the REST drain, or one quiet reconnect without a REST client).
-  One notice per episode through `on_error`.
+  `message.new` handler runs queued or running. Once it is reached no new
+  message is taken in (not acked, not dispatched; the drain stops) until the
+  queue is back to half — the whole episode, so a later message never
+  overtakes one left with the server; then the client fetches what it left
+  (the REST drain, or one quiet reconnect without a REST client, which
+  hands parked frames over only under `ack_on_receipt`). Gap-fill rows are
+  always taken in. One notice per episode through `on_error`.
 - The first `message.new` handler attached after a HELLO that offered no
-  `ack` triggers one quiet reconnect (no error, no backoff step) so the next
-  HELLO negotiates delivery acks.
+  `ack` (also while that HELLO is being sent) triggers one quiet reconnect
+  (no error, no backoff step) so the next HELLO negotiates delivery acks.
 - `CallOptions(retry=...)` never makes a POST / PATCH without an
   Idempotency-Key retry; `send_message(opts=CallOptions(retry=...))` works
   (it raised `TypeError`).
@@ -81,8 +87,9 @@ changes under **Types**.
   effectively was), and a capability holds only when offered and echoed. A
   frame is never acknowledged while no `message.new` handler is attached.
 - A re-offer whose first copy is still with the handlers is not dispatched
-  again on a later connection either, while that copy has run less than
-  `in_flight_adopt_ms` (15 min).
+  again on a later connection either, while that copy is still queued in
+  its conversation's lane or its handlers have run less than
+  `in_flight_adopt_ms` (15 min, counted from when the handlers started).
 - The connect budget: a close 1013 carrying `retry_after=<s>` (the server
   sends `rate_limited; retry_after=<s>`) waits for the server's delay
   (1 s to 1 h, plus up to 10 %), never `blocked`. Any other 1013 (the
@@ -93,9 +100,12 @@ changes under **Types**.
   without the row): fields the server did not echo come from the request,
   `id` / `created_at` are then `None`.
 - `ReceiveLoop` single-run mode: an invite still pending after two
-  completed runs is dismissed (in memory); `dismiss_ignored_invites=False`
-  turns it off for a host that forwards invites elsewhere (no read after the
-  run, nothing recorded).
+  completed runs is dismissed (in memory), paced like gate-call mode: the
+  dismissing run counts only when it ended at least `pace_ms` (60 s) after
+  the first counted one (earlier ones: `silent_paced`, the count does not
+  move); recorded also after `stop()`. `dismiss_ignored_invites=False` turns
+  it off for a host that forwards invites elsewhere (no read after the run,
+  nothing recorded).
 - `ReceiveLoop`: `max_concurrent_turns` (default 1) — extra turns wait for a
   slot, held out of the gate; `release_turn` (or a release through a shared
   `TurnTracker`, which now has `holds()` and `on_release()`) frees the slot at
@@ -131,7 +141,15 @@ changes under **Types**.
   `asyncio.Event` for a coroutine function, a `threading.Event` for a plain
   one, which the cycle simply stops waiting for). `status().recent_cycles`
   keeps the last 20 cycle summaries, newest last. `gate.run_async(...,
-  timeout_ms=)` bounds the model call.
+  timeout_ms=)` bounds the model call. Either deadline: `None` (left out) is
+  the default, `0` turns it off, a negative value raises `ValueError`.
+- An abandoned cycle records nothing more: `gate.run` / `gate.run_async`
+  take `cancel=` (anything with `is_set()`), and once it is set record no
+  further verdict and hand back no reply (the rest count as undecided); the
+  loop passes its cycle's. A verdict still being recorded is never aborted
+  and holds its card out of the next gate, so no verdict is recorded twice.
+- A `TurnTracker.release` from another thread hands the loop's slot work
+  over to the loop's event loop (the waiting turn then starts).
 - `inbox.tray(include_invites=True)` sends `invites=1`: a pending invite then
   also ends a held read (default off, as before).
 - `register`, `verify`, `recover` and `recover_verify` take `timeout_ms` and

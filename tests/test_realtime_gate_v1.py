@@ -262,20 +262,28 @@ async def test_a_full_queue_stops_the_drain_before_the_cursor_covers_a_row() -> 
 
 
 @pytest.mark.asyncio
-async def test_frames_of_no_conversation_share_one_serial_lane() -> None:
-    rt, ws = await connected(capabilities=["ack"])
-    release = asyncio.Event()
+async def test_frames_other_than_message_new_are_dispatched_at_once_on_no_lane() -> None:
+    # A wake, presence or invite frame never waits behind a hung handler —
+    # neither a conversation's message.new nor another such frame's — and
+    # is not counted in the queue bound.
+    rt, ws = await connected(capabilities=["ack"], max_queued_messages=1)
+    hang = asyncio.Event()
     order: list[str] = []
 
     async def presence(_m: dict[str, Any]) -> None:
         order.append("presence:start")
-        await release.wait()
-        order.append("presence:end")
+        await hang.wait()
+
+    async def message(m: dict[str, Any]) -> None:
+        order.append(m["payload"]["id"])
+        await hang.wait()
 
     rt.on("presence.update", presence)
     rt.on("wake", lambda _m: order.append("wake"))
-    rt.on("message.new", lambda m: order.append(m["payload"]["id"]))
+    rt.on("group.invite.received", lambda _m: order.append("invite"))
+    rt.on("message.new", message)
     try:
+        await ws.push(message_new("c", 1))
         await ws.push({"type": "presence.update", "payload": {"handle": "nova"}})
         await ws.push(
             {
@@ -289,16 +297,12 @@ async def test_frames_of_no_conversation_share_one_serial_lane() -> None:
                 },
             }
         )
-        await ws.push(message_new("c", 1))
+        await ws.push({"type": "group.invite.received", "payload": {"invite_id": "gri_1"}})
         await _flush()
-        # msg_1 is on its conversation's lane; the wake waits its turn on the
-        # no-conversation lane behind the running presence handler.
-        assert sorted(order) == ["msg_1", "presence:start"]
-        release.set()
-        await _flush()
-        assert order.index("wake") > order.index("presence:end")
+        assert sorted(order) == ["invite", "msg_1", "presence:start", "wake"]
+        assert rt._queued_messages == 1 and not rt._shedding
     finally:
-        release.set()
+        hang.set()
         await rt.disconnect()
 
 
@@ -772,3 +776,200 @@ async def test_an_upgrade_answered_429_is_the_ordinary_backoff_never_blocked() -
         await rt.disconnect()
 
 
+
+
+# ─────────────── delta review: adoption clock, backpressure order, HELLO ───────────────
+
+
+@pytest.mark.asyncio
+async def test_a_queued_message_is_adopted_across_a_reconnect_however_long_it_waited() -> None:
+    # The adoption clock starts when the lane starts the handler: msg_2 was
+    # queued 120 ms ago but has run ~40 ms (< in_flight_adopt_ms), so its
+    # re-offer on the next connection is adopted, not dispatched twice.
+    rt, ws = await connected(capabilities=["ack"], in_flight_adopt_ms=100)
+    entered: list[str] = []
+
+    async def handler(m: dict[str, Any]) -> None:
+        mid = m["payload"]["id"]
+        entered.append(mid)
+        if mid == "msg_1":
+            await asyncio.sleep(0.08)
+        else:
+            await asyncio.Event().wait()
+
+    rt.on("message.new", handler)
+    try:
+        await ws.push(message_new("c", 1))
+        await ws.push(message_new("c", 2))
+        await asyncio.sleep(0.12)
+        await ws.close(code=1006)
+        await _flush()
+        ws2 = MockWebSocket()
+
+        async def connect2(_url: str, **_kw: Any) -> MockWebSocket:
+            return ws2
+
+        rt._websocket_connect = connect2
+        await rt.connect()
+        await ws2.push({"type": "hello.ok", "capabilities": ["ack"]})
+        await ws2.push(message_new("c", 2))
+        await asyncio.sleep(0.15)  # past the lane bound: a second dispatch would show
+        assert entered == ["msg_1", "msg_2"]
+    finally:
+        await rt.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_a_message_still_queued_is_always_adopted() -> None:
+    # Never started (its conversation's lane is held), however old: adopted.
+    rt, ws = await connected(capabilities=["ack"], in_flight_adopt_ms=10_000)
+    entered: list[str] = []
+    hang = asyncio.Event()
+
+    async def handler(m: dict[str, Any]) -> None:
+        entered.append(m["payload"]["id"])
+        await hang.wait()
+
+    rt.on("message.new", handler)
+    try:
+        await ws.push(message_new("c", 1))
+        await ws.push(message_new("c", 2))
+        await _flush()
+        first = rt._inflight["msg_2"]
+        assert first.started_at is None
+        first.generation -= 1  # as if it came in on an earlier connection
+        assert rt._adoptable("msg_2") is first
+    finally:
+        hang.set()
+        await rt.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_a_shedding_episode_refuses_intake_until_the_queue_is_back_to_half(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A taken-in a3 would park behind a2 and surface when the gap resolves.
+    monkeypatch.setattr("agentchatme._realtime._GAP_FILL_WINDOW_S", 0.05)
+    rt, ws = await connected(capabilities=["ack"], max_queued_messages=4)
+    entered: list[str] = []
+    releases: dict[str, asyncio.Event] = {}
+
+    async def handler(m: dict[str, Any]) -> None:
+        mid = m["payload"]["id"]
+        entered.append(mid)
+        await releases.setdefault(mid, asyncio.Event()).wait()
+
+    rt.on("message.new", handler)
+    try:
+        for conv, seq in [("b", 1), ("b", 2), ("b", 3), ("a", 1), ("a", 2)]:
+            await ws.push(message_new(conv, seq, id=f"{conv}{seq}"))
+        await _flush()
+        assert rt._shedding  # a2 left with the server
+        releases.setdefault("a1", asyncio.Event()).set()
+        await _flush()
+        # Three queued: not back to half (2), so a3 is refused too and never
+        # overtakes a2.
+        await ws.push(message_new("a", 3, id="a3"))
+        await _flush()
+        await asyncio.sleep(0.15)
+        assert entered == ["b1", "a1"] and rt._shedding
+        assert "a3" not in _ack_frames(ws)
+    finally:
+        for ev in releases.values():
+            ev.set()
+        await rt.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_gap_fill_rows_are_taken_in_under_backpressure(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("agentchatme._realtime._GAP_FILL_WINDOW_S", 0.05)
+    api = MockAsyncClient(get_messages_result=[{"id": "a2", "conversation_id": "a", "seq": 2}])
+    rt, ws = await connected(capabilities=["ack"], client=api, auto_drain_on_connect=False, max_queued_messages=2)
+    entered: list[str] = []
+    hang = asyncio.Event()
+
+    def handler(m: dict[str, Any]) -> Any:
+        mid = m["payload"]["id"]
+        entered.append(mid)
+        # a's messages finish at once; b's hang, so the queue stays full.
+        return hang.wait() if mid.startswith("b") else None
+
+    rt.on("message.new", handler)
+    try:
+        await ws.push(message_new("a", 1, id="a1"))
+        await ws.push(message_new("a", 3, id="a3"))  # parked: a2 is missing
+        await ws.push(message_new("b", 1, id="b1"))
+        await ws.push(message_new("b", 2, id="b2"))  # the queue is full
+        await _flush()
+        assert rt._queue_full()
+        await asyncio.sleep(0.15)
+        # The fill fetched a2 while the queue was full: taken in, in order.
+        assert entered == ["a1", "b1", "a2", "a3"]
+    finally:
+        hang.set()
+        await rt.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_a_backpressure_reconnect_keeps_parked_frames_for_the_server(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("agentchatme._realtime._GAP_FILL_WINDOW_S", 30.0)  # never fires
+    first, second = MockWebSocket(), MockWebSocket()
+    rt, handed = _client_with_sockets([first, second], max_queued_messages=3)
+    sleep = ControlledSleep(hold=True)
+    rt._sleep = sleep
+    entered: list[str] = []
+    hang = asyncio.Event()
+
+    async def handler(m: dict[str, Any]) -> None:
+        mid = m["payload"]["id"]
+        entered.append(mid)
+        if mid.startswith("b"):
+            await hang.wait()
+
+    rt.on("message.new", handler)
+    try:
+        await rt.connect()
+        await _flush()
+        await first.push({"type": "hello.ok", "capabilities": ["ack"]})
+        await first.push(message_new("a", 1, id="a1"))
+        await first.push(message_new("a", 3, id="a3"))  # parked behind a2
+        for seq in (1, 2, 3, 4, 5):
+            await first.push(message_new("b", seq, id=f"b{seq}"))
+        await _flush()
+        assert rt._shedding
+        hang.set()
+        await _until(lambda: len(handed) == 2)
+        await _flush()
+        # Unacked parked frames come back in order from the server: a3 is not
+        # handed over ahead of a2.
+        assert "a3" not in entered
+    finally:
+        hang.set()
+        sleep.release()
+        await rt.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_a_handler_attached_while_the_hello_is_sent_still_renegotiates() -> None:
+    rt_ref: list[RealtimeClient] = []
+
+    class SlowHello(MockWebSocket):
+        async def send(self, data: str) -> None:
+            if json.loads(data).get("type") == "hello":
+                # The handler arrives while the HELLO (offered without ack)
+                # is on its way.
+                rt_ref[0].on("message.new", lambda _m: None)
+                await asyncio.sleep(0)
+            await super().send(data)
+
+    first, second = SlowHello(), MockWebSocket()
+    rt, handed = _client_with_sockets([first, second])
+    rt_ref.append(rt)
+    try:
+        await rt.connect()
+        await _until(lambda: len(handed) == 2)
+        assert first.close_code == 1000 and "negotiate delivery acks" in first.close_reason
+        hellos = [json.loads(d) for d in second.sent if json.loads(d).get("type") == "hello"]
+        assert hellos and "ack" in hellos[0]["capabilities"]
+    finally:
+        await rt.disconnect()
