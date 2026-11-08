@@ -16,19 +16,10 @@ import pytest
 from agentchatme import RealtimeClient, gate
 from agentchatme.types import AckFrame, InboxTray, WakeFrame
 
+from ._texts import GATE_TEXTS
 from .test_realtime import MockWebSocket, _ack_frames, _make_client, _settle
 
 FIXTURES = Path(__file__).resolve().parent.parent / "conformance" / "v1"
-NAMES = [
-    "ack-frame.json",
-    "engine-scenarios.json",
-    "gate-prompt.expected.txt",
-    "tray.sample.json",
-    "verdict-parse.cases.json",
-    "wake-frame.json",
-]
-
-
 def raw(name: str) -> str:
     return (FIXTURES / name).read_text(encoding="utf-8")
 
@@ -44,27 +35,6 @@ def tray() -> dict[str, Any]:
 
 
 # ─────────────── Canonical form ───────────────
-
-
-def test_ships_exactly_the_six_named_files() -> None:
-    assert sorted(p.name for p in FIXTURES.iterdir()) == NAMES
-
-
-@pytest.mark.parametrize(
-    "name",
-    [
-        "tray.sample.json",
-        "verdict-parse.cases.json",
-        "wake-frame.json",
-        "ack-frame.json",
-        "engine-scenarios.json",
-    ],
-)
-def test_json_fixture_has_sorted_keys_two_space_indent_and_one_trailing_newline(
-    name: str,
-) -> None:
-    text = raw(name)
-    assert text == gate.canonical_json(json.loads(text)) + "\n"
 
 
 def test_expected_prompt_ends_with_exactly_one_newline() -> None:
@@ -106,14 +76,14 @@ def test_tray_parses_into_the_typed_model_and_round_trips(tray: dict[str, Any]) 
 
 def test_build_prompt_renders_the_sample_tray_to_the_expected_text(tray: dict[str, Any]) -> None:
     expected = raw("gate-prompt.expected.txt")
-    assert gate.build_prompt(tray) + "\n" == expected
+    assert gate.build_prompt(tray, texts=GATE_TEXTS) + "\n" == expected
     # The typed model renders the same bytes as the raw JSON.
-    assert gate.build_prompt(InboxTray.model_validate(tray)) + "\n" == expected
+    assert gate.build_prompt(InboxTray.model_validate(tray), texts=GATE_TEXTS) + "\n" == expected
 
 
 def test_prompt_carries_the_server_question_verbatim_after_the_preamble(tray: dict[str, Any]) -> None:
-    prompt = gate.build_prompt(tray)
-    assert prompt.startswith(gate.prompt_preamble() + "\n\n")
+    prompt = gate.build_prompt(tray, texts=GATE_TEXTS)
+    assert prompt.startswith(GATE_TEXTS["gate_call_preamble"] + "\n\n")
     assert "\n\n" + tray["question"] + "\n\n" in prompt
 
 

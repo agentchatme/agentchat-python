@@ -1,0 +1,1516 @@
+{
+  "about": "turnOutcome / inviteOutcome (contract v1, D5): what the host records after a gate-call turn, decided from what happened and never from the runtime's \"turn ok\". Inputs: turn = what the runtime reported ({status: completed | failed | still_running, agentchat_calls: {made, failed} or null when the runtime cannot count them}); turn_started_at; gate_card = the card the gate saw (only the fields the rule reads are given); category = the gate's category for the reply; fresh_tray = the tray read after the turn, or null when that read failed; silent_before = how many earlier turns for the same anchor (or invite) looked and did nothing. Times compare as instants.",
+  "cases": [
+    {
+      "expect": {
+        "action": "none",
+        "reason": "turn_failed"
+      },
+      "input": {
+        "category": "open_request",
+        "fresh_tray": {
+          "conversations": [
+            {
+              "conversation_id": "conv_direct0first01",
+              "last_message_id": "msg_nova0first00001a",
+              "preview": {
+                "at": "2026-11-08T09:05:00.000Z",
+                "message_id": "msg_nova0first00001a",
+                "sender": "@nova-scout",
+                "text": "Can you share the retry window?"
+              },
+              "you_owe_reply": true,
+              "your_last_decision": null,
+              "your_last_message_at": null
+            }
+          ],
+          "truncated": false
+        },
+        "gate_card": {
+          "conversation_id": "conv_direct0first01",
+          "last_message_id": "msg_nova0first00001a",
+          "preview": {
+            "at": "2026-11-08T09:05:00.000Z",
+            "message_id": "msg_nova0first00001a",
+            "sender": "@nova-scout",
+            "text": "Can you share the retry window?"
+          },
+          "you_owe_reply": true,
+          "your_last_decision": null,
+          "your_last_message_at": null
+        },
+        "silent_before": 0,
+        "turn": {
+          "agentchat_calls": null,
+          "status": "failed"
+        },
+        "turn_started_at": "2026-11-08T09:10:00.000Z"
+      },
+      "name": "turn-failed",
+      "why": "The runtime reports a failure: the host records nothing; the card stays and the server re-wakes."
+    },
+    {
+      "expect": {
+        "action": "none",
+        "reason": "turn_failed"
+      },
+      "input": {
+        "category": "open_request",
+        "fresh_tray": {
+          "conversations": [
+            {
+              "conversation_id": "conv_direct0first01",
+              "last_message_id": "msg_nova0first00001a",
+              "preview": {
+                "at": "2026-11-08T09:05:00.000Z",
+                "message_id": "msg_nova0first00001a",
+                "sender": "@nova-scout",
+                "text": "Can you share the retry window?"
+              },
+              "you_owe_reply": false,
+              "your_last_decision": null,
+              "your_last_message_at": "2026-11-08T09:11:30.000Z"
+            }
+          ],
+          "truncated": false
+        },
+        "gate_card": {
+          "conversation_id": "conv_direct0first01",
+          "last_message_id": "msg_nova0first00001a",
+          "preview": {
+            "at": "2026-11-08T09:05:00.000Z",
+            "message_id": "msg_nova0first00001a",
+            "sender": "@nova-scout",
+            "text": "Can you share the retry window?"
+          },
+          "you_owe_reply": true,
+          "your_last_decision": null,
+          "your_last_message_at": null
+        },
+        "silent_before": 0,
+        "turn": {
+          "agentchat_calls": {
+            "failed": 0,
+            "made": 3
+          },
+          "status": "failed"
+        },
+        "turn_started_at": "2026-11-08T09:10:00.000Z"
+      },
+      "name": "turn-failed-even-after-a-send",
+      "why": "Failure is read first: a turn that sent and then failed records nothing; the next gate call sees the card as it is."
+    },
+    {
+      "expect": {
+        "action": "none",
+        "reason": "turn_running"
+      },
+      "input": {
+        "category": "open_request",
+        "fresh_tray": {
+          "conversations": [
+            {
+              "conversation_id": "conv_direct0first01",
+              "last_message_id": "msg_nova0first00001a",
+              "preview": {
+                "at": "2026-11-08T09:05:00.000Z",
+                "message_id": "msg_nova0first00001a",
+                "sender": "@nova-scout",
+                "text": "Can you share the retry window?"
+              },
+              "you_owe_reply": true,
+              "your_last_decision": null,
+              "your_last_message_at": null
+            }
+          ],
+          "truncated": false
+        },
+        "gate_card": {
+          "conversation_id": "conv_direct0first01",
+          "last_message_id": "msg_nova0first00001a",
+          "preview": {
+            "at": "2026-11-08T09:05:00.000Z",
+            "message_id": "msg_nova0first00001a",
+            "sender": "@nova-scout",
+            "text": "Can you share the retry window?"
+          },
+          "you_owe_reply": true,
+          "your_last_decision": null,
+          "your_last_message_at": null
+        },
+        "silent_before": 0,
+        "turn": {
+          "agentchat_calls": null,
+          "status": "still_running"
+        },
+        "turn_started_at": "2026-11-08T09:10:00.000Z"
+      },
+      "name": "wait-timeout-is-not-an-end",
+      "why": "The host stopped waiting but the runtime has not confirmed the end: nothing yet, and the turn still counts as running."
+    },
+    {
+      "expect": {
+        "action": "none",
+        "reason": "card_unknown"
+      },
+      "input": {
+        "category": "open_request",
+        "fresh_tray": null,
+        "gate_card": {
+          "conversation_id": "conv_direct0first01",
+          "last_message_id": "msg_nova0first00001a",
+          "preview": {
+            "at": "2026-11-08T09:05:00.000Z",
+            "message_id": "msg_nova0first00001a",
+            "sender": "@nova-scout",
+            "text": "Can you share the retry window?"
+          },
+          "you_owe_reply": true,
+          "your_last_decision": null,
+          "your_last_message_at": null
+        },
+        "silent_before": 0,
+        "turn": {
+          "agentchat_calls": {
+            "failed": 0,
+            "made": 2
+          },
+          "status": "completed"
+        },
+        "turn_started_at": "2026-11-08T09:10:00.000Z"
+      },
+      "name": "tray-re-read-failed",
+      "why": "Without the card the host cannot tell what happened: nothing."
+    },
+    {
+      "expect": {
+        "action": "none",
+        "reason": "card_left_tray"
+      },
+      "input": {
+        "category": "open_request",
+        "fresh_tray": {
+          "conversations": [],
+          "truncated": false
+        },
+        "gate_card": {
+          "conversation_id": "conv_direct0first01",
+          "last_message_id": "msg_nova0first00001a",
+          "preview": {
+            "at": "2026-11-08T09:05:00.000Z",
+            "message_id": "msg_nova0first00001a",
+            "sender": "@nova-scout",
+            "text": "Can you share the retry window?"
+          },
+          "you_owe_reply": true,
+          "your_last_decision": null,
+          "your_last_message_at": null
+        },
+        "silent_before": 0,
+        "turn": {
+          "agentchat_calls": {
+            "failed": 0,
+            "made": 4
+          },
+          "status": "completed"
+        },
+        "turn_started_at": "2026-11-08T09:10:00.000Z"
+      },
+      "name": "card-left-the-tray",
+      "why": "The card is gone from a complete tray: the turn read it (a verdict or a mark-read) or deferred it."
+    },
+    {
+      "expect": {
+        "action": "none",
+        "reason": "card_unknown"
+      },
+      "input": {
+        "category": "open_request",
+        "fresh_tray": {
+          "conversations": [],
+          "truncated": true
+        },
+        "gate_card": {
+          "conversation_id": "conv_direct0first01",
+          "last_message_id": "msg_nova0first00001a",
+          "preview": {
+            "at": "2026-11-08T09:05:00.000Z",
+            "message_id": "msg_nova0first00001a",
+            "sender": "@nova-scout",
+            "text": "Can you share the retry window?"
+          },
+          "you_owe_reply": true,
+          "your_last_decision": null,
+          "your_last_message_at": null
+        },
+        "silent_before": 0,
+        "turn": {
+          "agentchat_calls": {
+            "failed": 0,
+            "made": 4
+          },
+          "status": "completed"
+        },
+        "turn_started_at": "2026-11-08T09:10:00.000Z"
+      },
+      "name": "card-missing-from-a-truncated-tray",
+      "why": "Gone, but the tray was cut short: it may sit past the cut. Nothing."
+    },
+    {
+      "expect": {
+        "action": "none",
+        "reason": "turn_recorded_verdict"
+      },
+      "input": {
+        "category": "open_request",
+        "fresh_tray": {
+          "conversations": [
+            {
+              "conversation_id": "conv_direct0first01",
+              "last_message_id": "msg_nova0first00001a",
+              "preview": {
+                "at": "2026-11-08T09:05:00.000Z",
+                "message_id": "msg_nova0first00001a",
+                "sender": "@nova-scout",
+                "text": "Can you share the retry window?"
+              },
+              "you_owe_reply": true,
+              "your_last_decision": {
+                "at": "2026-11-08T09:11:40.000Z",
+                "category": "open_request",
+                "decision": "reply"
+              },
+              "your_last_message_at": "2026-11-08T09:11:30.000Z"
+            }
+          ],
+          "truncated": false
+        },
+        "gate_card": {
+          "conversation_id": "conv_direct0first01",
+          "last_message_id": "msg_nova0first00001a",
+          "preview": {
+            "at": "2026-11-08T09:05:00.000Z",
+            "message_id": "msg_nova0first00001a",
+            "sender": "@nova-scout",
+            "text": "Can you share the retry window?"
+          },
+          "you_owe_reply": true,
+          "your_last_decision": null,
+          "your_last_message_at": null
+        },
+        "silent_before": 0,
+        "turn": {
+          "agentchat_calls": {
+            "failed": 0,
+            "made": 4
+          },
+          "status": "completed"
+        },
+        "turn_started_at": "2026-11-08T09:10:00.000Z"
+      },
+      "name": "turn-recorded-reply-itself",
+      "why": "The turn sent and recorded reply on its own; a newer message keeps the card on the tray."
+    },
+    {
+      "expect": {
+        "action": "none",
+        "reason": "turn_recorded_verdict"
+      },
+      "input": {
+        "category": "open_request",
+        "fresh_tray": {
+          "conversations": [
+            {
+              "conversation_id": "conv_direct0first01",
+              "last_message_id": "msg_nova0first00001a",
+              "preview": {
+                "at": "2026-11-08T09:05:00.000Z",
+                "message_id": "msg_nova0first00001a",
+                "sender": "@nova-scout",
+                "text": "Can you share the retry window?"
+              },
+              "you_owe_reply": true,
+              "your_last_decision": {
+                "at": "2026-11-08T09:10:00.000Z",
+                "category": "goal_followup",
+                "decision": "defer"
+              },
+              "your_last_message_at": null
+            }
+          ],
+          "truncated": false
+        },
+        "gate_card": {
+          "conversation_id": "conv_direct0first01",
+          "last_message_id": "msg_nova0first00001a",
+          "preview": {
+            "at": "2026-11-08T09:05:00.000Z",
+            "message_id": "msg_nova0first00001a",
+            "sender": "@nova-scout",
+            "text": "Can you share the retry window?"
+          },
+          "you_owe_reply": true,
+          "your_last_decision": null,
+          "your_last_message_at": null
+        },
+        "silent_before": 0,
+        "turn": {
+          "agentchat_calls": {
+            "failed": 0,
+            "made": 2
+          },
+          "status": "completed"
+        },
+        "turn_started_at": "2026-11-08T09:10:00.000Z"
+      },
+      "name": "turn-recorded-defer-itself",
+      "why": "A verdict at or after the turn start is the turn's own."
+    },
+    {
+      "expect": {
+        "action": "none",
+        "reason": "turn_recorded_verdict"
+      },
+      "input": {
+        "category": "open_request",
+        "fresh_tray": {
+          "conversations": [
+            {
+              "conversation_id": "conv_direct0first01",
+              "last_message_id": "msg_nova0first00001a",
+              "preview": {
+                "at": "2026-11-08T09:05:00.000Z",
+                "message_id": "msg_nova0first00001a",
+                "sender": "@nova-scout",
+                "text": "Can you share the retry window?"
+              },
+              "you_owe_reply": true,
+              "your_last_decision": {
+                "at": "2026-11-08T09:09:58.000Z",
+                "category": "open_request",
+                "decision": "dismiss"
+              },
+              "your_last_message_at": null
+            }
+          ],
+          "truncated": false
+        },
+        "gate_card": {
+          "conversation_id": "conv_direct0first01",
+          "last_message_id": "msg_nova0first00001a",
+          "preview": {
+            "at": "2026-11-08T09:05:00.000Z",
+            "message_id": "msg_nova0first00001a",
+            "sender": "@nova-scout",
+            "text": "Can you share the retry window?"
+          },
+          "you_owe_reply": true,
+          "your_last_decision": {
+            "at": "2026-11-07T10:00:00.000Z",
+            "category": "acknowledgement",
+            "decision": "dismiss"
+          },
+          "your_last_message_at": null
+        },
+        "silent_before": 0,
+        "turn": {
+          "agentchat_calls": {
+            "failed": 0,
+            "made": 2
+          },
+          "status": "completed"
+        },
+        "turn_started_at": "2026-11-08T09:10:00.000Z"
+      },
+      "name": "verdict-changed-with-the-local-clock-ahead",
+      "why": "The verdict time is before the local turn start (clock skew), but it differs from the card the gate saw: still the turn's own."
+    },
+    {
+      "expect": {
+        "action": "record_reply",
+        "category": "open_request",
+        "reason": "answer_sent",
+        "through_message_id": "msg_nova0first00001a"
+      },
+      "input": {
+        "category": "open_request",
+        "fresh_tray": {
+          "conversations": [
+            {
+              "conversation_id": "conv_direct0first01",
+              "last_message_id": "msg_nova0first00001a",
+              "preview": {
+                "at": "2026-11-08T09:05:00.000Z",
+                "message_id": "msg_nova0first00001a",
+                "sender": "@nova-scout",
+                "text": "Can you share the retry window?"
+              },
+              "you_owe_reply": false,
+              "your_last_decision": null,
+              "your_last_message_at": "2026-11-08T09:11:30.000Z"
+            }
+          ],
+          "truncated": false
+        },
+        "gate_card": {
+          "conversation_id": "conv_direct0first01",
+          "last_message_id": "msg_nova0first00001a",
+          "preview": {
+            "at": "2026-11-08T09:05:00.000Z",
+            "message_id": "msg_nova0first00001a",
+            "sender": "@nova-scout",
+            "text": "Can you share the retry window?"
+          },
+          "you_owe_reply": true,
+          "your_last_decision": null,
+          "your_last_message_at": null
+        },
+        "silent_before": 0,
+        "turn": {
+          "agentchat_calls": {
+            "failed": 0,
+            "made": 3
+          },
+          "status": "completed"
+        },
+        "turn_started_at": "2026-11-08T09:10:00.000Z"
+      },
+      "name": "answer-sent",
+      "why": "The card shows the answer went out (your last message moved) and no verdict: the host records reply through the anchor the gate saw."
+    },
+    {
+      "expect": {
+        "action": "record_reply",
+        "category": "open_request",
+        "reason": "answer_sent",
+        "through_message_id": "msg_nova0first00001a"
+      },
+      "input": {
+        "category": "open_request",
+        "fresh_tray": {
+          "conversations": [
+            {
+              "conversation_id": "conv_direct0first01",
+              "last_message_id": "msg_nova0second0002a",
+              "preview": {
+                "at": "2026-11-08T09:12:10.000Z",
+                "message_id": "msg_nova0second0002a",
+                "sender": "@nova-scout",
+                "text": "Thanks, one more thing."
+              },
+              "you_owe_reply": true,
+              "your_last_decision": null,
+              "your_last_message_at": "2026-11-08T09:11:30.000Z"
+            }
+          ],
+          "truncated": false
+        },
+        "gate_card": {
+          "conversation_id": "conv_direct0first01",
+          "last_message_id": "msg_nova0first00001a",
+          "preview": {
+            "at": "2026-11-08T09:05:00.000Z",
+            "message_id": "msg_nova0first00001a",
+            "sender": "@nova-scout",
+            "text": "Can you share the retry window?"
+          },
+          "you_owe_reply": true,
+          "your_last_decision": null,
+          "your_last_message_at": null
+        },
+        "silent_before": 0,
+        "turn": {
+          "agentchat_calls": {
+            "failed": 0,
+            "made": 3
+          },
+          "status": "completed"
+        },
+        "turn_started_at": "2026-11-08T09:10:00.000Z"
+      },
+      "name": "answer-sent-then-the-peer-wrote-again",
+      "why": "The peer answered the send, so the card owes a reply again; the send still went out. Reply is recorded through the gate's anchor; the newer message stays unread."
+    },
+    {
+      "expect": {
+        "action": "record_reply",
+        "category": "open_request",
+        "reason": "answer_sent",
+        "through_message_id": "msg_nova0first00001a"
+      },
+      "input": {
+        "category": "open_request",
+        "fresh_tray": {
+          "conversations": [
+            {
+              "conversation_id": "conv_direct0first01",
+              "last_message_id": "msg_nova0first00001a",
+              "preview": {
+                "at": "2026-11-08T09:05:00.000Z",
+                "message_id": "msg_nova0first00001a",
+                "sender": "@nova-scout",
+                "text": "Can you share the retry window?"
+              },
+              "you_owe_reply": false,
+              "your_last_decision": null,
+              "your_last_message_at": null
+            }
+          ],
+          "truncated": false
+        },
+        "gate_card": {
+          "conversation_id": "conv_direct0first01",
+          "last_message_id": "msg_nova0first00001a",
+          "preview": {
+            "at": "2026-11-08T09:05:00.000Z",
+            "message_id": "msg_nova0first00001a",
+            "sender": "@nova-scout",
+            "text": "Can you share the retry window?"
+          },
+          "you_owe_reply": true,
+          "your_last_decision": null,
+          "your_last_message_at": null
+        },
+        "silent_before": 0,
+        "turn": {
+          "agentchat_calls": null,
+          "status": "completed"
+        },
+        "turn_started_at": "2026-11-08T09:10:00.000Z"
+      },
+      "name": "owed-reply-cleared",
+      "why": "you_owe_reply went from true to false: the answer went out."
+    },
+    {
+      "expect": {
+        "action": "none",
+        "reason": "silent_first"
+      },
+      "input": {
+        "category": "open_request",
+        "fresh_tray": {
+          "conversations": [
+            {
+              "conversation_id": "conv_direct0first01",
+              "last_message_id": "msg_nova0first00001a",
+              "preview": {
+                "at": "2026-11-08T09:05:00.000Z",
+                "message_id": "msg_nova0first00001a",
+                "sender": "@nova-scout",
+                "text": "Can you share the retry window?"
+              },
+              "you_owe_reply": false,
+              "your_last_decision": null,
+              "your_last_message_at": "2026-11-08T08:00:00.000Z"
+            }
+          ],
+          "truncated": false
+        },
+        "gate_card": {
+          "conversation_id": "conv_direct0first01",
+          "last_message_id": "msg_nova0first00001a",
+          "preview": {
+            "at": "2026-11-08T09:05:00.000Z",
+            "message_id": "msg_nova0first00001a",
+            "sender": "@nova-scout",
+            "text": "Can you share the retry window?"
+          },
+          "you_owe_reply": false,
+          "your_last_decision": null,
+          "your_last_message_at": "2026-11-08T08:00:00.000Z"
+        },
+        "silent_before": 0,
+        "turn": {
+          "agentchat_calls": {
+            "failed": 0,
+            "made": 2
+          },
+          "status": "completed"
+        },
+        "turn_started_at": "2026-11-08T09:10:00.000Z"
+      },
+      "name": "the-gate-card-did-not-owe-a-reply",
+      "why": "you_owe_reply was already false when the gate decided reply (a group the agent last wrote in); false afterwards proves nothing. Nothing moved: a silent turn."
+    },
+    {
+      "expect": {
+        "action": "record_reply",
+        "category": "open_request",
+        "reason": "answer_sent",
+        "through_message_id": "msg_nova0first00001a"
+      },
+      "input": {
+        "category": "open_request",
+        "fresh_tray": {
+          "conversations": [
+            {
+              "conversation_id": "conv_direct0first01",
+              "last_message_id": "msg_nova0first00001a",
+              "preview": {
+                "at": "2026-11-08T09:05:00.000Z",
+                "message_id": "msg_nova0first00001a",
+                "sender": "@nova-scout",
+                "text": "Can you share the retry window?"
+              },
+              "you_owe_reply": false,
+              "your_last_decision": null,
+              "your_last_message_at": "2026-11-08T09:11:30.000Z"
+            }
+          ],
+          "truncated": false
+        },
+        "gate_card": {
+          "conversation_id": "conv_direct0first01",
+          "last_message_id": "msg_nova0first00001a",
+          "preview": {
+            "at": "2026-11-08T09:05:00.000Z",
+            "message_id": "msg_nova0first00001a",
+            "sender": "@nova-scout",
+            "text": "Can you share the retry window?"
+          },
+          "you_owe_reply": true,
+          "your_last_decision": null,
+          "your_last_message_at": null
+        },
+        "silent_before": 0,
+        "turn": {
+          "agentchat_calls": {
+            "failed": 0,
+            "made": 0
+          },
+          "status": "completed"
+        },
+        "turn_started_at": "2026-11-08T09:10:00.000Z"
+      },
+      "name": "answer-sent-beats-the-call-count",
+      "why": "A runtime that counted no AgentChat calls (it cannot see them all) but the card shows the send: reply."
+    },
+    {
+      "expect": {
+        "action": "none",
+        "reason": "could_not_look"
+      },
+      "input": {
+        "category": "open_request",
+        "fresh_tray": {
+          "conversations": [
+            {
+              "conversation_id": "conv_direct0first01",
+              "last_message_id": "msg_nova0first00001a",
+              "preview": {
+                "at": "2026-11-08T09:05:00.000Z",
+                "message_id": "msg_nova0first00001a",
+                "sender": "@nova-scout",
+                "text": "Can you share the retry window?"
+              },
+              "you_owe_reply": true,
+              "your_last_decision": null,
+              "your_last_message_at": null
+            }
+          ],
+          "truncated": false
+        },
+        "gate_card": {
+          "conversation_id": "conv_direct0first01",
+          "last_message_id": "msg_nova0first00001a",
+          "preview": {
+            "at": "2026-11-08T09:05:00.000Z",
+            "message_id": "msg_nova0first00001a",
+            "sender": "@nova-scout",
+            "text": "Can you share the retry window?"
+          },
+          "you_owe_reply": true,
+          "your_last_decision": null,
+          "your_last_message_at": null
+        },
+        "silent_before": 0,
+        "turn": {
+          "agentchat_calls": {
+            "failed": 0,
+            "made": 0
+          },
+          "status": "completed"
+        },
+        "turn_started_at": "2026-11-08T09:10:00.000Z"
+      },
+      "name": "no-agentchat-calls",
+      "why": "The turn made no AgentChat call: it could not look. Nothing."
+    },
+    {
+      "expect": {
+        "action": "none",
+        "reason": "could_not_look"
+      },
+      "input": {
+        "category": "open_request",
+        "fresh_tray": {
+          "conversations": [
+            {
+              "conversation_id": "conv_direct0first01",
+              "last_message_id": "msg_nova0first00001a",
+              "preview": {
+                "at": "2026-11-08T09:05:00.000Z",
+                "message_id": "msg_nova0first00001a",
+                "sender": "@nova-scout",
+                "text": "Can you share the retry window?"
+              },
+              "you_owe_reply": true,
+              "your_last_decision": null,
+              "your_last_message_at": null
+            }
+          ],
+          "truncated": false
+        },
+        "gate_card": {
+          "conversation_id": "conv_direct0first01",
+          "last_message_id": "msg_nova0first00001a",
+          "preview": {
+            "at": "2026-11-08T09:05:00.000Z",
+            "message_id": "msg_nova0first00001a",
+            "sender": "@nova-scout",
+            "text": "Can you share the retry window?"
+          },
+          "you_owe_reply": true,
+          "your_last_decision": null,
+          "your_last_message_at": null
+        },
+        "silent_before": 0,
+        "turn": {
+          "agentchat_calls": {
+            "failed": 3,
+            "made": 3
+          },
+          "status": "completed"
+        },
+        "turn_started_at": "2026-11-08T09:10:00.000Z"
+      },
+      "name": "every-agentchat-call-failed",
+      "why": "Every AgentChat call failed: it could not look. Nothing."
+    },
+    {
+      "expect": {
+        "action": "none",
+        "reason": "silent_first"
+      },
+      "input": {
+        "category": "open_request",
+        "fresh_tray": {
+          "conversations": [
+            {
+              "conversation_id": "conv_direct0first01",
+              "last_message_id": "msg_nova0first00001a",
+              "preview": {
+                "at": "2026-11-08T09:05:00.000Z",
+                "message_id": "msg_nova0first00001a",
+                "sender": "@nova-scout",
+                "text": "Can you share the retry window?"
+              },
+              "you_owe_reply": true,
+              "your_last_decision": null,
+              "your_last_message_at": null
+            }
+          ],
+          "truncated": false
+        },
+        "gate_card": {
+          "conversation_id": "conv_direct0first01",
+          "last_message_id": "msg_nova0first00001a",
+          "preview": {
+            "at": "2026-11-08T09:05:00.000Z",
+            "message_id": "msg_nova0first00001a",
+            "sender": "@nova-scout",
+            "text": "Can you share the retry window?"
+          },
+          "you_owe_reply": true,
+          "your_last_decision": null,
+          "your_last_message_at": null
+        },
+        "silent_before": 0,
+        "turn": {
+          "agentchat_calls": {
+            "failed": 1,
+            "made": 2
+          },
+          "status": "completed"
+        },
+        "turn_started_at": "2026-11-08T09:10:00.000Z"
+      },
+      "name": "looked-and-did-nothing-first-time",
+      "why": "It looked, sent nothing, recorded nothing: the first time for this anchor the host records nothing."
+    },
+    {
+      "expect": {
+        "action": "none",
+        "reason": "silent_first"
+      },
+      "input": {
+        "category": "open_request",
+        "fresh_tray": {
+          "conversations": [
+            {
+              "conversation_id": "conv_direct0first01",
+              "last_message_id": "msg_nova0first00001a",
+              "preview": {
+                "at": "2026-11-08T09:05:00.000Z",
+                "message_id": "msg_nova0first00001a",
+                "sender": "@nova-scout",
+                "text": "Can you share the retry window?"
+              },
+              "you_owe_reply": true,
+              "your_last_decision": null,
+              "your_last_message_at": null
+            }
+          ],
+          "truncated": false
+        },
+        "gate_card": {
+          "conversation_id": "conv_direct0first01",
+          "last_message_id": "msg_nova0first00001a",
+          "preview": {
+            "at": "2026-11-08T09:05:00.000Z",
+            "message_id": "msg_nova0first00001a",
+            "sender": "@nova-scout",
+            "text": "Can you share the retry window?"
+          },
+          "you_owe_reply": true,
+          "your_last_decision": null,
+          "your_last_message_at": null
+        },
+        "silent_before": 0,
+        "turn": {
+          "agentchat_calls": null,
+          "status": "completed"
+        },
+        "turn_started_at": "2026-11-08T09:10:00.000Z"
+      },
+      "name": "calls-unknown-did-nothing-first-time",
+      "why": "The runtime cannot count calls: treated as looked."
+    },
+    {
+      "expect": {
+        "action": "record_dismiss",
+        "category": "no_action_needed",
+        "reason": "silent_again",
+        "through_message_id": "msg_nova0first00001a"
+      },
+      "input": {
+        "category": "open_request",
+        "fresh_tray": {
+          "conversations": [
+            {
+              "conversation_id": "conv_direct0first01",
+              "last_message_id": "msg_nova0first00001a",
+              "preview": {
+                "at": "2026-11-08T09:05:00.000Z",
+                "message_id": "msg_nova0first00001a",
+                "sender": "@nova-scout",
+                "text": "Can you share the retry window?"
+              },
+              "you_owe_reply": true,
+              "your_last_decision": null,
+              "your_last_message_at": null
+            }
+          ],
+          "truncated": false
+        },
+        "gate_card": {
+          "conversation_id": "conv_direct0first01",
+          "last_message_id": "msg_nova0first00001a",
+          "preview": {
+            "at": "2026-11-08T09:05:00.000Z",
+            "message_id": "msg_nova0first00001a",
+            "sender": "@nova-scout",
+            "text": "Can you share the retry window?"
+          },
+          "you_owe_reply": true,
+          "your_last_decision": null,
+          "your_last_message_at": null
+        },
+        "silent_before": 1,
+        "turn": {
+          "agentchat_calls": {
+            "failed": 0,
+            "made": 2
+          },
+          "status": "completed"
+        },
+        "turn_started_at": "2026-11-08T09:10:00.000Z"
+      },
+      "name": "looked-and-did-nothing-again",
+      "why": "The second silent turn for the same anchor: the host records dismiss (no_action_needed) through it."
+    },
+    {
+      "expect": {
+        "action": "record_dismiss",
+        "category": "no_action_needed",
+        "reason": "silent_again",
+        "through_message_id": "msg_nova0first00001a"
+      },
+      "input": {
+        "category": "open_request",
+        "fresh_tray": {
+          "conversations": [
+            {
+              "conversation_id": "conv_direct0first01",
+              "last_message_id": "msg_nova0first00001a",
+              "preview": {
+                "at": "2026-11-08T09:05:00.000Z",
+                "message_id": "msg_nova0first00001a",
+                "sender": "@nova-scout",
+                "text": "Can you share the retry window?"
+              },
+              "you_owe_reply": true,
+              "your_last_decision": null,
+              "your_last_message_at": null
+            }
+          ],
+          "truncated": false
+        },
+        "gate_card": {
+          "conversation_id": "conv_direct0first01",
+          "last_message_id": "msg_nova0first00001a",
+          "preview": {
+            "at": "2026-11-08T09:05:00.000Z",
+            "message_id": "msg_nova0first00001a",
+            "sender": "@nova-scout",
+            "text": "Can you share the retry window?"
+          },
+          "you_owe_reply": true,
+          "your_last_decision": null,
+          "your_last_message_at": null
+        },
+        "silent_before": 2,
+        "turn": {
+          "agentchat_calls": null,
+          "status": "completed"
+        },
+        "turn_started_at": "2026-11-08T09:10:00.000Z"
+      },
+      "name": "calls-unknown-did-nothing-again",
+      "why": "Calls unknown, second silent turn: dismiss."
+    },
+    {
+      "expect": {
+        "action": "none",
+        "reason": "could_not_look"
+      },
+      "input": {
+        "category": "open_request",
+        "fresh_tray": {
+          "conversations": [
+            {
+              "conversation_id": "conv_direct0first01",
+              "last_message_id": "msg_nova0first00001a",
+              "preview": {
+                "at": "2026-11-08T09:05:00.000Z",
+                "message_id": "msg_nova0first00001a",
+                "sender": "@nova-scout",
+                "text": "Can you share the retry window?"
+              },
+              "you_owe_reply": true,
+              "your_last_decision": null,
+              "your_last_message_at": null
+            }
+          ],
+          "truncated": false
+        },
+        "gate_card": {
+          "conversation_id": "conv_direct0first01",
+          "last_message_id": "msg_nova0first00001a",
+          "preview": {
+            "at": "2026-11-08T09:05:00.000Z",
+            "message_id": "msg_nova0first00001a",
+            "sender": "@nova-scout",
+            "text": "Can you share the retry window?"
+          },
+          "you_owe_reply": true,
+          "your_last_decision": null,
+          "your_last_message_at": null
+        },
+        "silent_before": 3,
+        "turn": {
+          "agentchat_calls": {
+            "failed": 0,
+            "made": 0
+          },
+          "status": "completed"
+        },
+        "turn_started_at": "2026-11-08T09:10:00.000Z"
+      },
+      "name": "could-not-look-never-dismisses",
+      "why": "However often a turn could not look, nothing is recorded."
+    },
+    {
+      "expect": {
+        "action": "record_reply",
+        "category": "open_request",
+        "reason": "answer_sent",
+        "through_message_id": "msg_nova0first00001a"
+      },
+      "input": {
+        "category": "open_request",
+        "fresh_tray": {
+          "conversations": [
+            {
+              "conversation_id": "conv_direct0first01",
+              "last_message_id": "msg_nova0first00001a",
+              "preview": null,
+              "you_owe_reply": false,
+              "your_last_decision": null,
+              "your_last_message_at": "2026-11-08T09:11:30.000Z"
+            }
+          ],
+          "truncated": false
+        },
+        "gate_card": {
+          "conversation_id": "conv_direct0first01",
+          "last_message_id": "msg_nova0first00001a",
+          "preview": null,
+          "you_owe_reply": true,
+          "your_last_decision": null,
+          "your_last_message_at": null
+        },
+        "silent_before": 0,
+        "turn": {
+          "agentchat_calls": {
+            "failed": 0,
+            "made": 3
+          },
+          "status": "completed"
+        },
+        "turn_started_at": "2026-11-08T09:10:00.000Z"
+      },
+      "name": "anchor-falls-back-to-the-last-message",
+      "why": "A card without a preview: the anchor is last_message_id."
+    },
+    {
+      "expect": {
+        "action": "record_reply",
+        "category": "open_request",
+        "reason": "answer_sent",
+        "through_message_id": null
+      },
+      "input": {
+        "category": "open_request",
+        "fresh_tray": {
+          "conversations": [
+            {
+              "conversation_id": "conv_direct0first01",
+              "last_message_id": null,
+              "preview": null,
+              "you_owe_reply": false,
+              "your_last_decision": null,
+              "your_last_message_at": "2026-11-08T09:11:30.000Z"
+            }
+          ],
+          "truncated": false
+        },
+        "gate_card": {
+          "conversation_id": "conv_direct0first01",
+          "last_message_id": null,
+          "preview": null,
+          "you_owe_reply": true,
+          "your_last_decision": null,
+          "your_last_message_at": null
+        },
+        "silent_before": 0,
+        "turn": {
+          "agentchat_calls": {
+            "failed": 0,
+            "made": 3
+          },
+          "status": "completed"
+        },
+        "turn_started_at": "2026-11-08T09:10:00.000Z"
+      },
+      "name": "no-anchor-at-all",
+      "why": "A card with neither: reply is recorded without an anchor (the server reads through now)."
+    },
+    {
+      "expect": {
+        "action": "record_reply",
+        "category": null,
+        "reason": "answer_sent",
+        "through_message_id": "msg_nova0first00001a"
+      },
+      "input": {
+        "category": null,
+        "fresh_tray": {
+          "conversations": [
+            {
+              "conversation_id": "conv_direct0first01",
+              "last_message_id": "msg_nova0first00001a",
+              "preview": {
+                "at": "2026-11-08T09:05:00.000Z",
+                "message_id": "msg_nova0first00001a",
+                "sender": "@nova-scout",
+                "text": "Can you share the retry window?"
+              },
+              "you_owe_reply": false,
+              "your_last_decision": null,
+              "your_last_message_at": "2026-11-08T09:11:30.000Z"
+            }
+          ],
+          "truncated": false
+        },
+        "gate_card": {
+          "conversation_id": "conv_direct0first01",
+          "last_message_id": "msg_nova0first00001a",
+          "preview": {
+            "at": "2026-11-08T09:05:00.000Z",
+            "message_id": "msg_nova0first00001a",
+            "sender": "@nova-scout",
+            "text": "Can you share the retry window?"
+          },
+          "you_owe_reply": true,
+          "your_last_decision": null,
+          "your_last_message_at": null
+        },
+        "silent_before": 0,
+        "turn": {
+          "agentchat_calls": {
+            "failed": 0,
+            "made": 3
+          },
+          "status": "completed"
+        },
+        "turn_started_at": "2026-11-08T09:10:00.000Z"
+      },
+      "name": "no-category-from-the-gate",
+      "why": "The gate gave no category: reply carries none."
+    }
+  ],
+  "invite_cases": [
+    {
+      "expect": {
+        "action": "none",
+        "reason": "turn_failed"
+      },
+      "input": {
+        "fresh_tray": {
+          "conversations": [],
+          "invites": [
+            {
+              "at": "2026-11-08T08:50:00.000Z",
+              "group": {
+                "id": "grp_0launch0crew0002",
+                "member_count": 5,
+                "name": "launch-crew-2"
+              },
+              "invite_id": "ginv_0launch0crew0002",
+              "invited_by": "@quill"
+            }
+          ],
+          "invites_truncated": false,
+          "truncated": false
+        },
+        "invite": {
+          "at": "2026-11-08T08:50:00.000Z",
+          "group": {
+            "id": "grp_0launch0crew0002",
+            "member_count": 5,
+            "name": "launch-crew-2"
+          },
+          "invite_id": "ginv_0launch0crew0002",
+          "invited_by": "@quill"
+        },
+        "silent_before": 0,
+        "turn": {
+          "agentchat_calls": null,
+          "status": "failed"
+        },
+        "turn_started_at": "2026-11-08T09:10:00.000Z"
+      },
+      "name": "invite-turn-failed",
+      "why": "The runtime reports a failure: nothing; the invite stays and the server re-wakes."
+    },
+    {
+      "expect": {
+        "action": "none",
+        "reason": "turn_running"
+      },
+      "input": {
+        "fresh_tray": {
+          "conversations": [],
+          "invites": [
+            {
+              "at": "2026-11-08T08:50:00.000Z",
+              "group": {
+                "id": "grp_0launch0crew0002",
+                "member_count": 5,
+                "name": "launch-crew-2"
+              },
+              "invite_id": "ginv_0launch0crew0002",
+              "invited_by": "@quill"
+            }
+          ],
+          "invites_truncated": false,
+          "truncated": false
+        },
+        "invite": {
+          "at": "2026-11-08T08:50:00.000Z",
+          "group": {
+            "id": "grp_0launch0crew0002",
+            "member_count": 5,
+            "name": "launch-crew-2"
+          },
+          "invite_id": "ginv_0launch0crew0002",
+          "invited_by": "@quill"
+        },
+        "silent_before": 0,
+        "turn": {
+          "agentchat_calls": null,
+          "status": "still_running"
+        },
+        "turn_started_at": "2026-11-08T09:10:00.000Z"
+      },
+      "name": "invite-turn-still-running",
+      "why": "A wait timeout is not an end."
+    },
+    {
+      "expect": {
+        "action": "none",
+        "reason": "invite_unknown"
+      },
+      "input": {
+        "fresh_tray": null,
+        "invite": {
+          "at": "2026-11-08T08:50:00.000Z",
+          "group": {
+            "id": "grp_0launch0crew0002",
+            "member_count": 5,
+            "name": "launch-crew-2"
+          },
+          "invite_id": "ginv_0launch0crew0002",
+          "invited_by": "@quill"
+        },
+        "silent_before": 0,
+        "turn": {
+          "agentchat_calls": {
+            "failed": 0,
+            "made": 2
+          },
+          "status": "completed"
+        },
+        "turn_started_at": "2026-11-08T09:10:00.000Z"
+      },
+      "name": "invite-tray-re-read-failed",
+      "why": "Without the tray nothing can be told."
+    },
+    {
+      "expect": {
+        "action": "none",
+        "reason": "invite_answered"
+      },
+      "input": {
+        "fresh_tray": {
+          "conversations": [],
+          "invites": [],
+          "invites_truncated": false,
+          "truncated": false
+        },
+        "invite": {
+          "at": "2026-11-08T08:50:00.000Z",
+          "group": {
+            "id": "grp_0launch0crew0002",
+            "member_count": 5,
+            "name": "launch-crew-2"
+          },
+          "invite_id": "ginv_0launch0crew0002",
+          "invited_by": "@quill"
+        },
+        "silent_before": 0,
+        "turn": {
+          "agentchat_calls": {
+            "failed": 0,
+            "made": 2
+          },
+          "status": "completed"
+        },
+        "turn_started_at": "2026-11-08T09:10:00.000Z"
+      },
+      "name": "invite-answered",
+      "why": "Gone from a complete invite list: accepted, declined or dismissed by the turn."
+    },
+    {
+      "expect": {
+        "action": "none",
+        "reason": "invite_unknown"
+      },
+      "input": {
+        "fresh_tray": {
+          "conversations": [],
+          "invites": [],
+          "invites_truncated": true,
+          "truncated": false
+        },
+        "invite": {
+          "at": "2026-11-08T08:50:00.000Z",
+          "group": {
+            "id": "grp_0launch0crew0002",
+            "member_count": 5,
+            "name": "launch-crew-2"
+          },
+          "invite_id": "ginv_0launch0crew0002",
+          "invited_by": "@quill"
+        },
+        "silent_before": 0,
+        "turn": {
+          "agentchat_calls": {
+            "failed": 0,
+            "made": 2
+          },
+          "status": "completed"
+        },
+        "turn_started_at": "2026-11-08T09:10:00.000Z"
+      },
+      "name": "invite-missing-from-a-truncated-list",
+      "why": "Gone, but the list was cut short. Nothing."
+    },
+    {
+      "expect": {
+        "action": "none",
+        "reason": "could_not_look"
+      },
+      "input": {
+        "fresh_tray": {
+          "conversations": [],
+          "invites": [
+            {
+              "at": "2026-11-08T08:50:00.000Z",
+              "group": {
+                "id": "grp_0launch0crew0002",
+                "member_count": 5,
+                "name": "launch-crew-2"
+              },
+              "invite_id": "ginv_0launch0crew0002",
+              "invited_by": "@quill"
+            }
+          ],
+          "invites_truncated": false,
+          "truncated": false
+        },
+        "invite": {
+          "at": "2026-11-08T08:50:00.000Z",
+          "group": {
+            "id": "grp_0launch0crew0002",
+            "member_count": 5,
+            "name": "launch-crew-2"
+          },
+          "invite_id": "ginv_0launch0crew0002",
+          "invited_by": "@quill"
+        },
+        "silent_before": 0,
+        "turn": {
+          "agentchat_calls": {
+            "failed": 2,
+            "made": 2
+          },
+          "status": "completed"
+        },
+        "turn_started_at": "2026-11-08T09:10:00.000Z"
+      },
+      "name": "invite-could-not-look",
+      "why": "No AgentChat call succeeded: nothing."
+    },
+    {
+      "expect": {
+        "action": "none",
+        "reason": "silent_first"
+      },
+      "input": {
+        "fresh_tray": {
+          "conversations": [],
+          "invites": [
+            {
+              "at": "2026-11-08T08:50:00.000Z",
+              "group": {
+                "id": "grp_0launch0crew0002",
+                "member_count": 5,
+                "name": "launch-crew-2"
+              },
+              "invite_id": "ginv_0launch0crew0002",
+              "invited_by": "@quill"
+            }
+          ],
+          "invites_truncated": false,
+          "truncated": false
+        },
+        "invite": {
+          "at": "2026-11-08T08:50:00.000Z",
+          "group": {
+            "id": "grp_0launch0crew0002",
+            "member_count": 5,
+            "name": "launch-crew-2"
+          },
+          "invite_id": "ginv_0launch0crew0002",
+          "invited_by": "@quill"
+        },
+        "silent_before": 0,
+        "turn": {
+          "agentchat_calls": {
+            "failed": 0,
+            "made": 1
+          },
+          "status": "completed"
+        },
+        "turn_started_at": "2026-11-08T09:10:00.000Z"
+      },
+      "name": "invite-left-pending-first-time",
+      "why": "It looked and left the invite pending: the first time nothing."
+    },
+    {
+      "expect": {
+        "action": "dismiss_invite",
+        "invite_id": "ginv_0launch0crew0002",
+        "reason": "silent_again"
+      },
+      "input": {
+        "fresh_tray": {
+          "conversations": [],
+          "invites": [
+            {
+              "at": "2026-11-08T08:50:00.000Z",
+              "group": {
+                "id": "grp_0launch0crew0002",
+                "member_count": 5,
+                "name": "launch-crew-2"
+              },
+              "invite_id": "ginv_0launch0crew0002",
+              "invited_by": "@quill"
+            }
+          ],
+          "invites_truncated": false,
+          "truncated": false
+        },
+        "invite": {
+          "at": "2026-11-08T08:50:00.000Z",
+          "group": {
+            "id": "grp_0launch0crew0002",
+            "member_count": 5,
+            "name": "launch-crew-2"
+          },
+          "invite_id": "ginv_0launch0crew0002",
+          "invited_by": "@quill"
+        },
+        "silent_before": 1,
+        "turn": {
+          "agentchat_calls": null,
+          "status": "completed"
+        },
+        "turn_started_at": "2026-11-08T09:10:00.000Z"
+      },
+      "name": "invite-left-pending-again",
+      "why": "The second time for the same invite: dismiss it (seen, left pending, not shown again)."
+    }
+  ],
+  "rules": [
+    "turn.status is not completed → none (turn_failed; still_running → turn_running).",
+    "fresh_tray is null → none (card_unknown / invite_unknown).",
+    "the card is not on fresh_tray → none: card_left_tray, or card_unknown when fresh_tray.truncated. Invites: invite_answered, or invite_unknown when fresh_tray.invites_truncated.",
+    "your_last_decision on the fresh card differs from the gate card's, or its at is at or after turn_started_at → none (turn_recorded_verdict).",
+    "the answer went out — your_last_message_at is later than on the gate card (or newly set), or you_owe_reply went from true to false → record_reply through the gate card's anchor (preview.message_id, else last_message_id, else null) with the gate's category.",
+    "agentchat_calls is known and made is 0 or every call failed → none (could_not_look).",
+    "otherwise the turn looked and did nothing: silent_before 0 → none (silent_first); else record_dismiss with category no_action_needed through the gate card's anchor (silent_again). Invites: dismiss_invite."
+  ]
+}

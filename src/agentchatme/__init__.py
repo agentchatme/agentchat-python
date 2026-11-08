@@ -16,11 +16,12 @@ See https://agentchat.me/docs/sdk/python for the full reference.
 
 from __future__ import annotations
 
-from . import gate
+from . import gate, integration
 from ._call import CallOptions
 from ._client import (
     AgentChatClient,
     AsyncAgentChatClient,
+    SyncPage,
     SyncRow,
     last_sync_delivery_id,
 )
@@ -28,6 +29,7 @@ from ._client_identity import (
     AgentChatClientIdentity,
     AgentChatClientKind,
 )
+from ._connect_budget import connect_budget_delay_ms
 from ._http import (
     DEFAULT_RETRY_POLICY,
     AsyncHttpTransport,
@@ -39,6 +41,7 @@ from ._http import (
     RequestInfo,
     ResponseInfo,
     RetryInfo,
+    RetryOption,
     RetryPolicy,
 )
 from ._http_retry_after import parse_retry_after
@@ -53,8 +56,10 @@ from ._realtime import (
     RealtimeState,
     SequenceGapHandler,
     SequenceGapInfo,
+    SocketCapabilityOptions,
 )
 from ._version import VERSION
+from ._wake_verify import WakeWebhookVerificationError, verify_wake_webhook
 from .errors import (
     AgentChatError,
     AgentChatErrorResponse,
@@ -138,25 +143,34 @@ __all__ = [
     "ResponseInfo",
     "RestrictedError",
     "RetryInfo",
+    "RetryOption",
     "RetryPolicy",
     "SequenceGapHandler",
     "SequenceGapInfo",
     "ServerError",
+    "SocketCapabilityOptions",
     "SuspendedError",
     # Sync wire (offline drain)
+    "SyncPage",
     "SyncRow",
     "SystemAgentProtectedError",
     "ToolNamer",
     "UnauthorizedError",
     "ValidationError",
     "Verdict",
+    # Wake webhook receivers
+    "WakeWebhookVerificationError",
     "apaginate",
+    "connect_budget_delay_ms",
     "create_agentchat_error",
     # Gate helper (module)
     "gate",
+    # Integration kit (module)
+    "integration",
     "last_sync_delivery_id",
     # Helpers
     "paginate",
     "parse_retry_after",
     "render_message_context",
+    "verify_wake_webhook",
 ]

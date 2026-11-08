@@ -9,7 +9,9 @@ from typing import Any
 import pytest
 
 from agentchatme import GateResult, gate
-from agentchatme.types import InboxCard, InboxTray, ReplyDecision
+from agentchatme.types import InboxCard, InboxTray, ReplyDecision, Texts
+
+from ._texts import GATE_CALL_ANSWER_FORMAT, GATE_CALL_PREAMBLE, GATE_TEXTS, texts
 
 FIXTURES = Path(__file__).resolve().parent.parent / "conformance" / "v1"
 
@@ -71,60 +73,93 @@ class FakeClient:
 # ─────────────── build_prompt ───────────────
 
 
-def test_prompt_opens_with_the_preamble_then_the_served_question() -> None:
+def test_prompt_opens_with_the_served_preamble_then_the_served_question() -> None:
     tray = sample_tray()
-    prompt = gate.build_prompt(tray)
-    assert prompt.startswith(gate.prompt_preamble() + "\n\n" + tray["question"] + "\n\n")
-    assert "do not call agentchat_decide," in gate.prompt_preamble()
-    # The preamble names the verdict tool the way the runtime spells it.
-    named = gate.build_prompt(tray, tool_namer=gate.mcp_tool_namer("ac"))
-    assert named.startswith(gate.prompt_preamble(gate.mcp_tool_namer("ac")))
-    assert "do not call mcp__ac__agentchat_decide," in named
+    prompt = gate.build_prompt(tray, texts=GATE_TEXTS)
+    assert prompt.startswith(GATE_CALL_PREAMBLE + "\n\n" + tray["question"] + "\n\n")
+    assert prompt.endswith("\n\n" + GATE_CALL_ANSWER_FORMAT)
+    # The served preamble comes spelled for the runtime already: verbatim.
+    named = gate.build_prompt(tray, tool_namer=gate.mcp_tool_namer("ac"), texts=GATE_TEXTS)
+    assert named.startswith(GATE_CALL_PREAMBLE + "\n\n")
 
 
 def test_tool_namer_respells_hosted_tool_names_and_nothing_else() -> None:
     tray = sample_tray()
-    named = gate.build_prompt(tray, tool_namer=gate.mcp_tool_namer("agentchat"))
+    named = gate.build_prompt(tray, tool_namer=gate.mcp_tool_namer("agentchat"), texts=GATE_TEXTS)
     assert "mcp__agentchat__agentchat_decide" in named
-    assert " agentchat_decide " not in named
-    # The preamble and the question are re-spelled; the card JSON is untouched.
-    assert named.count("mcp__agentchat__") == tray["question"].count("agentchat_decide") + 1
-    assert gate.build_prompt(tray, tool_namer=gate.bare_tool_namer) == gate.build_prompt(tray)
+    # Only the tray's question is re-spelled; the served texts and the card
+    # JSON are untouched.
+    assert named.count("mcp__agentchat__") == tray["question"].count("agentchat_decide")
+    assert gate.build_prompt(tray, tool_namer=gate.bare_tool_namer, texts=GATE_TEXTS) == (
+        gate.build_prompt(tray, texts=GATE_TEXTS)
+    )
+
+
+def test_names_the_server_already_spelled_for_the_runtime_are_left_alone() -> None:
+    spelled = texts(
+        gate_call_preamble=GATE_CALL_PREAMBLE.replace(
+            "agentchat_decide", "mcp__agentchat__agentchat_decide"
+        )
+    )
+    prompt = gate.build_prompt(
+        sample_tray(), tool_namer=gate.mcp_tool_namer("agentchat"), texts=spelled
+    )
+    assert "do not call mcp__agentchat__agentchat_decide," in prompt
+    assert "mcp__agentchat__mcp__agentchat__" not in prompt
 
 
 def test_build_prompt_raises_without_a_question() -> None:
     tray = sample_tray()
     tray["question"] = "   "
     with pytest.raises(ValueError, match="no question"):
-        gate.build_prompt(tray)
+        gate.build_prompt(tray, texts=GATE_TEXTS)
 
 
-def test_build_prompt_omits_categories_when_the_server_serves_none() -> None:
+@pytest.mark.parametrize(
+    "served",
+    [
+        None,
+        texts(gate_call_preamble=None),
+        texts(gate_call_answer_format="  "),
+        {k: v for k, v in GATE_TEXTS.items() if k != "gate_call_preamble"},
+    ],
+)
+def test_build_prompt_fails_closed_without_the_served_gate_call_texts(served: Any) -> None:
+    with pytest.raises(ValueError, match="gate_call"):
+        gate.build_prompt(sample_tray(), texts=served)
+
+
+def test_build_prompt_takes_typed_texts() -> None:
+    typed = Texts.model_validate(GATE_TEXTS)
+    assert gate.build_prompt(sample_tray(), texts=typed) == gate.build_prompt(
+        sample_tray(), texts=GATE_TEXTS
+    )
+
+
+def test_build_prompt_omits_the_categories_line_when_the_server_serves_none() -> None:
     tray = sample_tray()
     tray["categories"] = []
-    prompt = gate.build_prompt(tray)
+    prompt = gate.build_prompt(tray, texts=GATE_TEXTS)
     assert "Categories:" not in prompt
-    assert '"category": "<one of' not in prompt
-    assert prompt.endswith('"decision": "reply" | "dismiss" | "defer"}]} — one entry per card, every card decided.')
 
 
 def test_build_prompt_sorts_card_keys_regardless_of_server_order() -> None:
     tray = sample_tray()
     shuffled = dict(reversed(list(tray["conversations"][0].items())))
     tray["conversations"][0] = shuffled
-    assert gate.build_prompt(tray) == gate.build_prompt(sample_tray())
+    assert gate.build_prompt(tray, texts=GATE_TEXTS) == gate.build_prompt(sample_tray(), texts=GATE_TEXTS)
 
 
 def test_build_prompt_counts_cards_in_the_singular() -> None:
     tray = sample_tray()
     tray["conversations"] = tray["conversations"][:1]
-    assert "Your tray, as the server built it: 1 conversation." in gate.build_prompt(tray)
-    assert "Card 1 of 1" in gate.build_prompt(tray)
+    assert "Your tray, as the server built it: 1 conversation." in gate.build_prompt(tray, texts=GATE_TEXTS)
+    assert "Card 1 of 1" in gate.build_prompt(tray, texts=GATE_TEXTS)
 
 
 def test_build_prompt_rejects_other_tray_types() -> None:
     with pytest.raises(TypeError):
-        gate.build_prompt("not a tray")  # type: ignore[arg-type]
+        gate.build_prompt("not a tray", texts=GATE_TEXTS)  # type: ignore[arg-type]
 
 
 # ─────────────── run ───────────────
@@ -146,9 +181,9 @@ def test_run_records_dismiss_and_defer_at_once_and_hands_reply_back_with_a_recor
             ]
         )
 
-    result = gate.run(tray, call_model, FakeClient(decisions))  # type: ignore[arg-type]
+    result = gate.run(tray, call_model, FakeClient(decisions), texts=GATE_TEXTS)  # type: ignore[arg-type]
 
-    assert prompts == [gate.build_prompt(tray)]
+    assert prompts == [gate.build_prompt(tray, texts=GATE_TEXTS)]
     assert isinstance(result, GateResult)
     assert result.outcome == "decided"
     assert result.undecided == []
@@ -184,6 +219,7 @@ def test_reply_record_raises_what_the_client_raises_and_may_be_retried() -> None
         sample_tray(),
         lambda _p: answer([{"conversation_id": IDS["direct"], "decision": "reply"}]),
         FakeClient(decisions),  # type: ignore[arg-type]
+        texts=GATE_TEXTS,
     )
     assert result.outcome == "decided"
     assert result.recorded == 0 and result.record_failures == []
@@ -226,6 +262,7 @@ def test_reply_anchor_falls_back_to_last_message_id_when_the_preview_is_null() -
             ]
         ),
         FakeClient(decisions),  # type: ignore[arg-type]
+        texts=GATE_TEXTS,
     )
     assert result.reply[0].anchor_message_id == "msg_fallback0001"
     result.reply[0].record()
@@ -247,6 +284,7 @@ def test_run_passes_the_namer_through_to_the_prompt() -> None:
         call_model,
         FakeClient(FakeDecisions()),  # type: ignore[arg-type]
         tool_namer=gate.mcp_tool_namer("ac"),
+        texts=GATE_TEXTS,
     )
     assert "mcp__ac__agentchat_decide" in prompts[0]
 
@@ -257,7 +295,7 @@ def test_run_records_nothing_and_fails_closed_when_the_model_call_raises() -> No
     def call_model(_prompt: str) -> str:
         raise RuntimeError("provider down")
 
-    result = gate.run(sample_tray(), call_model, FakeClient(decisions))  # type: ignore[arg-type]
+    result = gate.run(sample_tray(), call_model, FakeClient(decisions), texts=GATE_TEXTS)  # type: ignore[arg-type]
     assert result.outcome == "fail_closed"
     assert result.failure is not None and "provider down" in result.failure
     assert result.reply == []
@@ -271,7 +309,7 @@ def test_run_records_nothing_and_fails_closed_when_the_model_call_raises() -> No
 )
 def test_run_records_nothing_and_fails_closed_without_a_usable_verdict(text: str) -> None:
     decisions = FakeDecisions()
-    result = gate.run(sample_tray(), lambda _p: text, FakeClient(decisions))  # type: ignore[arg-type]
+    result = gate.run(sample_tray(), lambda _p: text, FakeClient(decisions), texts=GATE_TEXTS)  # type: ignore[arg-type]
     assert result.outcome == "fail_closed"
     assert result.failure == "no usable verdicts in the answer"
     assert result.verdicts == []
@@ -283,7 +321,7 @@ def test_run_fails_closed_without_a_model_call_when_the_tray_has_no_question() -
     tray["question"] = ""
     decisions = FakeDecisions()
     calls: list[str] = []
-    result = gate.run(tray, lambda p: calls.append(p) or "", FakeClient(decisions))  # type: ignore[arg-type]
+    result = gate.run(tray, lambda p: calls.append(p) or "", FakeClient(decisions), texts=GATE_TEXTS)  # type: ignore[arg-type]
     assert result.outcome == "fail_closed"
     assert calls == []
     assert decisions.calls == []
@@ -294,7 +332,7 @@ def test_run_returns_empty_for_a_tray_without_cards_and_never_calls_the_model() 
     tray["conversations"] = []
     decisions = FakeDecisions()
     calls: list[str] = []
-    result = gate.run(tray, lambda p: calls.append(p) or "", FakeClient(decisions))  # type: ignore[arg-type]
+    result = gate.run(tray, lambda p: calls.append(p) or "", FakeClient(decisions), texts=GATE_TEXTS)  # type: ignore[arg-type]
     assert result == GateResult(outcome="empty")
     assert calls == []
     assert decisions.calls == []
@@ -306,6 +344,7 @@ def test_run_lists_skipped_cards_as_undecided_and_still_records_the_rest() -> No
         sample_tray(),
         lambda _p: answer([{"conversation_id": IDS["crew"], "decision": "dismiss", "category": "closing"}]),
         FakeClient(decisions),  # type: ignore[arg-type]
+        texts=GATE_TEXTS,
     )
     assert result.outcome == "decided"
     assert result.undecided == [IDS["direct"], IDS["ops"], IDS["gone"]]
@@ -323,6 +362,7 @@ def test_run_reports_an_immediate_record_failure_and_keeps_going() -> None:
             ]
         ),
         FakeClient(decisions),  # type: ignore[arg-type]
+        texts=GATE_TEXTS,
     )
     assert result.outcome == "decided"
     assert result.recorded == 1
@@ -337,6 +377,7 @@ def test_run_with_a_typed_tray_hands_back_typed_cards() -> None:
         InboxTray.model_validate(sample_tray()),
         lambda _p: answer([{"conversation_id": IDS["direct"], "decision": "reply"}]),
         FakeClient(decisions),  # type: ignore[arg-type]
+        texts=GATE_TEXTS,
     )
     entry = result.reply[0]
     assert isinstance(entry.card, InboxCard)
@@ -360,7 +401,7 @@ async def test_run_async_awaits_an_async_model_and_an_async_client() -> None:
             ]
         )
 
-    result = await gate.run_async(sample_tray(), call_model, FakeClient(decisions))  # type: ignore[arg-type]
+    result = await gate.run_async(sample_tray(), call_model, FakeClient(decisions), texts=GATE_TEXTS)  # type: ignore[arg-type]
     assert result.outcome == "decided"
     assert result.recorded == 1
     assert [c[0] for c in decisions.calls] == [IDS["gone"]]
@@ -381,13 +422,14 @@ async def test_run_async_accepts_a_sync_model_call_and_fails_closed_on_raise() -
         sample_tray(),
         lambda _p: answer([{"conversation_id": IDS["crew"], "decision": "no"}]),
         FakeClient(decisions),  # type: ignore[arg-type]
+        texts=GATE_TEXTS,
     )
     assert ok.verdicts[0].decision == "dismiss"
 
     async def boom(_prompt: str) -> str:
         raise RuntimeError("provider down")
 
-    failed = await gate.run_async(sample_tray(), boom, FakeClient(decisions))  # type: ignore[arg-type]
+    failed = await gate.run_async(sample_tray(), boom, FakeClient(decisions), texts=GATE_TEXTS)  # type: ignore[arg-type]
     assert failed.outcome == "fail_closed"
     assert failed.failure is not None and "provider down" in failed.failure
     assert len(decisions.calls) == 1

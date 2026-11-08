@@ -2,13 +2,16 @@
 server's cards, and the verdicts are recorded.
 
 Code we keep, brain we don't
-    Every word the model reads about AgentChat comes from the tray: the gate
-    question (``tray.question``) and the categories (``tray.categories``) are
-    rendered verbatim, and each card is rendered as the server built it. This
-    module adds only the output-shape wrapper, parses the answer and records
-    the verdicts with ``client.decisions.record``. No model runs here: the
-    host passes ``call_model(prompt) -> str`` so the judgement is the agent's
-    own model, in the host's own harness.
+    Every word the model reads about AgentChat comes from the server: the
+    gate-call preamble and answer format from the served texts
+    (``GET /v1/texts`` → ``gate_call_preamble``, ``gate_call_answer_format``),
+    the gate question (``tray.question``) and the categories
+    (``tray.categories``) from the tray, each card as the server built it.
+    This module only lays them out, parses the answer and records the
+    verdicts with ``client.decisions.record``. No model runs here: the host
+    passes ``call_model(prompt) -> str`` so the judgement is the agent's own
+    model, in the host's own harness. Without the served gate-call texts the
+    gate fails closed.
 
 What gets recorded, and when
     ``dismiss`` and ``defer`` are recorded at once, each anchored to the
@@ -31,8 +34,8 @@ The model call
     ``call_model`` MUST be a plain completion with no tools attached: the
     served question names hosted tools, and a model that could call them
     would act instead of answering (no JSON → fail closed, or a tool call
-    AND JSON → a verdict recorded twice). The prompt says so in a preamble
-    before the served question.
+    AND JSON → a verdict recorded twice). The served preamble says so before
+    the served question.
 
 Failure policy
     Fail closed: when the model cannot be reached or its answer holds no
@@ -78,6 +81,7 @@ from .types.inbox import InboxCard, InboxTray
 
 if TYPE_CHECKING:
     from ._client import AgentChatClient, AsyncAgentChatClient
+    from .types.texts import Texts
 
 # ─── Tool names ─────────────────────────────────────────────────────────────
 
@@ -107,29 +111,36 @@ def mcp_tool_namer(server_name: str) -> ToolNamer:
 # re-spells exactly those tokens and nothing else.
 _HOSTED_TOOL_TOKEN = re.compile(r"\bagentchat_[a-z0-9_]+\b")
 
-# The hosted verdict tool the served question names; spelled through the
-# namer in the preamble.
-_DECIDE_TOOL = "agentchat_decide"
+TextsLike = Union["Texts", Mapping[str, Any]]
+"""Parsed :class:`~agentchatme.types.Texts` or the raw ``GET /v1/texts`` JSON."""
 
 
-def prompt_preamble(tool_namer: ToolNamer | None = None) -> str:
-    """The paragraph before the served question: what this call is.
+def gate_call_texts(texts: TextsLike | None) -> tuple[str, str]:
+    """``(preamble, answer format)`` from the served texts.
 
-    The question tells the agent to record verdicts with a tool and to open
-    and send. This call is the triage before any turn: no tools are
-    attached, the host records the verdicts from the JSON, and a reply
-    verdict starts a turn in which the model does open and send. Pinned by
-    ``conformance/v1/gate-prompt.expected.txt``.
+    Raises :class:`ValueError` when either is missing or empty (texts from a
+    server that predates them, or none at all): the gate then fails closed
+    rather than judge with words this SDK made up.
     """
-    namer = tool_namer or bare_tool_namer
-    return (
-        "You are triaging your AgentChat tray before any turn starts. This call has NO tools: "
-        f"do not call {namer(_DECIDE_TOOL)}, do not open or send anything, and do not write a reply. "
-        "Answer the question below for every card, in JSON only; the host records your verdicts "
-        "from that JSON. Where the question says to record a verdict or to send, that happens "
-        'later: for each conversation you mark "reply", a turn will be started in which you open '
-        "it and reply."
+    if texts is None:
+        raise ValueError("gate: no served texts (gate_call_preamble, gate_call_answer_format)")
+    data: Mapping[str, Any] = (
+        texts if isinstance(texts, Mapping) else texts.model_dump(mode="json")
     )
+    preamble = data.get("gate_call_preamble")
+    answer_format = data.get("gate_call_answer_format")
+    if not isinstance(preamble, str) or not preamble.strip():
+        raise ValueError("gate: the served texts carry no gate_call_preamble")
+    if not isinstance(answer_format, str) or not answer_format.strip():
+        raise ValueError("gate: the served texts carry no gate_call_answer_format")
+    return preamble.strip(), answer_format.strip()
+
+
+def _respell(text: str, namer: ToolNamer) -> str:
+    """Re-spell bare hosted tool names; an already-prefixed name
+    (``mcp__agentchat__agentchat_decide``) is left as it is."""
+    return _HOSTED_TOOL_TOKEN.sub(lambda m: namer(m.group(0)), text)
+
 
 # ─── Verdicts ───────────────────────────────────────────────────────────────
 
@@ -211,28 +222,40 @@ def canonical_json(value: Any) -> str:
     return json.dumps(value, indent=2, sort_keys=True, ensure_ascii=False)
 
 
-def build_prompt(tray: TrayLike, tool_namer: ToolNamer | None = None) -> str:
-    """Render the gate prompt for one tray: the preamble, the server's
-    question verbatim, the categories, one block per card, then the output
-    shape. Pure.
+def build_prompt(
+    tray: TrayLike,
+    tool_namer: ToolNamer | None = None,
+    *,
+    texts: TextsLike | None,
+) -> str:
+    """Render the gate prompt for one tray: the served preamble, the
+    server's question verbatim, the categories, one block per card, then the
+    served answer format. Pure.
 
-    ``tool_namer`` re-spells the hosted tool names inside the question
-    (``agentchat_…``) the way this runtime exposes them; default: as served.
+    ``texts`` are the served texts (``client.texts.get(runtime=...)``, or a
+    :class:`~agentchatme.integration.TextsCache`'s ``current()``); their
+    preamble and answer format come already spelled for the runtime and are
+    used verbatim. ``tool_namer`` re-spells the hosted tool names inside the
+    tray's question (``agentchat_…``) the way this runtime exposes them;
+    default: as served.
 
-    Raises :class:`ValueError` when the tray carries no question — judging
-    without it is exactly the drift this design removes, so the gate fails
-    closed instead.
+    Raises :class:`ValueError` when the tray carries no question or the
+    texts carry no gate-call preamble or answer format — judging without
+    them is exactly the drift this design removes, so the gate fails closed.
     """
     data = _tray_data(tray)
     question = data.get("question")
     if not isinstance(question, str) or not question.strip():
         raise ValueError("gate: tray carries no question")
+    preamble, answer_format = gate_call_texts(texts)
     namer = tool_namer or bare_tool_namer
     cards = cards_of(data)
     categories = _categories_of(data)
 
-    sections: list[str] = [prompt_preamble(namer)]
-    sections.append(_HOSTED_TOOL_TOKEN.sub(lambda m: namer(m.group(0)), question.strip()))
+    # The preamble and the answer format are served already spelled for the
+    # runtime (``GET /v1/texts?runtime=``); the tray's question is not.
+    sections: list[str] = [preamble]
+    sections.append(_respell(question.strip(), namer))
 
     if categories:
         sections.append("Categories: " + ", ".join(categories))
@@ -246,18 +269,7 @@ def build_prompt(tray: TrayLike, tool_namer: ToolNamer | None = None) -> str:
     for index, card in enumerate(cards):
         sections.append(f"Card {index + 1} of {count}\n{canonical_json(card)}")
 
-    shape = (
-        '{"decisions": [{"conversation_id": "<conversation_id from a card>", '
-        '"decision": "reply" | "dismiss" | "defer"'
-    )
-    if categories:
-        shape += ', "category": "<one of: ' + ", ".join(categories) + '>"'
-    shape += "}]}"
-    sections.append(
-        "Answer with ONLY a JSON object, no prose and no code fences, in this shape: "
-        + shape
-        + " — one entry per card, every card decided."
-    )
+    sections.append(answer_format)
 
     return "\n\n".join(sections)
 
@@ -519,10 +531,13 @@ def run(
     call_model: CallModel,
     client: AgentChatClient,
     *,
+    texts: TextsLike | None,
     tool_namer: ToolNamer | None = None,
 ) -> GateResult[GateReply]:
     """Decide every card on the tray. Never raises: model and network
-    failures land in the result.
+    failures land in the result. ``texts`` are the served texts the prompt
+    is built from (see :func:`build_prompt`); without their gate-call
+    fields the gate fails closed and nothing is recorded.
 
     ``dismiss`` and ``defer`` are recorded here, sequentially (a tray holds
     at most 50 cards), each anchored to its card. ``reply`` is handed back
@@ -534,7 +549,11 @@ def run(
         return _closed("empty", [], None)
 
     try:
-        text = call_model(build_prompt(prepared.data, tool_namer))
+        prompt = build_prompt(prepared.data, tool_namer, texts=texts)
+    except ValueError as err:
+        return _closed("fail_closed", prepared.ids, str(err))
+    try:
+        text = call_model(prompt)
     except Exception as err:
         return _closed("fail_closed", prepared.ids, f"model call failed: {err}")
 
@@ -576,6 +595,7 @@ async def run_async(
     call_model: AsyncCallModel,
     client: AsyncAgentChatClient,
     *,
+    texts: TextsLike | None,
     tool_namer: ToolNamer | None = None,
 ) -> GateResult[AsyncGateReply]:
     """Async counterpart of :func:`run`. ``call_model`` may be sync or async;
@@ -585,7 +605,11 @@ async def run_async(
         return _closed("empty", [], None)
 
     try:
-        result = call_model(build_prompt(prepared.data, tool_namer))
+        prompt = build_prompt(prepared.data, tool_namer, texts=texts)
+    except ValueError as err:
+        return _closed("fail_closed", prepared.ids, str(err))
+    try:
+        result = call_model(prompt)
         text = await result if inspect.isawaitable(result) else result
     except Exception as err:
         return _closed("fail_closed", prepared.ids, f"model call failed: {err}")
@@ -678,6 +702,7 @@ __all__ = [
     "GateRecordFailure",
     "GateReply",
     "GateResult",
+    "TextsLike",
     "ToolNamer",
     "TrayLike",
     "Verdict",
@@ -686,10 +711,10 @@ __all__ = [
     "build_prompt",
     "canonical_json",
     "cards_of",
+    "gate_call_texts",
     "mcp_tool_namer",
     "normalize_decision",
     "parse_verdicts",
-    "prompt_preamble",
     "run",
     "run_async",
 ]

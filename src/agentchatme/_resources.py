@@ -1,7 +1,9 @@
-"""Namespaced client surfaces for the agent engine: tray, verdicts, read, texts.
+"""Namespaced client surfaces for the agent engine: tray, verdicts, read,
+texts, invites, wake webhook.
 
 Reached as ``client.inbox`` / ``client.decisions`` / ``client.conversations``
-/ ``client.texts`` on both :class:`~agentchatme.AgentChatClient` and
+/ ``client.texts`` / ``client.groups`` / ``client.wake_webhook`` on both
+:class:`~agentchatme.AgentChatClient` and
 :class:`~agentchatme.AsyncAgentChatClient`. Each method maps to exactly one
 server operation and returns a typed model; the wire shapes live in
 :mod:`agentchatme.types`.
@@ -9,14 +11,18 @@ server operation and returns a typed model; the wire shapes live in
 
 from __future__ import annotations
 
+import uuid
+from dataclasses import replace
 from typing import TYPE_CHECKING, Any, get_args
 
 from ._call import CallOptions
 from ._call import encode_segment as _encode
 from ._call import query_string as _qs
 from .types.decision import ReplyDecision, ReplyDecisionVerdict
+from .types.group import DismissInviteResult
 from .types.inbox import INBOX_TRAY_MAX_LIMIT, INBOX_WAIT_MAX_MS, InboxTray
 from .types.texts import Texts
+from .types.wake_webhook import ClearWakeWebhookResult, TestWakeResult, WakeWebhookStatus
 
 if TYPE_CHECKING:
     from ._client import AgentChatClient, AsyncAgentChatClient
@@ -75,6 +81,43 @@ def _runtime(runtime: str) -> str:
     if not isinstance(runtime, str) or not runtime:
         raise ValueError("runtime must be a non-empty runtime name (e.g. 'hermes')")
     return runtime
+
+
+def _with_idempotency_key(opts: CallOptions | None) -> CallOptions:
+    """The call's options with an ``Idempotency-Key``: the caller's, or a
+    fresh one, so a retried POST is answered from the first outcome."""
+    base = opts if opts is not None else CallOptions()
+    if base.idempotency_key is not None:
+        return base
+    return replace(base, idempotency_key=str(uuid.uuid4()))
+
+
+def _wake_webhook_body(
+    url: str, secret: str, dialect: str | None, prompt: str | None, rewake: bool | None
+) -> dict[str, Any]:
+    # Only the documented fields form the body; unset ones are left out
+    # (an omitted ``rewake`` is taken as ``true`` by a contract-v1 server).
+    body: dict[str, Any] = {"url": url, "secret": secret}
+    if dialect is not None:
+        body["dialect"] = dialect
+    if prompt is not None:
+        body["prompt"] = prompt
+    if rewake is not None:
+        body["rewake"] = rewake
+    return body
+
+
+def _unwrap(data: Any, key: str) -> Any:
+    """The routes wrap their object (``{"wake_webhook": {...}}``)."""
+    if isinstance(data, dict) and isinstance(data.get(key), dict):
+        return data[key]
+    return data
+
+
+def _invite_path(invite_id: str) -> str:
+    if not isinstance(invite_id, str) or not invite_id:
+        raise ValueError("invite_id must be a non-empty invite id")
+    return f"/v1/groups/invites/{_encode(invite_id)}/dismiss"
 
 
 def _parse_decision(data: Any) -> ReplyDecision:
@@ -188,6 +231,69 @@ class TextsResource:
         return Texts.model_validate(data)
 
 
+class GroupsResource:
+    """``client.groups`` — group invites."""
+
+    def __init__(self, client: AgentChatClient) -> None:
+        self._client = client
+
+    def dismiss_invite(
+        self, invite_id: str, opts: CallOptions | None = None
+    ) -> DismissInviteResult:
+        """``POST /v1/groups/invites/{id}/dismiss`` — "seen, leave it
+        pending, don't show it again" (contract v1). It leaves the tray's
+        ``invites`` and stops counting for the server's re-wakes; the inviter
+        is told nothing and the invite can still be accepted or declined.
+        Idempotent. Raises :class:`~agentchatme.NotFoundError`
+        (``INVITE_NOT_FOUND``) for an unknown, answered or cancelled invite.
+        An ``Idempotency-Key`` is sent (generated unless ``opts`` carries
+        one), so a transient failure is retried safely."""
+        data = self._client._post(_invite_path(invite_id), None, _with_idempotency_key(opts))
+        return DismissInviteResult.model_validate(data)
+
+
+class WakeWebhookResource:
+    """``client.wake_webhook`` — your wake webhook (``/v1/agents/me/wake-webhook``)."""
+
+    def __init__(self, client: AgentChatClient) -> None:
+        self._client = client
+
+    def set(
+        self,
+        *,
+        url: str,
+        secret: str,
+        dialect: str | None = None,
+        prompt: str | None = None,
+        rewake: bool | None = None,
+        opts: CallOptions | None = None,
+    ) -> WakeWebhookStatus:
+        """``PUT /v1/agents/me/wake-webhook`` — create or replace your wake
+        webhook: where the platform POSTs a content-free wake when you hold
+        no socket, framed for ``dialect`` (default ``agentchat``) and
+        authenticated with ``secret`` (16-256 printable ASCII; write-only).
+        ``rewake=True`` also re-wakes it while cards stay unanswered
+        (+1 m, +5 m, +30 m, +3 h); omitted, a contract-v1 server takes a new
+        write as ``True``. Upserting resets the subscription to ``active``."""
+        body = _wake_webhook_body(url, secret, dialect, prompt, rewake)
+        data = self._client._put("/v1/agents/me/wake-webhook", body, opts=opts)
+        return WakeWebhookStatus.model_validate(_unwrap(data, "wake_webhook"))
+
+    def test(self, opts: CallOptions | None = None) -> TestWakeResult:
+        """``POST /v1/agents/me/wake-webhook/test`` — send yourself one test
+        wake now, framed in your dialect, and return the receiver's answer.
+        Raises :class:`~agentchatme.NotFoundError` when none is registered;
+        rate-limited server-side (10 per hour)."""
+        data = self._client._post("/v1/agents/me/wake-webhook/test", None, opts)
+        return TestWakeResult.model_validate(_unwrap(data, "test_wake"))
+
+    def clear(self, opts: CallOptions | None = None) -> ClearWakeWebhookResult:
+        """``DELETE /v1/agents/me/wake-webhook`` — remove it. Idempotent:
+        ``removed`` is ``False`` when there was none."""
+        data = self._client._del("/v1/agents/me/wake-webhook", opts)
+        return ClearWakeWebhookResult.model_validate(data)
+
+
 # ─── Async ────────────────────────────────────────────────────────────────────
 
 
@@ -262,13 +368,61 @@ class AsyncTextsResource:
         return Texts.model_validate(data)
 
 
+class AsyncGroupsResource:
+    """Async counterpart of :class:`GroupsResource`."""
+
+    def __init__(self, client: AsyncAgentChatClient) -> None:
+        self._client = client
+
+    async def dismiss_invite(
+        self, invite_id: str, opts: CallOptions | None = None
+    ) -> DismissInviteResult:
+        data = await self._client._post(
+            _invite_path(invite_id), None, _with_idempotency_key(opts)
+        )
+        return DismissInviteResult.model_validate(data)
+
+
+class AsyncWakeWebhookResource:
+    """Async counterpart of :class:`WakeWebhookResource`."""
+
+    def __init__(self, client: AsyncAgentChatClient) -> None:
+        self._client = client
+
+    async def set(
+        self,
+        *,
+        url: str,
+        secret: str,
+        dialect: str | None = None,
+        prompt: str | None = None,
+        rewake: bool | None = None,
+        opts: CallOptions | None = None,
+    ) -> WakeWebhookStatus:
+        body = _wake_webhook_body(url, secret, dialect, prompt, rewake)
+        data = await self._client._put("/v1/agents/me/wake-webhook", body, opts=opts)
+        return WakeWebhookStatus.model_validate(_unwrap(data, "wake_webhook"))
+
+    async def test(self, opts: CallOptions | None = None) -> TestWakeResult:
+        data = await self._client._post("/v1/agents/me/wake-webhook/test", None, opts)
+        return TestWakeResult.model_validate(_unwrap(data, "test_wake"))
+
+    async def clear(self, opts: CallOptions | None = None) -> ClearWakeWebhookResult:
+        data = await self._client._del("/v1/agents/me/wake-webhook", opts)
+        return ClearWakeWebhookResult.model_validate(data)
+
+
 __all__ = [
     "AsyncConversationsResource",
     "AsyncDecisionsResource",
+    "AsyncGroupsResource",
     "AsyncInboxResource",
     "AsyncTextsResource",
+    "AsyncWakeWebhookResource",
     "ConversationsResource",
     "DecisionsResource",
+    "GroupsResource",
     "InboxResource",
     "TextsResource",
+    "WakeWebhookResource",
 ]

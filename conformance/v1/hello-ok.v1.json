@@ -1,0 +1,8 @@
+{
+  "capabilities": [
+    "ack",
+    "heartbeat",
+    "rewake"
+  ],
+  "type": "hello.ok"
+}

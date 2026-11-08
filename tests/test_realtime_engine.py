@@ -542,7 +542,10 @@ async def test_a_copy_on_a_later_connection_adopts_the_first_copy_still_running(
         release.set()
         await _settle()
         assert calls == ["msg_1"]
-        assert _ack_frames(ws2) == ["msg_1"]
+        # The first copy's settlement and the adopted re-offer each ack on
+        # the current socket (the TypeScript SDK's behaviour; the server
+        # takes a repeated ack as a no-op).
+        assert _ack_frames(ws2) == ["msg_1", "msg_1"]
     finally:
         release.set()
         await rt.disconnect()

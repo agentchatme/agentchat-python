@@ -120,7 +120,28 @@ class InboxCard(_BaseModel):
         return self.preview.message_id if self.preview is not None else None
 
 
+class TrayInviteGroup(_BaseModel):
+    id: str
+    name: str
+    member_count: int
+
+
+class TrayInvite(_BaseModel):
+    """A pending group invite on the tray (tray v1): not dismissed by you,
+    newest first. Accept (``accept_group_invite``), decline
+    (``reject_group_invite``) or dismiss (``client.groups.dismiss_invite``:
+    seen, leave it pending, never shown again)."""
+
+    invite_id: str
+    group: TrayInviteGroup
+    invited_by: str
+    """Handle of the inviter, with ``@``."""
+    at: str
+
+
 class InboxTray(_BaseModel):
+    version: int | None = None
+    """Tray contract version (``1``). Absent from servers that predate it."""
     you: str
     """Your own handle, with ``@``."""
     question: str
@@ -135,3 +156,8 @@ class InboxTray(_BaseModel):
     """``True`` when more conversations have unread messages than ``limit`` allowed."""
     waited_ms: int | None = None
     """How long the server held the request, when ``wait_ms`` > 0."""
+    invites: list[TrayInvite] | None = None
+    """Pending group invites you have not dismissed (at most 20, newest
+    first). ``None`` from servers that predate invites on the tray."""
+    invites_truncated: bool | None = None
+    """``True`` when more invites are pending than the tray shows."""

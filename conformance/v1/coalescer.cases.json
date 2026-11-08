@@ -1,0 +1,460 @@
+{
+  "about": "WakeCoalescer timing (quietMs / maxMs). A fake clock starts at 0. Every case sets quiet_ms, max_ms, how long a cycle runs (cycle_ms: one number for every cycle, or a list whose last value repeats), and timed events: \"wake\" is any wake (a message.new frame, a wake frame, a connect, an integration-side wake) and \"stop\" stops the coalescer. A cycle starts when its timer fires and ends cycle_ms later. At one instant, first every timer due by then fires and every cycle due to end by then ends, then the events at that instant apply in order, then timers they armed for that same instant fire. expect_cycles is the start time of every cycle, in order, until the clock reaches run_until.",
+  "cases": [
+    {
+      "cycle_ms": 100,
+      "events": [
+        {
+          "at": 0,
+          "op": "wake"
+        }
+      ],
+      "expect_cycles": [
+        2000
+      ],
+      "max_ms": 6000,
+      "name": "one-wake",
+      "quiet_ms": 2000,
+      "run_until": 20000
+    },
+    {
+      "cycle_ms": 100,
+      "events": [
+        {
+          "at": 0,
+          "op": "wake"
+        },
+        {
+          "at": 0,
+          "op": "wake"
+        },
+        {
+          "at": 0,
+          "op": "wake"
+        }
+      ],
+      "expect_cycles": [
+        2000
+      ],
+      "max_ms": 6000,
+      "name": "simultaneous-wakes-are-one-cycle",
+      "quiet_ms": 2000,
+      "run_until": 20000
+    },
+    {
+      "cycle_ms": 100,
+      "events": [
+        {
+          "at": 0,
+          "op": "wake"
+        },
+        {
+          "at": 300,
+          "op": "wake"
+        },
+        {
+          "at": 900,
+          "op": "wake"
+        },
+        {
+          "at": 1500,
+          "op": "wake"
+        }
+      ],
+      "expect_cycles": [
+        3500
+      ],
+      "max_ms": 6000,
+      "name": "a-burst-is-one-cycle-after-its-last-wake",
+      "quiet_ms": 2000,
+      "run_until": 20000
+    },
+    {
+      "cycle_ms": 100,
+      "events": [
+        {
+          "at": 0,
+          "op": "wake"
+        },
+        {
+          "at": 1000,
+          "op": "wake"
+        },
+        {
+          "at": 2000,
+          "op": "wake"
+        },
+        {
+          "at": 3000,
+          "op": "wake"
+        },
+        {
+          "at": 4000,
+          "op": "wake"
+        },
+        {
+          "at": 5000,
+          "op": "wake"
+        },
+        {
+          "at": 5900,
+          "op": "wake"
+        }
+      ],
+      "expect_cycles": [
+        6000
+      ],
+      "max_ms": 6000,
+      "name": "a-steady-trickle-is-capped",
+      "quiet_ms": 2000,
+      "run_until": 20000
+    },
+    {
+      "cycle_ms": 100,
+      "events": [
+        {
+          "at": 0,
+          "op": "wake"
+        },
+        {
+          "at": 1000,
+          "op": "wake"
+        },
+        {
+          "at": 2000,
+          "op": "wake"
+        },
+        {
+          "at": 3000,
+          "op": "wake"
+        },
+        {
+          "at": 4000,
+          "op": "wake"
+        },
+        {
+          "at": 5000,
+          "op": "wake"
+        },
+        {
+          "at": 6500,
+          "op": "wake"
+        },
+        {
+          "at": 7000,
+          "op": "wake"
+        }
+      ],
+      "expect_cycles": [
+        6000,
+        9000
+      ],
+      "max_ms": 6000,
+      "name": "a-wake-after-the-cap-starts-a-new-burst",
+      "quiet_ms": 2000,
+      "run_until": 20000
+    },
+    {
+      "cycle_ms": 3000,
+      "events": [
+        {
+          "at": 0,
+          "op": "wake"
+        }
+      ],
+      "expect_cycles": [
+        2000
+      ],
+      "max_ms": 6000,
+      "name": "no-wake-during-the-cycle-earns-nothing-more",
+      "quiet_ms": 2000,
+      "run_until": 20000
+    },
+    {
+      "cycle_ms": 3000,
+      "events": [
+        {
+          "at": 0,
+          "op": "wake"
+        },
+        {
+          "at": 2500,
+          "op": "wake"
+        },
+        {
+          "at": 3000,
+          "op": "wake"
+        },
+        {
+          "at": 4000,
+          "op": "wake"
+        },
+        {
+          "at": 4500,
+          "op": "wake"
+        }
+      ],
+      "expect_cycles": [
+        2000,
+        6500
+      ],
+      "max_ms": 6000,
+      "name": "wakes-during-a-cycle-earn-exactly-one-more",
+      "quiet_ms": 2000,
+      "run_until": 20000
+    },
+    {
+      "cycle_ms": 5000,
+      "events": [
+        {
+          "at": 0,
+          "op": "wake"
+        },
+        {
+          "at": 2100,
+          "op": "wake"
+        }
+      ],
+      "expect_cycles": [
+        2000,
+        7000
+      ],
+      "max_ms": 6000,
+      "name": "the-quiet-window-already-lapsed-when-the-cycle-ends",
+      "quiet_ms": 2000,
+      "run_until": 20000
+    },
+    {
+      "cycle_ms": [
+        10000,
+        100
+      ],
+      "events": [
+        {
+          "at": 0,
+          "op": "wake"
+        },
+        {
+          "at": 2500,
+          "op": "wake"
+        },
+        {
+          "at": 4500,
+          "op": "wake"
+        },
+        {
+          "at": 6500,
+          "op": "wake"
+        },
+        {
+          "at": 8500,
+          "op": "wake"
+        },
+        {
+          "at": 10500,
+          "op": "wake"
+        }
+      ],
+      "expect_cycles": [
+        2000,
+        12000
+      ],
+      "max_ms": 6000,
+      "name": "a-trickle-during-a-long-cycle-starts-at-its-end",
+      "quiet_ms": 2000,
+      "run_until": 30000
+    },
+    {
+      "cycle_ms": [
+        3000,
+        100
+      ],
+      "events": [
+        {
+          "at": 0,
+          "op": "wake"
+        },
+        {
+          "at": 4000,
+          "op": "wake"
+        },
+        {
+          "at": 5500,
+          "op": "wake"
+        }
+      ],
+      "expect_cycles": [
+        2000,
+        7500
+      ],
+      "max_ms": 6000,
+      "name": "a-wake-after-the-cycle-joins-the-window-it-earned",
+      "quiet_ms": 2000,
+      "run_until": 20000
+    },
+    {
+      "cycle_ms": [
+        3000,
+        100
+      ],
+      "events": [
+        {
+          "at": 0,
+          "op": "wake"
+        },
+        {
+          "at": 4500,
+          "op": "wake"
+        },
+        {
+          "at": 6000,
+          "op": "wake"
+        },
+        {
+          "at": 7000,
+          "op": "wake"
+        },
+        {
+          "at": 8000,
+          "op": "wake"
+        },
+        {
+          "at": 9000,
+          "op": "wake"
+        },
+        {
+          "at": 10000,
+          "op": "wake"
+        }
+      ],
+      "expect_cycles": [
+        2000,
+        10500
+      ],
+      "max_ms": 6000,
+      "name": "the-earned-window-keeps-its-cap",
+      "quiet_ms": 2000,
+      "run_until": 20000
+    },
+    {
+      "cycle_ms": 1000,
+      "events": [
+        {
+          "at": 0,
+          "op": "wake"
+        },
+        {
+          "at": 2500,
+          "op": "wake"
+        },
+        {
+          "at": 5000,
+          "op": "wake"
+        }
+      ],
+      "expect_cycles": [
+        2000,
+        4500,
+        7000
+      ],
+      "max_ms": 6000,
+      "name": "a-wake-during-the-second-cycle-earns-a-third",
+      "quiet_ms": 2000,
+      "run_until": 20000
+    },
+    {
+      "cycle_ms": 100,
+      "events": [
+        {
+          "at": 0,
+          "op": "wake"
+        },
+        {
+          "at": 2000,
+          "op": "wake"
+        }
+      ],
+      "expect_cycles": [
+        2000,
+        4000
+      ],
+      "max_ms": 6000,
+      "name": "a-wake-at-the-firing-instant-is-during-the-cycle",
+      "quiet_ms": 2000,
+      "run_until": 20000
+    },
+    {
+      "cycle_ms": 100,
+      "events": [
+        {
+          "at": 0,
+          "op": "wake"
+        },
+        {
+          "at": 10,
+          "op": "wake"
+        }
+      ],
+      "expect_cycles": [
+        0,
+        100
+      ],
+      "max_ms": 0,
+      "name": "zero-quiet-starts-at-once",
+      "quiet_ms": 0,
+      "run_until": 20000
+    },
+    {
+      "cycle_ms": 100,
+      "events": [
+        {
+          "at": 0,
+          "op": "wake"
+        },
+        {
+          "at": 1000,
+          "op": "stop"
+        },
+        {
+          "at": 1500,
+          "op": "wake"
+        }
+      ],
+      "expect_cycles": [],
+      "max_ms": 6000,
+      "name": "stop-cancels-the-armed-window",
+      "quiet_ms": 2000,
+      "run_until": 20000
+    },
+    {
+      "cycle_ms": 3000,
+      "events": [
+        {
+          "at": 0,
+          "op": "wake"
+        },
+        {
+          "at": 2500,
+          "op": "wake"
+        },
+        {
+          "at": 3000,
+          "op": "stop"
+        }
+      ],
+      "expect_cycles": [
+        2000
+      ],
+      "max_ms": 6000,
+      "name": "stop-during-a-cycle-earns-nothing-more",
+      "quiet_ms": 2000,
+      "run_until": 20000
+    }
+  ],
+  "rules": {
+    "during_cycle": "A wake while a cycle runs is remembered. When the cycle ends, exactly one more cycle follows, however many wakes arrived meanwhile: its timer is due quiet_ms after the last of those wakes, capped at max_ms after the first of them, and never before the end of the cycle. Wakes after that end and before the timer fires join that window as in \"window\" (the burst began with the first wake during the cycle).",
+    "stop": "After stop nothing starts; a running cycle is not interrupted, and wakes it saw earn nothing.",
+    "validation": "max_ms below quiet_ms, or a negative value, is a configuration error.",
+    "window": "The first wake while nothing is armed or running arms a timer quiet_ms later. Each further wake before it fires moves it to quiet_ms after that wake, but never later than max_ms after the first wake of the burst."
+  }
+}

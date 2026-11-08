@@ -35,10 +35,18 @@ from .contact import (
     UpdateContactRequest,
 )
 from .conversation import (
+    AgentConversationContext,
+    AgentConversationContextCounterparty,
+    AgentConversationContextDirectState,
+    AgentConversationContextGroup,
+    AgentConversationContextRelationship,
+    AgentConversationContextUnread,
     Conversation,
     ConversationListItem,
     ConversationParticipant,
     ConversationType,
+    DirectConversationLookup,
+    DirectConversationLookupCounterparty,
 )
 from .decision import (
     KnownReplyDecisionCategory,
@@ -51,6 +59,7 @@ from .group import (
     AddMemberResult,
     CreateGroupRequest,
     DeletedGroupInfo,
+    DismissInviteResult,
     Group,
     GroupDetail,
     GroupInvitation,
@@ -75,6 +84,8 @@ from .inbox import (
     InboxCardRelationship,
     InboxCardReminder,
     InboxTray,
+    TrayInvite,
+    TrayInviteGroup,
 )
 from .message import (
     Message,
@@ -95,11 +106,24 @@ from .presence import (
     PresenceUpdate,
 )
 from .texts import Texts, TextsManual, TextsRuntime
+from .wake_webhook import (
+    ClearWakeWebhookResult,
+    KnownWakeDialect,
+    TestWakeResult,
+    WakeConversation,
+    WakeDialect,
+    WakeWebhookPayload,
+    WakeWebhookState,
+    WakeWebhookStatus,
+)
 from .ws import (
     AckFrame,
     ClientAction,
+    HeartbeatFrame,
+    HeartbeatPayload,
     KnownWakeReason,
     ServerEvent,
+    SocketCapability,
     WakeFrame,
     WakePayload,
     WakeReason,
@@ -123,12 +147,19 @@ __all__ = [
     "AddMemberResult",
     # agent
     "Agent",
+    "AgentConversationContext",
+    "AgentConversationContextCounterparty",
+    "AgentConversationContextDirectState",
+    "AgentConversationContextGroup",
+    "AgentConversationContextRelationship",
+    "AgentConversationContextUnread",
     "AgentProfile",
     "AgentSettings",
     "AgentStatus",
     "AttachmentMime",
     "BlockedAgent",
     # ws
+    "ClearWakeWebhookResult",
     "ClientAction",
     "Contact",
     # conversation
@@ -140,6 +171,9 @@ __all__ = [
     "CreateUploadRequest",
     "CreateUploadResponse",
     "DeletedGroupInfo",
+    "DirectConversationLookup",
+    "DirectConversationLookupCounterparty",
+    "DismissInviteResult",
     "Group",
     "GroupDetail",
     "GroupInvitation",
@@ -149,6 +183,8 @@ __all__ = [
     "GroupRole",
     "GroupSettings",
     "GroupSystemEvent",
+    "HeartbeatFrame",
+    "HeartbeatPayload",
     "InboxCard",
     "InboxCardCounterparty",
     "InboxCardGroup",
@@ -161,6 +197,7 @@ __all__ = [
     "InboxMode",
     "InboxTray",
     "KnownReplyDecisionCategory",
+    "KnownWakeDialect",
     "KnownWakeReason",
     # message
     "Message",
@@ -187,16 +224,25 @@ __all__ = [
     "ReportRequest",
     "SendMessageRequest",
     "ServerEvent",
+    "SocketCapability",
+    "TestWakeResult",
     # texts
     "Texts",
     "TextsManual",
     "TextsRuntime",
+    "TrayInvite",
+    "TrayInviteGroup",
     "UpdateAgentRequest",
     "UpdateContactRequest",
     "UpdateGroupRequest",
     "VerifyRequest",
+    "WakeConversation",
+    "WakeDialect",
     "WakeFrame",
     "WakePayload",
     "WakeReason",
+    "WakeWebhookPayload",
+    "WakeWebhookState",
+    "WakeWebhookStatus",
     "WsMessage",
 ]

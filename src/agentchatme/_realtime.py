@@ -60,7 +60,6 @@ import inspect
 import json
 import logging
 import random
-import re
 import time
 import warnings
 from collections import OrderedDict
@@ -71,12 +70,13 @@ from typing import (
     Any,
     Callable,
     Literal,
+    TypedDict,
     Union,
 )
 
 from ._client import last_sync_delivery_id
 from ._client_identity import DEFAULT_CLIENT_IDENTITY, AgentChatClientIdentity
-from ._http_retry_after import parse_retry_after
+from ._connect_budget import BudgetClose, BudgetUpgrade, connect_budget_delay_ms
 from .errors import ConnectionError as _RealtimeConnectionError
 
 if TYPE_CHECKING:
@@ -211,6 +211,14 @@ def _resolved_ws_connect() -> Any:
         return None
 
 
+class SocketCapabilityOptions(TypedDict, total=False):
+    """Which optional socket capabilities to offer (see
+    :attr:`RealtimeOptions.capabilities`)."""
+
+    heartbeat: bool
+    rewake: bool
+
+
 @dataclass
 class RealtimeOptions:
     """Configuration for :class:`RealtimeClient`."""
@@ -264,15 +272,21 @@ class RealtimeOptions:
     default mode keeps ordering because unacked frames come back in order
     on the next drain. Such a flush fires ``on_sequence_gap`` with
     ``reason="connection_closed"``."""
-    rewake: bool = False
-    """Advertise the ``rewake`` capability: the server then sends its
-    unanswered re-wake (``{"type": "wake", "payload": {"reason":
-    "unanswered", "conversation_ids": [...], "step": 1..4, "at": ...}}``) to
-    this socket, and a live ``rewake`` socket stops the same re-wake going
-    to the agent's wake webhook. Turn it on only when an ``on("wake")``
-    handler reads the tray on every wake; a socket that negotiates it and
-    ignores wakes swallows them. The integration kit's receive loop turns it
-    on. Default ``False``."""
+    capabilities: SocketCapabilityOptions | None = None
+    """Socket capabilities to offer in HELLO besides ``ack`` (always
+    offered); the server echoes what it accepted
+    (:attr:`RealtimeClient.capabilities`).
+
+    ``heartbeat`` (default ``True``): the server sends a ``heartbeat`` frame
+    on its 45 s timer, which keeps the idle watchdog working on sockets that
+    cannot see pings.
+
+    ``rewake`` (default ``False``): the server sends ``wake`` frames with
+    ``reason: "unanswered"`` while cards on the tray stay unanswered, and
+    counts this socket as present, so the wake webhook does not re-wake too.
+    Offer it only when an ``on("wake")`` handler acts on those frames (the
+    integration kit's :class:`~agentchatme.integration.ReceiveLoop` does); a
+    socket that accepts it and ignores wakes swallows them."""
 
 
 # ───────────────────────── Internal constants ─────────────────────────
@@ -340,29 +354,22 @@ _SYNC_PAGE_SIZE = 100
 # Capability strings advertised in the HELLO frame. The server echoes the
 # subset it accepted on ``hello.ok``; anything not echoed stays disabled
 # locally (a ``hello.ok`` without ``capabilities`` means legacy server).
-# ``ack``: per-message delivery acks. ``heartbeat``: the server sends a
-# ``heartbeat`` frame on its 45 s timer (no reply expected), which the idle
-# watchdog counts like any inbound frame. ``rewake`` is opt-in
-# (``RealtimeOptions.rewake``) and appended after these.
-_CLIENT_CAPABILITIES = ("ack", "heartbeat")
-_REWAKE_CAPABILITY = "rewake"
+# ``ack`` (always): per-message delivery acks. ``heartbeat`` (default on):
+# the server sends a ``heartbeat`` frame on its 45 s timer (no reply
+# expected), which the idle watchdog counts like any inbound frame.
+# ``rewake`` (opt-in): the server's unanswered re-wake comes to this socket.
+# See ``RealtimeOptions.capabilities``.
 
 # A ready socket whose server negotiated ``heartbeat`` gets a frame at least
 # every 45 s, so the idle watchdog is armed on it even when the transport
 # exposes no ping(); this deadline is two missed heartbeats plus margin.
 _HEARTBEAT_LIVENESS_TIMEOUT_MS = 100_000
 
-# Connect budget (per agent on /v1/ws). Over budget the server answers HTTP
-# 429 with ``Retry-After`` before the upgrade, or closes 1013 (Try Again
-# Later) with a retry hint in the reason after HELLO. Both are backoff with
-# the server's delay, never ``blocked``. Without a usable hint the client
-# waits this long (the per-minute budget's window); a hint is honoured up to
-# _RATE_LIMIT_MAX_DELAY_MS (the per-hour budget's window), never longer.
-_RATE_LIMIT_CLOSE_CODE = 1013
-_RATE_LIMIT_DEFAULT_DELAY_MS = 60_000
-_RATE_LIMIT_MAX_DELAY_MS = 60 * 60_000
-# Spread a fleet told the same delay: up to 10 % ABOVE the server's delay,
-# never below it.
+# Connect budget (per agent on /v1/ws, D8): over budget the server answers
+# HTTP 429 with ``Retry-After`` before the upgrade, or closes 1013 with a
+# retry hint after HELLO. Both are backoff with the server's delay (see
+# ``_connect_budget``), never ``blocked``. The client waits up to 10 % longer
+# than that delay, never less, so a fleet told the same delay spreads out.
 _RATE_LIMIT_JITTER = 0.1
 
 # disconnect(): how long dispatches still running get to finish before they
@@ -441,56 +448,10 @@ def _jittered_above_ms(ms: int, ratio: float) -> int:
     return max(0, int(ms * factor))
 
 
-_RETRY_HINT_PATTERNS: tuple[tuple[re.Pattern[str], float], ...] = (
-    # retry_after_ms=1500, retry-after-ms: 1500
-    (re.compile(r"retry[\s_-]*after[\s_-]*ms\s*[=:]?\s*(\d+(?:\.\d+)?)", re.IGNORECASE), 1.0),
-    # retry_after=30, Retry-After: 30, retry after 30s
-    (
-        re.compile(r"retry[\s_-]*after\s*[=:]?\s*(\d+(?:\.\d+)?)\s*(?:s\b|sec|seconds?\b)?", re.IGNORECASE),
-        1000.0,
-    ),
-    # retry in 30s / retry in 1500ms / retry in 2m
-    (re.compile(r"retry\s+in\s+(\d+(?:\.\d+)?)\s*ms\b", re.IGNORECASE), 1.0),
-    (re.compile(r"retry\s+in\s+(\d+(?:\.\d+)?)\s*m(?:in(?:utes?)?)?\b", re.IGNORECASE), 60_000.0),
-    (re.compile(r"retry\s+in\s+(\d+(?:\.\d+)?)\s*(?:s\b|sec|seconds?\b)?", re.IGNORECASE), 1000.0),
-)
-
-
-def _retry_hint_ms(reason: str) -> int | None:
-    """The delay a 1013 close reason asks for, in ms, or ``None``.
-
-    Tolerant of the shapes a close reason can carry in its 123 bytes: a JSON
-    object (``retry_after_ms`` / ``retry_after_s`` / ``retry_after`` in
-    seconds) or text (``retry_after_ms=…``, ``retry_after=…`` seconds,
-    ``retry in 30s``). Pure."""
-    text = reason.strip()
-    if not text:
-        return None
-    if text.startswith("{"):
-        try:
-            data = json.loads(text)
-        except ValueError:
-            data = None
-        if isinstance(data, dict):
-            for key, scale in (
-                ("retry_after_ms", 1.0),
-                ("retry_after_s", 1000.0),
-                ("retry_after", 1000.0),
-            ):
-                value = data.get(key)
-                if isinstance(value, (int, float)) and not isinstance(value, bool) and value >= 0:
-                    return int(value * scale)
-    for pattern, scale in _RETRY_HINT_PATTERNS:
-        match = pattern.search(text)
-        if match:
-            return int(float(match.group(1)) * scale)
-    return None
-
-
-def _rate_limit_delay_ms(hint_ms: int | None) -> int:
-    """The delay before the next attempt after a connect-budget answer."""
-    base = _RATE_LIMIT_DEFAULT_DELAY_MS if hint_ms is None else hint_ms
-    return _jittered_above_ms(min(max(0, base), _RATE_LIMIT_MAX_DELAY_MS), _RATE_LIMIT_JITTER)
+def _budget_wait_ms(delay_ms: int) -> int:
+    """The server's delay, up to 10 % longer to spread a fleet told the same
+    delay, never shorter."""
+    return _jittered_above_ms(delay_ms, _RATE_LIMIT_JITTER)
 
 
 def _upgrade_rejection(err: BaseException) -> tuple[int, str | None] | None:
@@ -651,7 +612,7 @@ class RealtimeClient:
         handshake_timeout_ms: int | None = None,
         liveness_timeout_ms: int | None = None,
         ack_on_receipt: bool | None = None,
-        rewake: bool | None = None,
+        capabilities: SocketCapabilityOptions | None = None,
         websocket_connect: Callable[..., Awaitable[Any]] | None = None,
     ) -> None:
         if options is None:
@@ -686,7 +647,7 @@ class RealtimeClient:
                 ),
                 liveness_timeout_ms=liveness_timeout_ms,
                 ack_on_receipt=bool(ack_on_receipt),
-                rewake=bool(rewake),
+                capabilities=capabilities,
             )
 
         # A private copy: the client writes to its options (the auto-drain
@@ -854,20 +815,25 @@ class RealtimeClient:
             ws = await connect_fn(url, **_keepalive_kwargs(connect_fn))
         except Exception as err:
             self._connecting = False
-            min_delay_ms: int | None = None
+            budget_ms: int | None = None
             rejection = _upgrade_rejection(err)
-            if rejection is not None and rejection[0] == 429:
-                # The connect budget, before the upgrade: backoff with the
-                # server's delay, never blocked.
-                min_delay_ms = _rate_limit_delay_ms(parse_retry_after(rejection[1]))
-                self._rate_limited_ms = min_delay_ms
-                _log.warning(
-                    "AgentChat realtime: connect budget exceeded (HTTP 429); next attempt in %.0fs",
-                    min_delay_ms / 1000.0,
+            if rejection is not None:
+                # The connect budget, before the upgrade (HTTP 429): backoff
+                # with the server's delay, never blocked.
+                budget_ms = connect_budget_delay_ms(
+                    BudgetUpgrade(status=rejection[0], retry_after=rejection[1])
                 )
-            error = _RealtimeConnectionError(f"WebSocket connection failed: {err}")
+            if budget_ms is not None:
+                self._rate_limited_ms = budget_ms
+                error = _RealtimeConnectionError(
+                    f"the server refused the connection: connect budget exceeded"
+                    f" (HTTP {rejection[0] if rejection else 429});"
+                    f" retrying in {round(budget_ms / 1000)}s"
+                )
+            else:
+                error = _RealtimeConnectionError(f"WebSocket connection failed: {err}")
             await self._emit_error(error)
-            await self._schedule_reconnect(min_delay_ms=min_delay_ms)
+            await self._schedule_reconnect(server_delay_ms=budget_ms)
             raise error from err
         finally:
             self._connecting = False
@@ -919,9 +885,12 @@ class RealtimeClient:
         self._recv_task = asyncio.create_task(self._recv_loop())
 
     def _advertised_capabilities(self) -> list[str]:
-        caps = list(_CLIENT_CAPABILITIES)
-        if self._opts.rewake:
-            caps.append(_REWAKE_CAPABILITY)
+        offered = self._opts.capabilities or {}
+        caps = ["ack"]
+        if offered.get("heartbeat", True) is not False:
+            caps.append("heartbeat")
+        if offered.get("rewake", False) is True:
+            caps.append("rewake")
         return caps
 
     def _resolve_connect_fn(self) -> Callable[..., Awaitable[Any]]:
@@ -1270,15 +1239,12 @@ class RealtimeClient:
             # usually, the delay it wants. Backoff with that delay; never an
             # auth verdict, whenever it arrives.
             rate_limited_ms: int | None = None
-            if not ours and close_code == _RATE_LIMIT_CLOSE_CODE:
-                rate_limited_ms = _rate_limit_delay_ms(_retry_hint_ms(close_reason))
-                self._rate_limited_ms = rate_limited_ms
-                _log.warning(
-                    "AgentChat realtime: connect budget exceeded (close 1013 %r);"
-                    " next attempt in %.0fs",
-                    close_reason,
-                    rate_limited_ms / 1000.0,
+            if not ours:
+                rate_limited_ms = connect_budget_delay_ms(
+                    BudgetClose(code=close_code, reason=close_reason)
                 )
+                if rate_limited_ms is not None:
+                    self._rate_limited_ms = rate_limited_ms
 
             info: dict[str, Any] = {
                 "code": close_code,
@@ -1293,6 +1259,13 @@ class RealtimeClient:
             if rate_limited_ms is not None:
                 info["retry_after_ms"] = rate_limited_ms
             await self._emit_disconnect(info)
+            if rate_limited_ms is not None and not self._disposed:
+                await self._emit_error(
+                    _RealtimeConnectionError(
+                        f"the server refused the connection: connect budget exceeded"
+                        f" (close {close_code}); retrying in {round(rate_limited_ms / 1000)}s"
+                    )
+                )
 
             # Ack-on-receipt: every frame parked on a seq gap was acknowledged
             # at parse, so the server has it `delivered` and will never
@@ -1315,6 +1288,7 @@ class RealtimeClient:
                 if (
                     not ours
                     and not handshake_done
+                    and rate_limited_ms is None
                     and _is_auth_rejection_close(close_code, close_reason)
                 ):
                     # The server rejected the key during the handshake. Not
@@ -1326,7 +1300,7 @@ class RealtimeClient:
                     # server timed out, an eviction after hello.ok, or the
                     # connect budget: the next HELLO is the evidence (rules 2
                     # and 3), after the server's delay when it gave one.
-                    await self._schedule_reconnect(min_delay_ms=rate_limited_ms)
+                    await self._schedule_reconnect(server_delay_ms=rate_limited_ms)
 
     # ─── Offline drain ───────────────────────────────────────────────
 
@@ -1515,10 +1489,11 @@ class RealtimeClient:
 
     # ─── Reconnect ───────────────────────────────────────────────────
 
-    async def _schedule_reconnect(self, *, min_delay_ms: int | None = None) -> None:
+    async def _schedule_reconnect(self, *, server_delay_ms: int | None = None) -> None:
         """Arm the normal backoff. No attempt cap: the client never gives up
-        on its own (rule 1). ``min_delay_ms`` is a delay the server asked for
-        (the connect budget): the next attempt waits at least that long."""
+        on its own (rule 1). ``server_delay_ms`` is the delay the server
+        asked for (the connect budget): it replaces the backoff step (the
+        client waits up to 10 % longer, never less)."""
         if self._disposed:
             return
         if self._connecting or self._ws is not None:
@@ -1548,9 +1523,11 @@ class RealtimeClient:
                 _LONG_OUTAGE_AFTER_ATTEMPTS,
                 max(self._opts.max_reconnect_interval_ms, _LONG_OUTAGE_MAX_INTERVAL_MS) / 1000.0,
             )
-        delay_ms = self._compute_reconnect_delay_ms(attempt)
-        if min_delay_ms is not None:
-            delay_ms = max(delay_ms, min_delay_ms)
+        delay_ms = (
+            _budget_wait_ms(server_delay_ms)
+            if server_delay_ms is not None
+            else self._compute_reconnect_delay_ms(attempt)
+        )
         delay_s = delay_ms / 1000.0
         _log.debug("realtime reconnect %d scheduled in %.1fs", attempt, delay_s)
         await self._set_state("backoff")
@@ -1953,17 +1930,20 @@ class RealtimeClient:
         """
         loop = asyncio.get_running_loop()
         message_id = _extract_message_id(message)
-        # The socket this copy is acknowledged on, whenever it settles.
-        via = self._ws
+        handlers = list(self._handlers.get("message.new", ()))
+        first = self._inflight.get(message_id) if message_id is not None else None
+
+        if first is None and not handlers:
+            # No handler attached: nothing on this machine received the
+            # message. Not acked on any path (the drain cursor stops here
+            # too) and not remembered, so the server keeps offering it until
+            # a handler is there.
+            return self._settle_drain_row(message, _resolved(loop, False))
 
         if message_id is not None and self._dedup.hit(message_id):
             if ws_ack:
                 await self._send_delivery_ack(message_id)
             return self._settle_drain_row(message, _resolved(loop, True))
-
-        handlers = list(self._handlers.get("message.new", ()))
-        if not handlers:
-            return self._settle_drain_row(message, _resolved(loop, False))
 
         adopted = self._adopt_in_flight(message, ws_ack=ws_ack)
         if adopted is not None:
@@ -1988,12 +1968,10 @@ class RealtimeClient:
             # ack goes out in arrival order exactly as before.
             self._finish_dispatch_sync(message_id, own, ok=ok)
             if ok and ws_ack and message_id is not None:
-                await self._send_delivery_ack(message_id, via=via)
+                await self._send_delivery_ack(message_id)
             return self._settle_drain_row(message, _resolved(loop, ok))
 
-        settlement = self._settle_later(
-            message_id, own, started, ok=ok, ack_via=via if ws_ack else None
-        )
+        settlement = self._settle_later(message_id, own, started, ok=ok, ws_ack=ws_ack)
         return self._settle_drain_row(message, settlement)
 
     def _settle_later(
@@ -2003,11 +1981,12 @@ class RealtimeClient:
         started: list[asyncio.Future[Any]],
         *,
         ok: bool,
-        ack_via: Any,
+        ws_ack: bool,
     ) -> asyncio.Future[bool]:
-        """Wait for the async handlers off the receive loop, then settle;
-        acknowledge on ``ack_via`` (the socket the copy came in on) when it
-        is set and every handler settled cleanly."""
+        """Wait for the async handlers off the receive loop, then settle, and
+        acknowledge (``ws_ack``) on the current socket when every handler
+        settled cleanly. After a reconnect that is the new socket: the server
+        accepts an ack for a message on any connection of the agent."""
 
         async def settle() -> bool:
             try:
@@ -2027,8 +2006,8 @@ class RealtimeClient:
                             exc_info=(type(result), result, result.__traceback__),
                         )
             self._finish_dispatch_sync(message_id, own, ok=clean)
-            if clean and ack_via is not None and message_id is not None and not self._disposed:
-                await self._send_delivery_ack(message_id, via=ack_via)
+            if clean and ws_ack and message_id is not None and not self._disposed:
+                await self._send_delivery_ack(message_id)
             return clean
 
         task: asyncio.Future[bool] = asyncio.ensure_future(settle())
@@ -2074,12 +2053,11 @@ class RealtimeClient:
         if id(message) in self._drain_settlements:
             self._drain_adopted[id(message)] = first.outcome
         if ws_ack:
-            via = self._ws
 
             def ack_if_handled(outcome: asyncio.Future[bool]) -> None:
                 if outcome.cancelled() or not outcome.result() or self._disposed:
                     return
-                self._spawn(self._send_delivery_ack(message_id, via=via))
+                self._spawn(self._send_delivery_ack(message_id))
 
             first.outcome.add_done_callback(ack_if_handled)
         return first.outcome
@@ -2092,14 +2070,8 @@ class RealtimeClient:
             self._drain_settlements[key] = settlement
         return settlement
 
-    async def _send_delivery_ack(self, message_id: str, *, via: Any = None) -> None:
+    async def _send_delivery_ack(self, message_id: str) -> None:
         """Send a delivery-ack frame if this connection negotiated ack-mode.
-
-        ``via`` is the socket the copy being acknowledged arrived on: the
-        ack goes out only while that socket is still the current one. A
-        settlement that ends after a reconnect sends nothing — the server
-        re-offers the frame on the new connection, where that copy (adopted
-        or a dedup hit) is acknowledged on its own socket, once.
 
         Best-effort by design: a lost ack (socket died mid-send) leaves
         the envelope ``stored`` server-side; it re-arrives on the next
@@ -2109,7 +2081,7 @@ class RealtimeClient:
         if not self._ack_negotiated:
             return
         ws = self._ws
-        if ws is None or (via is not None and via is not ws):
+        if ws is None or not self._authenticated:
             return
         try:
             await ws.send(json.dumps({"type": "ack", "message_id": message_id}))
@@ -2586,48 +2558,41 @@ def _log_handler_failure(task: asyncio.Future[Any]) -> None:
         )
 
 
-_WAKE_CONVERSATION_IDS_MAX = 50
-
-
 def wake_payload_problem(payload: Any) -> str | None:
     """Why a ``wake`` frame's payload is not one, or ``None`` when it is.
 
-    Minimal on purpose: a newer reason may arrive ahead of this SDK, and any
-    wake means the same thing (read the tray). Required: ``reason``, a
-    non-empty string. The fields each known reason carries are required for
-    it (``reminder``: ``conversation_id``, ``anchor_message_id``, ``step``,
-    ``at``; ``unanswered``: ``conversation_ids`` (≤ 50), ``step``, ``at``),
-    and any of them present on another reason must be well-typed. Pure.
+    Every wake carries ``reason`` and ``at`` (non-empty strings). A
+    ``reminder`` also carries ``conversation_id``, ``anchor_message_id`` and
+    an integer ``step``; an ``unanswered`` wake a list of conversation ids
+    (``conversation_ids``) and an integer ``step``. A reason this SDK does
+    not know yet is forwarded (its ``step``, when present, is an integer):
+    any wake means the same thing — read the tray. Pure.
     """
     if not isinstance(payload, dict):
         return "payload is not an object"
-    reason = payload.get("reason")
-    if not isinstance(reason, str) or not reason:
-        return "reason is not a non-empty string"
-    required: tuple[str, ...] = ()
+
+    def text(key: str) -> str | None:
+        value = payload.get(key)
+        return None if isinstance(value, str) and value else f"{key} is not a non-empty string"
+
+    problem = text("reason") or text("at")
+    if problem is not None:
+        return problem
+    step = payload.get("step")
+    integer_step = isinstance(step, int) and not isinstance(step, bool)
+    reason = payload["reason"]
     if reason == "reminder":
-        required = ("conversation_id", "anchor_message_id", "step", "at")
-    elif reason == "unanswered":
-        required = ("conversation_ids", "step", "at")
-    for key in required:
-        if key not in payload:
-            return f"{key} is missing"
-    for key in ("conversation_id", "anchor_message_id", "at"):
-        if key in payload and (not isinstance(payload[key], str) or not payload[key]):
-            return f"{key} is not a non-empty string"
-    if "step" in payload:
-        step = payload["step"]
-        if not isinstance(step, int) or isinstance(step, bool):
-            return "step is not an integer"
-    if "conversation_ids" in payload:
-        ids = payload["conversation_ids"]
-        if (
-            not isinstance(ids, list)
-            or len(ids) > _WAKE_CONVERSATION_IDS_MAX
-            or not all(isinstance(item, str) and item for item in ids)
-        ):
-            return "conversation_ids is not a list of at most 50 non-empty strings"
-    return None
+        return (
+            text("conversation_id")
+            or text("anchor_message_id")
+            or (None if integer_step else "step is not an integer")
+        )
+    if reason == "unanswered":
+        ids = payload.get("conversation_ids")
+        if not isinstance(ids, list) or not all(isinstance(i, str) and i for i in ids):
+            return "conversation_ids is not a list of ids"
+        return None if integer_step else "step is not an integer"
+    return None if "step" not in payload or integer_step else "step is not an integer"
 
 
 async def _release_tasks(
@@ -2715,4 +2680,5 @@ __all__ = [
     "RealtimeState",
     "SequenceGapHandler",
     "SequenceGapInfo",
+    "SocketCapabilityOptions",
 ]

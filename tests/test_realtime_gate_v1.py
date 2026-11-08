@@ -13,7 +13,7 @@ from typing import Any
 import pytest
 
 from agentchatme import RealtimeClient, _realtime
-from agentchatme._realtime import _retry_hint_ms, _upgrade_rejection, wake_payload_problem
+from agentchatme._realtime import _upgrade_rejection, wake_payload_problem
 
 from .test_realtime import MockWebSocket, _ack_frames, _make_client, _settle
 from .test_realtime_engine import connected, message_new
@@ -177,12 +177,20 @@ async def test_a_wake_handler_alone_does_not_make_message_frames_ackable() -> No
 # ─────────────── capabilities: heartbeat, rewake ───────────────
 
 
-@pytest.mark.parametrize(("rewake", "caps"), [(False, ["ack", "heartbeat"]), (True, ["ack", "heartbeat", "rewake"])])
+@pytest.mark.parametrize(
+    ("offered", "caps"),
+    [
+        (None, ["ack", "heartbeat"]),
+        ({"rewake": True}, ["ack", "heartbeat", "rewake"]),
+        ({"heartbeat": False}, ["ack"]),
+        ({"heartbeat": False, "rewake": True}, ["ack", "rewake"]),
+    ],
+)
 @pytest.mark.asyncio
-async def test_hello_advertises_heartbeat_and_rewake_only_when_asked(
-    rewake: bool, caps: list[str]
+async def test_hello_offers_heartbeat_by_default_and_rewake_only_when_asked(
+    offered: Any, caps: list[str]
 ) -> None:
-    rt, ws = _make_client(rewake=rewake)
+    rt, ws = _make_client(capabilities=offered)
     try:
         await rt.connect()
         await _settle()
@@ -193,7 +201,7 @@ async def test_hello_advertises_heartbeat_and_rewake_only_when_asked(
 
 @pytest.mark.asyncio
 async def test_negotiated_capabilities_are_exposed_and_cleared_on_close() -> None:
-    rt, ws = await connected(capabilities=["ack", "heartbeat", "rewake"], rewake=True)
+    rt, ws = await connected(capabilities=["ack", "heartbeat", "rewake"])
     try:
         assert rt.capabilities == frozenset({"ack", "heartbeat", "rewake"})
         await ws.close(code=1006)
@@ -245,7 +253,7 @@ async def test_heartbeat_frames_keep_a_quiet_socket_alive_and_their_absence_trip
 
 @pytest.mark.asyncio
 async def test_an_unanswered_wake_reaches_wake_handlers() -> None:
-    rt, ws = await connected(capabilities=["ack", "heartbeat", "rewake"], rewake=True)
+    rt, ws = await connected(capabilities=["ack", "heartbeat", "rewake"])
     wakes: list[dict[str, Any]] = []
     rt.on("wake", lambda m: wakes.append(m["payload"]))
     payload = {
@@ -267,16 +275,19 @@ async def test_an_unanswered_wake_reaches_wake_handlers() -> None:
     ("payload", "problem"),
     [
         ({"reason": "unanswered", "conversation_ids": ["a"], "step": 1, "at": "t"}, None),
+        ({"reason": "unanswered", "conversation_ids": ["a"] * 60, "step": 4, "at": "t"}, None),
         ({"reason": "reminder", "conversation_id": "c", "anchor_message_id": "m", "step": 1, "at": "t"}, None),
-        ({"reason": "something_new"}, None),
-        ({"reason": "something_new", "conversation_ids": ["a"], "step": 3}, None),
-        ({"reason": "unanswered", "step": 1, "at": "t"}, "conversation_ids is missing"),
+        ({"reason": "something_new", "at": "t"}, None),
+        ({"reason": "something_new", "at": "t", "conversation_ids": ["a"], "step": 3}, None),
+        ({"reason": "something_new"}, "at"),
+        ({"reason": "something_new", "at": "t", "step": "3"}, "step"),
+        ({"reason": "unanswered", "step": 1, "at": "t"}, "conversation_ids"),
         ({"reason": "unanswered", "conversation_ids": "a", "step": 1, "at": "t"}, "conversation_ids"),
-        ({"reason": "unanswered", "conversation_ids": ["a"] * 51, "step": 1, "at": "t"}, "conversation_ids"),
         ({"reason": "unanswered", "conversation_ids": [""], "step": 1, "at": "t"}, "conversation_ids"),
         ({"reason": "unanswered", "conversation_ids": ["a"], "step": "1", "at": "t"}, "step"),
-        ({"reason": "reminder", "conversation_id": "c", "step": 1, "at": "t"}, "anchor_message_id is missing"),
-        ({"reason": ""}, "reason"),
+        ({"reason": "unanswered", "conversation_ids": ["a"], "at": "t"}, "step"),
+        ({"reason": "reminder", "conversation_id": "c", "step": 1, "at": "t"}, "anchor_message_id"),
+        ({"reason": "", "at": "t"}, "reason"),
         ({}, "reason"),
         ([], "payload is not an object"),
     ],
@@ -290,26 +301,6 @@ def test_wake_payload_problem(payload: Any, problem: str | None) -> None:
 
 
 # ─────────────── the connect budget ───────────────
-
-
-@pytest.mark.parametrize(
-    ("reason", "ms"),
-    [
-        ('{"retry_after_ms": 1500}', 1500),
-        ('{"retry_after": 30}', 30_000),
-        ('{"retry_after_s": 2.5}', 2500),
-        ("retry_after_ms=1500", 1500),
-        ("rate limited; retry_after=45", 45_000),
-        ("Retry-After: 12", 12_000),
-        ("too many connections, retry in 30s", 30_000),
-        ("retry in 1500ms", 1500),
-        ("retry in 2m", 120_000),
-        ("connect budget exceeded", None),
-        ("", None),
-    ],
-)
-def test_retry_hint_ms(reason: str, ms: int | None) -> None:
-    assert _retry_hint_ms(reason) == ms
 
 
 @pytest.mark.asyncio
@@ -333,8 +324,8 @@ async def test_a_1013_close_backs_off_with_the_servers_delay_and_never_blocks() 
         assert rt.state == "backoff"
         assert rt.blocked_reason is None
         assert 30.0 <= sleep.delays[0] <= 33.0
-        assert disconnects[-1]["retry_after_ms"] >= 30_000
-        assert rt.rate_limited_ms is not None and rt.rate_limited_ms >= 30_000
+        assert disconnects[-1]["retry_after_ms"] == 30_000
+        assert rt.rate_limited_ms == 30_000
         sleep.release()
         await _until(lambda: len(handed) == 2)
         await second.push({"type": "hello.ok", "capabilities": ["ack"]})
@@ -347,6 +338,7 @@ async def test_a_1013_close_backs_off_with_the_servers_delay_and_never_blocks() 
 
 @pytest.mark.asyncio
 async def test_a_1013_close_during_the_handshake_is_not_an_auth_rejection() -> None:
+    # Even with the auth reason in the text: 1013 is the budget, never blocked.
     sock = MockWebSocket()
     rt, _handed = _client_with_sockets([sock])
     sleep = ControlledSleep(hold=True)
@@ -355,10 +347,11 @@ async def test_a_1013_close_during_the_handshake_is_not_an_auth_rejection() -> N
         await rt.connect()
         await _settle()
         sock.close_code = 1013
-        sock.close_reason = ""
+        sock.close_reason = "invalid token"
         await sock._inbox.put(None)
         await _until(lambda: bool(sleep.delays))
         assert rt.state == "backoff"
+        assert rt.blocked_reason is None
         # No hint: the per-minute budget's window.
         assert 60.0 <= sleep.delays[0] <= 66.0
     finally:
@@ -453,8 +446,3 @@ async def test_a_429_without_retry_after_waits_the_default_window() -> None:
         await rt.disconnect()
 
 
-@pytest.mark.asyncio
-async def test_a_server_hint_is_capped_at_an_hour() -> None:
-    assert _realtime._rate_limit_delay_ms(10 * 60 * 60_000) <= int(
-        _realtime._RATE_LIMIT_MAX_DELAY_MS * 1.1
-    )
