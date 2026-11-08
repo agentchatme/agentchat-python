@@ -25,8 +25,11 @@ from agentchatme.integration import (
     TrackedTurn,
     TurnAdmission,
     TurnEnd,
+    TurnOutcome,
     TurnRequest,
     TurnTracker,
+    apply_outcome,
+    apply_outcome_async,
     probe_hosted_tools,
     probe_hosted_tools_async,
     sync_manual,
@@ -679,12 +682,84 @@ async def test_looked_and_did_nothing_is_dismissed_the_second_time_for_the_same_
     await loop.start()
     for index in range(2):
         await _cycle(loop)
-        turns.ends[index].set_result(TurnEnd(status="completed"))
+        turns.ends[index].set_result(TurnEnd(status="completed", agentchat_calls=AgentChatCallCount(made=3, failed=0)))
         await asyncio.sleep(0.02)
     assert client.decisions.recorded == [
         {"conversation_id": "c1", "decision": "dismiss", "category": "no_action_needed", "through_message_id": "m1"}
     ]
     assert loop.status().counters["outcomes"] == {"silent_first": 1, "silent_again": 1}
+    await loop.stop()
+
+
+def _outcomes() -> list[TurnOutcome]:
+    return [
+        TurnOutcome("record_reply", "answer_sent", "c1", "m1", "open_request"),
+        TurnOutcome("record_dismiss", "silent_again", "c2", None, "no_action_needed"),
+        TurnOutcome("record_defer", "silent_again", "c3", "m3", None),
+        TurnOutcome("none", "silent_first", "c4"),
+    ]
+
+
+_RECORDED = [
+    {"conversation_id": "c1", "decision": "reply", "category": "open_request", "through_message_id": "m1"},
+    {"conversation_id": "c2", "decision": "dismiss", "category": "no_action_needed"},
+    {"conversation_id": "c3", "decision": "defer", "through_message_id": "m3"},
+]
+
+
+def test_apply_outcome_makes_one_recording_call_per_action() -> None:
+    recorded: list[dict[str, Any]] = []
+
+    class _SyncDecisions:
+        def record(self, conversation_id: str, **kwargs: Any) -> Any:
+            recorded.append({"conversation_id": conversation_id, **kwargs})
+            return {"id": "dec"}
+
+    class _SyncClient:
+        decisions = _SyncDecisions()
+        groups = None
+
+    assert [apply_outcome(_SyncClient(), o) for o in _outcomes()] == [True, True, True, False]
+    assert recorded == _RECORDED
+
+
+@pytest.mark.asyncio
+async def test_apply_outcome_async_makes_one_recording_call_per_action() -> None:
+    client = _LoopClient([_tray([])])
+    assert [await apply_outcome_async(client, o) for o in _outcomes()] == [True, True, True, False]
+    assert client.decisions.recorded == _RECORDED
+
+
+@pytest.mark.asyncio
+async def test_with_the_calls_unknown_the_second_silent_look_records_defer_not_dismiss() -> None:
+    client = _LoopClient([_tray([_card("c1", "m1")])])
+    turns = _Turns()
+    loop = _loop(client, call_model=lambda _p: _answer(("c1", "reply")), start_turn=turns, pace_ms=0)
+    await loop.start()
+    for index in range(2):
+        await _cycle(loop)
+        turns.ends[index].set_result(TurnEnd(status="completed", agentchat_calls=None))
+        await asyncio.sleep(0.02)
+    # Unread, back on the server's reminder ladder: no category, the gate's anchor.
+    assert client.decisions.recorded == [{"conversation_id": "c1", "decision": "defer", "through_message_id": "m1"}]
+    assert loop.status().counters["outcomes"] == {"silent_first": 1, "silent_again": 1}
+    await loop.stop()
+
+
+@pytest.mark.asyncio
+async def test_a_turn_that_sent_and_then_failed_records_reply_and_is_not_gated_again() -> None:
+    sent = _tray([_card("c1", "m1", you_owe_reply=False, your_last_message_at="2026-11-08T09:11:30.000Z")])
+    client = _LoopClient([_tray([_card("c1", "m1")]), sent])
+    turns = _Turns()
+    loop = _loop(client, call_model=lambda _p: _answer(("c1", "reply")), start_turn=turns)
+    await loop.start()
+    await _cycle(loop)
+    turns.ends[0].set_result(TurnEnd(status="failed", detail="the runtime hit its time limit after the send"))
+    await asyncio.sleep(0.05)
+    assert client.decisions.recorded == [
+        {"conversation_id": "c1", "decision": "reply", "through_message_id": "m1"}
+    ]
+    assert loop.status().counters["outcomes"] == {"answer_sent": 1}
     await loop.stop()
 
 

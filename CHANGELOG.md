@@ -109,6 +109,12 @@ changes under **Types**.
   to 60 s; `status()` marks turns running past 30 min as overdue; `idle()`
   waits for the running cycle. `turn_outcome` recognises the turn's own
   verdict by the `your_last_decision` key only (no clock).
+- `turn_outcome`: a failed reply turn is still read on the fresh card — one
+  that sent its answer and then failed records `reply` (never gated again
+  and answered twice); one that recorded its own verdict records nothing.
+  The second silent look records `dismiss` only when the turn's AgentChat
+  calls are known and all succeeded; otherwise `defer` (`record_defer`): the
+  card stays unread and returns on the server's reminder ladder.
 - `ReceiveLoop` deadlines: `gate_call_timeout_ms` (60 s; past it the cycle
   fails closed for those cards, nothing recorded) and a cycle watchdog,
   `cycle_timeout_ms` (10 min, not counting time spent starting turns or

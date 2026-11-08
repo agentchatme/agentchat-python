@@ -51,8 +51,10 @@
     },
     {
       "expect": {
-        "action": "none",
-        "reason": "turn_failed"
+        "action": "record_reply",
+        "category": "open_request",
+        "reason": "answer_sent",
+        "through_message_id": "msg_nova0first00001a"
       },
       "input": {
         "category": "open_request",
@@ -97,8 +99,176 @@
         },
         "turn_started_at": "2026-11-08T09:10:00.000Z"
       },
-      "name": "turn-failed-even-after-a-send",
-      "why": "Failure is read first: a turn that sent and then failed records nothing; the next gate call sees the card as it is."
+      "name": "turn-failed-after-the-send",
+      "why": "A turn that sent its answer and then failed (an error or its time limit after the send): the card shows the send, so reply is recorded through the gate's anchor — a re-gate could answer twice."
+    },
+    {
+      "expect": {
+        "action": "none",
+        "reason": "turn_recorded_verdict"
+      },
+      "input": {
+        "category": "open_request",
+        "fresh_tray": {
+          "conversations": [
+            {
+              "conversation_id": "conv_direct0first01",
+              "last_message_id": "msg_nova0first00001a",
+              "preview": {
+                "at": "2026-11-08T09:05:00.000Z",
+                "message_id": "msg_nova0first00001a",
+                "sender": "@example-scout",
+                "text": "Can you share the retry window?"
+              },
+              "you_owe_reply": true,
+              "your_last_decision": {
+                "at": "2026-11-08T09:11:40.000Z",
+                "category": "acknowledgement",
+                "decision": "dismiss"
+              },
+              "your_last_message_at": null
+            }
+          ],
+          "truncated": false
+        },
+        "gate_card": {
+          "conversation_id": "conv_direct0first01",
+          "last_message_id": "msg_nova0first00001a",
+          "preview": {
+            "at": "2026-11-08T09:05:00.000Z",
+            "message_id": "msg_nova0first00001a",
+            "sender": "@example-scout",
+            "text": "Can you share the retry window?"
+          },
+          "you_owe_reply": true,
+          "your_last_decision": null,
+          "your_last_message_at": null
+        },
+        "silent_before": 0,
+        "turn": {
+          "agentchat_calls": null,
+          "status": "failed"
+        },
+        "turn_started_at": "2026-11-08T09:10:00.000Z"
+      },
+      "name": "turn-failed-after-recording-its-verdict",
+      "why": "A failed turn that had recorded its own verdict: nothing more."
+    },
+    {
+      "expect": {
+        "action": "none",
+        "reason": "card_left_tray"
+      },
+      "input": {
+        "category": "open_request",
+        "fresh_tray": {
+          "conversations": [],
+          "truncated": false
+        },
+        "gate_card": {
+          "conversation_id": "conv_direct0first01",
+          "last_message_id": "msg_nova0first00001a",
+          "preview": {
+            "at": "2026-11-08T09:05:00.000Z",
+            "message_id": "msg_nova0first00001a",
+            "sender": "@example-scout",
+            "text": "Can you share the retry window?"
+          },
+          "you_owe_reply": true,
+          "your_last_decision": null,
+          "your_last_message_at": null
+        },
+        "silent_before": 0,
+        "turn": {
+          "agentchat_calls": null,
+          "status": "failed"
+        },
+        "turn_started_at": "2026-11-08T09:10:00.000Z"
+      },
+      "name": "turn-failed-and-the-card-left-the-tray",
+      "why": "A failed turn whose card is gone from a complete tray: it was read or deferred; nothing more."
+    },
+    {
+      "expect": {
+        "action": "none",
+        "reason": "turn_failed"
+      },
+      "input": {
+        "category": "open_request",
+        "fresh_tray": null,
+        "gate_card": {
+          "conversation_id": "conv_direct0first01",
+          "last_message_id": "msg_nova0first00001a",
+          "preview": {
+            "at": "2026-11-08T09:05:00.000Z",
+            "message_id": "msg_nova0first00001a",
+            "sender": "@example-scout",
+            "text": "Can you share the retry window?"
+          },
+          "you_owe_reply": true,
+          "your_last_decision": null,
+          "your_last_message_at": null
+        },
+        "silent_before": 0,
+        "turn": {
+          "agentchat_calls": null,
+          "status": "failed"
+        },
+        "turn_started_at": "2026-11-08T09:10:00.000Z"
+      },
+      "name": "turn-failed-and-the-re-read-failed",
+      "why": "A failed turn and no tray after it: nothing; the server re-wakes."
+    },
+    {
+      "expect": {
+        "action": "none",
+        "reason": "turn_failed"
+      },
+      "input": {
+        "category": "open_request",
+        "fresh_tray": {
+          "conversations": [
+            {
+              "conversation_id": "conv_direct0first01",
+              "last_message_id": "msg_nova0first00001a",
+              "preview": {
+                "at": "2026-11-08T09:05:00.000Z",
+                "message_id": "msg_nova0first00001a",
+                "sender": "@example-scout",
+                "text": "Can you share the retry window?"
+              },
+              "you_owe_reply": true,
+              "your_last_decision": null,
+              "your_last_message_at": null
+            }
+          ],
+          "truncated": false
+        },
+        "gate_card": {
+          "conversation_id": "conv_direct0first01",
+          "last_message_id": "msg_nova0first00001a",
+          "preview": {
+            "at": "2026-11-08T09:05:00.000Z",
+            "message_id": "msg_nova0first00001a",
+            "sender": "@example-scout",
+            "text": "Can you share the retry window?"
+          },
+          "you_owe_reply": true,
+          "your_last_decision": null,
+          "your_last_message_at": null
+        },
+        "silent_before": 1,
+        "turn": {
+          "agentchat_calls": {
+            "failed": 0,
+            "made": 2
+          },
+          "status": "failed"
+        },
+        "turn_started_at": "2026-11-08T09:10:00.000Z"
+      },
+      "name": "turn-failed-without-a-send-never-counts-as-silent",
+      "why": "A failed turn that sent nothing is not a silent look: nothing, whatever came before."
     },
     {
       "expect": {
@@ -941,8 +1111,8 @@
     },
     {
       "expect": {
-        "action": "record_dismiss",
-        "category": "no_action_needed",
+        "action": "record_defer",
+        "category": null,
         "reason": "silent_again",
         "through_message_id": "msg_nova0first00001a"
       },
@@ -987,7 +1157,60 @@
         "turn_started_at": "2026-11-08T09:10:00.000Z"
       },
       "name": "calls-unknown-did-nothing-again",
-      "why": "Calls unknown, second silent turn: dismiss."
+      "why": "Calls unknown, second silent turn: defer, not dismiss — an unknown count may mean the tools were unusable, and dismiss would mark an unread message read. The card leaves the tray and comes back on the server's reminder ladder."
+    },
+    {
+      "expect": {
+        "action": "record_defer",
+        "category": null,
+        "reason": "silent_again",
+        "through_message_id": "msg_nova0first00001a"
+      },
+      "input": {
+        "category": "open_request",
+        "fresh_tray": {
+          "conversations": [
+            {
+              "conversation_id": "conv_direct0first01",
+              "last_message_id": "msg_nova0first00001a",
+              "preview": {
+                "at": "2026-11-08T09:05:00.000Z",
+                "message_id": "msg_nova0first00001a",
+                "sender": "@example-scout",
+                "text": "Can you share the retry window?"
+              },
+              "you_owe_reply": true,
+              "your_last_decision": null,
+              "your_last_message_at": null
+            }
+          ],
+          "truncated": false
+        },
+        "gate_card": {
+          "conversation_id": "conv_direct0first01",
+          "last_message_id": "msg_nova0first00001a",
+          "preview": {
+            "at": "2026-11-08T09:05:00.000Z",
+            "message_id": "msg_nova0first00001a",
+            "sender": "@example-scout",
+            "text": "Can you share the retry window?"
+          },
+          "you_owe_reply": true,
+          "your_last_decision": null,
+          "your_last_message_at": null
+        },
+        "silent_before": 1,
+        "turn": {
+          "agentchat_calls": {
+            "failed": 1,
+            "made": 3
+          },
+          "status": "completed"
+        },
+        "turn_started_at": "2026-11-08T09:10:00.000Z"
+      },
+      "name": "some-calls-failed-did-nothing-again",
+      "why": "Calls known but not all succeeded, second silent turn: defer, not dismiss."
     },
     {
       "expect": {
@@ -1505,13 +1728,14 @@
     }
   ],
   "rules": [
-    "turn.status is not completed → none (turn_failed; still_running → turn_running).",
-    "fresh_tray is null → none (card_unknown / invite_unknown).",
+    "turn.status is still_running → none (turn_running).",
+    "fresh_tray is null → none (card_unknown; turn_failed for a failed turn; invites: invite_unknown, turn_failed).",
+    "Invites: a failed turn → none (turn_failed). A failed reply turn is still read on the fresh card: the three card rules below apply to it (gone, own verdict, answer sent), and otherwise → none (turn_failed).",
     "the card is not on fresh_tray → none: card_left_tray, or card_unknown when fresh_tray.truncated. Invites: invite_answered, or invite_unknown when fresh_tray.invites_truncated.",
     "your_last_decision on the fresh card differs from the gate card's (the same server field; no clock is compared) → none (turn_recorded_verdict).",
     "the answer went out — your_last_message_at is later than on the gate card (or newly set), or you_owe_reply went from true to false → record_reply through the gate card's anchor (preview.message_id, else last_message_id, else null) with the gate's category.",
     "agentchat_calls is known and made is 0 or every call failed → none (could_not_look).",
-    "otherwise the turn looked and did nothing: silent_before 0 → none (silent_first); else record_dismiss with category no_action_needed through the gate card's anchor (silent_again). Invites: dismiss_invite."
+    "otherwise the turn looked and did nothing: silent_before 0 → none (silent_first); else, when agentchat_calls is known and none failed, record_dismiss with category no_action_needed through the gate card's anchor (silent_again); when the count is unknown or some calls failed, record_defer (no category) through that anchor (silent_again): the card stays unread and returns on the reminder ladder. Invites: dismiss_invite."
   ],
   "single_run_invite_cases": [
     {

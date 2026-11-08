@@ -7,13 +7,17 @@ actually happened, read on a fresh tray, never from the runtime's "turn ok":
 ==========================================================  =========================================
 After the turn                                              Host does
 ==========================================================  =========================================
-runtime reports failure (or has not confirmed the end)      nothing; the card stays (server re-wakes)
+runtime has not confirmed the end                           nothing; the turn keeps its card
 the turn recorded its own verdict (card gone, or            nothing
-``your_last_decision`` moved)
-the card shows the answer went out                          ``reply`` through the anchor the gate saw
+``your_last_decision`` moved) — failed or not
+the card shows the answer went out — failed or not          ``reply`` through the anchor the gate saw
+runtime reports failure, otherwise                          nothing; the card stays (server re-wakes)
 0 AgentChat calls, or all failed (when countable)           nothing (it could not look)
 it looked, sent nothing, recorded nothing                   1st time nothing; 2nd time for the same
                                                             anchor ``dismiss`` (``no_action_needed``)
+                                                            when its AgentChat calls are known and
+                                                            all succeeded, else ``defer`` (unread,
+                                                            back on the reminder ladder)
 ==========================================================  =========================================
 
 :func:`turn_outcome` is the pure decision (conformance
@@ -25,7 +29,9 @@ looked is dismissed — seen, left pending, not shown again.
 Where the copies this replaces differed: Hermes recorded ``reply`` on any
 completed turn (zero AgentChat calls counted as success) and when the
 post-turn tray read failed; OpenClaw on any turn whose run ended ``ok``.
-Here a failed read records nothing (the server's re-wake covers it), "answer
+Here a failed turn is still read on the card (one that sent and then failed
+records ``reply`` and is not gated again, which could answer twice), a failed
+read records nothing (the server's re-wake covers it), "answer
 went out" is read from ``your_last_message_at`` moving (clock-free, and true
 even when the peer has written again since), and a verdict the turn recorded
 is recognised by ``your_last_decision`` changing (clock-free, as Hermes did);
@@ -87,7 +93,7 @@ TurnOutcomeReason = Literal[
     "silent_again",
 ]
 
-TurnAction = Literal["none", "record_reply", "record_dismiss"]
+TurnAction = Literal["none", "record_reply", "record_dismiss", "record_defer"]
 
 
 @dataclass(frozen=True)
@@ -101,7 +107,7 @@ class TurnOutcome:
     """The anchor the gate saw (``record_*`` only)."""
     category: ReplyDecisionCategory | None = None
     """The gate's category for ``record_reply``; ``no_action_needed`` for
-    ``record_dismiss``."""
+    ``record_dismiss``; ``None`` for ``record_defer``."""
 
 
 Instant = Union[str, int, float, datetime]
@@ -144,10 +150,12 @@ def turn_outcome(
 
     if turn.status == "still_running":
         return none("turn_running")
-    if turn.status != "completed":
-        return none("turn_failed")
+    failed = turn.status != "completed"
+    # A failed turn is still read on the fresh card: one that sent its answer
+    # and then failed (an error or its time limit after the send) must not be
+    # gated again, or the peer gets the answer twice.
     if fresh_tray is None:
-        return none("card_unknown")
+        return none("turn_failed" if failed else "card_unknown")
     tray = _data(fresh_tray)
     fresh = next(
         (card for card in cards_of(tray) if card["conversation_id"] == conversation_id), None
@@ -167,16 +175,30 @@ def turn_outcome(
             through_message_id=anchor,
             category=category,
         )
-    if _could_not_look(turn.agentchat_calls):
+    if failed:
+        return none("turn_failed")
+    calls = turn.agentchat_calls
+    if _could_not_look(calls):
         return none("could_not_look")
     if silent_before <= 0:
         return none("silent_first")
+    # Dismiss marks the conversation read: only when the turn's AgentChat calls
+    # are known and all succeeded. An unknown count (or a failed call) may mean
+    # the tools were unusable; defer instead: unread, back on the reminder ladder.
+    if _calls_all_succeeded(calls):
+        return TurnOutcome(
+            action="record_dismiss",
+            reason="silent_again",
+            conversation_id=conversation_id,
+            through_message_id=anchor,
+            category="no_action_needed",
+        )
     return TurnOutcome(
-        action="record_dismiss",
+        action="record_defer",
         reason="silent_again",
         conversation_id=conversation_id,
         through_message_id=anchor,
-        category="no_action_needed",
+        category=None,
     )
 
 
@@ -256,9 +278,8 @@ class _InviteOutcomeClient(Protocol):
 
 
 def _record_kwargs(outcome: TurnOutcome) -> dict[str, Any]:
-    kwargs: dict[str, Any] = {
-        "decision": "reply" if outcome.action == "record_reply" else "dismiss"
-    }
+    decision = {"record_reply": "reply", "record_defer": "defer"}.get(outcome.action, "dismiss")
+    kwargs: dict[str, Any] = {"decision": decision}
     if outcome.category:
         kwargs["category"] = outcome.category
     if outcome.through_message_id:
@@ -267,8 +288,8 @@ def _record_kwargs(outcome: TurnOutcome) -> dict[str, Any]:
 
 
 def apply_outcome(client: _OutcomeClient, outcome: TurnOutcome) -> bool:
-    """Make the one recording call an outcome asks for (``reply`` or
-    ``dismiss`` through the gate's anchor) with a sync client; ``none``
+    """Make the one recording call an outcome asks for (``reply``,
+    ``dismiss`` or ``defer`` through the gate's anchor) with a sync client; ``none``
     makes no call. Returns whether a verdict was recorded. A server error is
     raised to the caller (the card stays on the tray and the server
     re-wakes)."""
@@ -377,6 +398,10 @@ def _could_not_look(calls: AgentChatCallCount | None) -> bool:
     if calls is None:
         return False
     return calls.made <= 0 or calls.failed >= calls.made
+
+
+def _calls_all_succeeded(calls: AgentChatCallCount | None) -> bool:
+    return calls is not None and calls.made > 0 and calls.failed == 0
 
 
 __all__ = [
