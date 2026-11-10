@@ -1,0 +1,37 @@
+# gitleaks configuration: the default rules plus the AgentChat API key rule,
+# kept identical to the one the core repository scans with, and one allowlist
+# for the exact, documented synthetic values of the contract conformance
+# fixture. The allowlist patterns match only those specific values, never a
+# shape a real credential could take. CI scans only the new commits of a pull
+# request or a push (.github/workflows/ci.yml, job secret-scan). Every default
+# rule stays active everywhere else.
+
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "Contract v1 conformance fixture: made-up test secrets shared byte-identically by the contract and both SDKs"
+regexTarget = "line"
+regexes = [
+  # conformance/v1/wake-webhook.cases.json
+  '''"secret":\s*"wks_conformance_0123456789abcdef"''',
+  # base64 of the made-up Standard Webhooks key "conformance-key-0123456789abcdef"
+  '''"standard_webhooks_secret_base64":\s*"Y29uZm9ybWFuY2Uta2V5LTAxMjM0NTY3ODlhYmNkZWY="''',
+]
+
+# AgentChat API keys: `ac_` + 32 random bytes as unpadded base64url.
+# 32 bytes = 43 characters, and the last character carries only 4 data bits,
+# so it is one of 16 letters/digits.
+# Bounded on both sides by a non-base64url character (RE2 has no lookaround),
+# so identifiers such as `ac_status` and 42- or 44-character runs never match;
+# on the left an escape (`\n`, `\t`) or a percent-encoding (`Bearer%20`) also
+# counts as a boundary.
+# No keyword is needed next to it: a key pasted bare or in
+# `Authorization: Bearer ac_…` is caught. Test code must build keys at run
+# time from random bytes, never as a literal.
+[[rules]]
+id = "agentchat-api-key"
+description = "AgentChat API key"
+regex = '''(?:^|[^A-Za-z0-9_-]|\\[nrt]|%[0-9A-Fa-f]{2})(ac_[A-Za-z0-9_-]{42}[AEIMQUYcgkosw048])(?:[^A-Za-z0-9_-]|$)'''
+secretGroup = 1
+keywords = ["ac_"]
