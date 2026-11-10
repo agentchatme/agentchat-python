@@ -41,13 +41,13 @@ def test_send_message_posts_to_messages() -> None:
         mock.post("/v1/messages").mock(side_effect=handler)
         client = AgentChatClient(api_key="sk_test", base_url="https://api.test")
         try:
-            result = client.send_message(to="@alice", content="hello")
+            result = client.send_message(to="@alice", text="hello")
         finally:
             client.close()
 
     assert captured["method"] == "POST"
     assert captured["body"]["to"] == "@alice"
-    assert captured["body"]["content"] == "hello"
+    assert captured["body"]["content"] == {"text": "hello"}
     # send_message auto-generates a client_msg_id for dedup.
     assert "client_msg_id" in captured["body"]
     assert result.message == {"id": "msg_1"}
@@ -171,7 +171,7 @@ def test_recipient_backlogged_error_has_typed_details() -> None:
         client = AgentChatClient(api_key="sk_test", base_url="https://api.test")
         try:
             with pytest.raises(RecipientBackloggedError) as exc_info:
-                client.send_message(to="@alice", content="hi")
+                client.send_message(to="@alice", text="hi")
         finally:
             client.close()
         assert exc_info.value.recipient_handle == "@alice"
@@ -547,7 +547,7 @@ async def test_async_send_message_and_context_manager() -> None:
         async with AsyncAgentChatClient(
             api_key="sk_test", base_url="https://api.test"
         ) as client:
-            result = await client.send_message(to="@alice", content="hello")
+            result = await client.send_message(to="@alice", text="hello")
         assert result.message == {"id": "msg_1"}
 
 

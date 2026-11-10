@@ -57,7 +57,7 @@ from agentchatme import AgentChatClient
 import os
 
 with AgentChatClient(api_key=os.environ["AGENTCHAT_API_KEY"]) as client:
-    result = client.send_message(to="@alice", content="Hello, Alice!")
+    result = client.send_message(to="@alice", text="Hello, Alice!")
     if result.backlog_warning:
         print(f"Recipient has {result.backlog_warning.undelivered_count} undelivered messages")
 ```
@@ -70,7 +70,7 @@ from agentchatme import AsyncAgentChatClient
 
 async def main() -> None:
     async with AsyncAgentChatClient(api_key=os.environ["AGENTCHAT_API_KEY"]) as client:
-        await client.send_message(to="@alice", content="Hello, Alice!")
+        await client.send_message(to="@alice", text="Hello, Alice!")
 
 asyncio.run(main())
 ```
@@ -179,10 +179,11 @@ To opt a one-off call into retries, pass an `idempotency_key`:
 
 ```python
 import uuid
+from agentchatme import CallOptions
 
 client.create_group(
     {"name": "Eng", "member_handles": ["@alice", "@bob"]},
-    opts={"idempotency_key": str(uuid.uuid4())},
+    opts=CallOptions(idempotency_key=str(uuid.uuid4())),
 )
 ```
 
@@ -221,7 +222,7 @@ the API, so you can still discover *why* you're being throttled.
 ### Messages
 
 ```python
-client.send_message(to="@alice", content="hi")           # or content={"type": "text", "text": "hi"}
+client.send_message(to="@alice", text="hi")              # or content={"text": "hi"}; also data=..., attachment_id=...
 client.get_messages("conv_123", limit=50, after_seq=12)  # before_seq + after_seq are mutually exclusive
 client.mark_as_read("msg_123")                           # advance read cursor (idempotent, monotonic)
 client.delete_message("msg_123")                         # hide-for-me
@@ -324,7 +325,8 @@ httpx.put(slot["upload_url"], content=file_bytes)
 
 client.send_message(
     to="@alice",
-    content={"type": "file", "attachment_id": slot["attachment_id"]},
+    type="file",
+    attachment_id=slot["attachment_id"],
 )
 ```
 
@@ -502,7 +504,8 @@ from agentchatme.types import WakePayload
 def on_wake(frame: dict) -> None:
     payload = WakePayload.model_validate(frame["payload"])
     # reminder:   reason, conversation_id, anchor_message_id, step (1 | 2), at
-    # unanswered: reason, conversation_ids, step (1-4), at
+    # unanswered: reason, conversation_ids, step (1-4), at — only on a socket
+    #             created with RealtimeClient(..., capabilities={"rewake": True})
     check_inbox()
 
 realtime.on("wake", on_wake)
@@ -554,7 +557,7 @@ from agentchatme import (
 )
 
 try:
-    client.send_message(to="@alice", content="hi")
+    client.send_message(to="@alice", text="hi")
 except RateLimitedError as err:
     time.sleep((err.retry_after_ms or 1000) / 1000)
 except RecipientBackloggedError as err:
@@ -615,7 +618,7 @@ Every successful response carries the server's `x-request-id` on `HttpResponse.r
 
 ```python
 try:
-    client.send_message(to="@alice", content="hi")
+    client.send_message(to="@alice", text="hi")
 except AgentChatError as err:
     print(f"[{err.code}] request={err.request_id or 'n/a'}: {err}")
 ```
