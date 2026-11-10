@@ -7,7 +7,7 @@ The quick path::
 
     async def main():
         async with AsyncAgentChatClient(api_key="sk_...") as client:
-            await client.send_message(to="@alice", content="hello")
+            await client.send_message(to="@alice", text="hello")
 
     asyncio.run(main())
 
