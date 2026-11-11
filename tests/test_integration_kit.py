@@ -120,7 +120,7 @@ async def test_a_shared_tracker_release_frees_the_loops_slot() -> None:
     await _cycle(loop)
     assert [r.conversation_id for r in turns.requests] == ["c1"]
     tracker.release("conversation:c1")  # the host lets go, not the loop
-    await asyncio.sleep(0.02)
+    await _eventually(lambda: len(turns.requests) == 2, "the waiting turn to start")
     assert [r.conversation_id for r in turns.requests] == ["c1", "c2"]
     await loop.stop()
 
@@ -579,13 +579,16 @@ class _Turns:
         return TurnAdmission(started=True, done=done)
 
 
-async def _eventually(predicate: Any, *, timeout: float = 5.0) -> None:
+async def _eventually(predicate: Any, what: str = "condition", *, timeout: float = 5.0) -> None:
     """Wait until ``predicate()`` holds (condition-driven: no fixed sleep
-    that a coarse timer could cut short)."""
+    that a coarse timer could cut short). On Windows before Python 3.13 the
+    event loop's clock ticks every 15.6 ms, so ``asyncio.sleep(0.02)`` can
+    return after a few milliseconds, before a worker thread or a turn's end
+    has run: wait for what the test needs, never for a duration."""
     deadline = asyncio.get_running_loop().time() + timeout
     while not predicate():
         if asyncio.get_running_loop().time() > deadline:
-            raise AssertionError("condition not met in time")
+            raise AssertionError(f"timed out after {timeout:g}s waiting for {what}")
         await asyncio.sleep(0.005)
 
 
@@ -643,7 +646,7 @@ async def test_gate_call_records_dismiss_at_once_and_reply_once_the_card_shows_t
     assert turns.requests[0].prompt.endswith("conversation_id: c1")
     assert prompts[0].startswith(texts_body()["gate_call_preamble"])
     turns.ends[0].set_result(TurnEnd(status="completed", agentchat_calls=AgentChatCallCount(made=3, failed=0)))
-    await asyncio.sleep(0.02)
+    await _eventually(lambda: loop.status().turns == [], "the turn's end to be recorded")
     assert client.decisions.recorded[-1] == {
         "conversation_id": "c1",
         "decision": "reply",
@@ -675,8 +678,9 @@ async def test_a_running_turn_holds_its_card_and_a_wait_timeout_starts_no_second
     assert len(model_calls) == 1 and len(turns.requests) == 1
     assert loop.status().last_cycle is not None and loop.status().last_cycle.outcome == "nothing_owed"
     reads = client.inbox.reads
+    cycles = loop.status().coalescer["cycles"]
     next_end.set_result(TurnEnd(status="failed"))
-    await asyncio.sleep(0.05)
+    await _eventually(lambda: loop.status().coalescer["cycles"] > cycles, "the turn's end to wake a cycle")
     await loop.idle()
     # The turn ended: the held card is read again (and gated again).
     assert client.inbox.reads > reads
@@ -981,7 +985,7 @@ async def test_a_refused_turn_records_nothing_and_a_sync_turn_runs_in_a_thread()
     loop2 = _loop(client2, call_model=lambda _p: _answer(("c1", "reply")), start_turn=blocking_turn)
     await loop2.start()
     await _cycle(loop2)
-    await asyncio.sleep(0.05)
+    await _eventually(lambda: loop2.status().turns == [], "the threaded turn's end to be recorded")
     assert client2.decisions.recorded[-1]["decision"] == "reply"
     await loop2.stop()
 
@@ -1103,7 +1107,7 @@ async def test_stop_tells_running_turns_and_an_outcome_after_stop_is_still_recor
     await loop.stop()
     assert turns.requests[0].stopping.is_set()
     turns.ends[0].set_result(TurnEnd(status="completed"))
-    await asyncio.sleep(0.02)
+    await _eventually(lambda: loop.status().turns == [], "the turn's end to be recorded")
     # The turn ended after stop(): what it did is still recorded.
     assert client.decisions.recorded == [
         {"conversation_id": "c1", "decision": "reply", "through_message_id": "m1"}
@@ -1384,10 +1388,10 @@ async def test_at_most_max_concurrent_turns_run_and_the_rest_wait_for_a_slot() -
     await _cycle(loop)  # waiting turns are held out of the gate: no second model call
     assert len(calls) == 1
     turns.ends[0].set_result(TurnEnd(status="failed"))
-    await asyncio.sleep(0.02)
+    await _eventually(lambda: len(turns.requests) == 2, "the second turn to start")
     assert [r.conversation_id for r in turns.requests] == ["c1", "c2"]
     turns.ends[1].set_result(TurnEnd(status="failed"))
-    await asyncio.sleep(0.02)
+    await _eventually(lambda: len(turns.requests) == 3, "the third turn to start")
     assert [r.conversation_id for r in turns.requests] == ["c1", "c2", "c3"]
     await loop.stop()
 
@@ -1406,7 +1410,7 @@ async def test_releasing_a_turn_that_never_ends_frees_its_slot() -> None:
     await _cycle(loop)
     assert [r.conversation_id for r in turns.requests] == ["c1"]
     assert loop.release_turn("conversation:c1") is True
-    await asyncio.sleep(0.02)
+    await _eventually(lambda: len(turns.requests) == 2, "c2 to get the slot")
     assert [r.conversation_id for r in turns.requests] == ["c1", "c2"]  # c2 got the slot
     turns.ends[0].set_result(TurnEnd(status="completed"))  # a late end records nothing
     await asyncio.sleep(0.02)
@@ -1430,11 +1434,13 @@ async def test_a_waiting_turn_that_is_released_never_starts() -> None:
     await loop.start()
     loop.wake()
     timers.fns.pop(0)()
-    await asyncio.sleep(0.02)
+    # The gate call runs in a worker thread: wait for the cycle's result.
+    await _eventually(lambda: loop.status().counters["turns_waiting"] == 1, "c2 to wait for the slot")
     assert [r.conversation_id for r in turns.requests] == ["c1"]  # c2 waits for the slot
     assert loop.release_turn("conversation:c2") is True
+    assert loop.status().counters["turns_waiting"] == 0  # its admission is dropped at once
     turns.ends[0].set_result(TurnEnd(status="failed"))
-    await asyncio.sleep(0.02)
+    await _eventually(lambda: loop.status().counters["turns_active"] == 0, "c1's slot to be freed")
     assert [r.conversation_id for r in turns.requests] == ["c1"]  # the released one never starts
     await loop.stop()
 
@@ -1509,7 +1515,7 @@ async def test_d5_pacing_after_a_silent_turn(case: dict[str, Any]) -> None:
     await loop.start()
     await _cycle(loop)
     turns.ends[0].set_result(TurnEnd(status="completed"))  # looked, did nothing
-    await asyncio.sleep(0.02)
+    await _eventually(lambda: loop.status().turns == [], "the turn's end to be counted")
     assert loop.status().counters["outcomes"] == {"silent_first": 1}
     clock["now"] += case["advance_ms"]
     if case["unanswered_names_it"]:
@@ -1534,7 +1540,7 @@ async def test_d5_pacing_after_an_invite_turn() -> None:
     await loop.start()
     await _cycle(loop)
     turns.ends[0].set_result(TurnEnd(status="completed"))
-    await asyncio.sleep(0.02)
+    await _eventually(lambda: loop.status().turns == [], "the invite turn's end to be counted")
     clock["now"] += 30_000
     await _cycle(loop)
     assert len(turns.requests) == 1  # no second invite turn within the window
@@ -1685,13 +1691,17 @@ async def test_the_socket_wakes_echoes_do_not_and_the_handle_is_learned() -> Non
     hello = json.loads(ws.sent[0])
     assert hello["capabilities"] == ["ack", "heartbeat", "rewake"]
     await ws.push({"type": "hello.ok", "capabilities": ["ack", "heartbeat", "rewake"]})
-    await asyncio.sleep(0.02)
+    await _eventually(lambda: loop.status().handle is not None, "the connect wake's tray read")
     await loop.idle()
     assert loop.status().handle == "nova"  # learned from the tray's you
     await ws.push({"type": "message.new", "payload": {"id": "m1", "conversation_id": "c1", "sender": "nova", "seq": 1}})
     await ws.push({"type": "message.new", "payload": {"id": "m2", "conversation_id": "c1", "sender": "peer", "seq": 2}})
     await ws.push({"type": "wake", "payload": {"reason": "unanswered", "conversation_ids": ["c1"], "step": 1, "at": "t"}})
-    await asyncio.sleep(0.02)
+    await _eventually(
+        lambda: [json.loads(s).get("type") for s in ws.sent].count("ack") == 2
+        and any(e.get("source") == "wake_frame" for e in events),
+        "the three frames to be handled",
+    )
     sources = [e["source"] for e in events if e["type"] == "wake"]
     assert sources[:1] == ["connect"] and "message" in sources and "wake_frame" in sources
     assert [e for e in events if e["type"] == "echo"]
