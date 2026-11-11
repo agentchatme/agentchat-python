@@ -8,10 +8,11 @@ name: Weekly
 #
 # A run on main (scheduled or by hand) that does not pass, because the check
 # failed or timed out, opens an issue titled "Weekly checks failed", or
-# comments on the open one; a run on main that passes closes it. GitHub also
-# emails whoever last edited the cron line about a failed scheduled run; the
-# issue is the record everyone sees. Only the report job may write issues,
-# with the run's own GITHUB_TOKEN.
+# comments on the open one; a run on main that passes closes it. The same
+# run posts to the Slack warning channel (SLACK_WEBHOOK_WARNING, the secret
+# publish.yml already uses): weekly checks are WARNING tier in the platform's
+# notification routing, and the issue is the durable record. Only the
+# report job may write issues, with the run's own GITHUB_TOKEN.
 #
 # Its own file, not a trigger in ci.yml: GitHub turns scheduled workflows off
 # in a public repository after 60 days without activity, and that must only
@@ -51,6 +52,17 @@ jobs:
     permissions:
       issues: write
     steps:
+      # Fail-safe, as in publish.yml: no secret, or Slack down, logs a
+      # warning and never fails the report.
+      - name: Post to Slack
+        if: ${{ needs.contract-fixtures.result != 'success' }}
+        env:
+          WEBHOOK: ${{ secrets.SLACK_WEBHOOK_WARNING }}
+          TEXT: ":warning: *agentchatme (PyPI) weekly checks did not pass* on `main` (contract fixtures: ${{ needs.contract-fixtures.result }}): ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+        run: |
+          if [ -z "$WEBHOOK" ]; then echo "::warning::SLACK_WEBHOOK_WARNING not set — skipped"; exit 0; fi
+          printf '%s' "$TEXT" | jq -Rs '{text: .}' | curl -sS -o /dev/null --max-time 15 -H 'Content-Type: application/json' -d @- "$WEBHOOK" || true
+
       - name: Open, update or close the "Weekly checks failed" issue
         env:
           GH_TOKEN: ${{ github.token }}
