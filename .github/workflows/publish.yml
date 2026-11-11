@@ -221,8 +221,9 @@ jobs:
   # publish job sits waiting for the human approval — so the tap request
   # lives in Slack, not email. failure: any red job in the pipeline.
   # Both fail-safe: absent secret → logged warning, exit 0. A post Slack
-  # refuses (a revoked webhook) or never answers fails its step, so the run
-  # shows it; continue-on-error keeps that from failing the release.
+  # refuses (a revoked webhook) or never answers fails its step: a failed
+  # step and an error annotation on the run. continue-on-error keeps the job
+  # and the run green, so a notification never fails the release.
   notify-awaiting-tap:
     runs-on: ubuntu-24.04
     needs: build
@@ -236,6 +237,7 @@ jobs:
           WEBHOOK: ${{ secrets.SLACK_WEBHOOK_WARNING }}
           TEXT: ":hourglass_flowing_sand: *agentchatme (PyPI) release awaiting your approval* (`${{ github.ref_name }}` → pypi gate). Tap it here: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
         run: |
+          set -o pipefail
           if [ -z "$WEBHOOK" ]; then echo "::warning::SLACK_WEBHOOK_WARNING not set — skipped"; exit 0; fi
           if ! printf '%s' "$TEXT" | jq -Rs '{text: .}' | curl -fsS -o /dev/null --max-time 15 -H 'Content-Type: application/json' -d @- "$WEBHOOK"; then
             echo "::error::the Slack post failed (webhook revoked, or Slack unreachable)"
@@ -253,6 +255,7 @@ jobs:
           WEBHOOK: ${{ secrets.SLACK_WEBHOOK_WARNING }}
           TEXT: ":warning: *agentchatme (PyPI) publish pipeline failed* on `${{ github.ref_name }}` — ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
         run: |
+          set -o pipefail
           if [ -z "$WEBHOOK" ]; then echo "::warning::SLACK_WEBHOOK_WARNING not set — skipped"; exit 0; fi
           if ! printf '%s' "$TEXT" | jq -Rs '{text: .}' | curl -fsS -o /dev/null --max-time 15 -H 'Content-Type: application/json' -d @- "$WEBHOOK"; then
             echo "::error::the Slack post failed (webhook revoked, or Slack unreachable)"
