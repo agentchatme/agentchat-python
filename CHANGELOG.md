@@ -12,8 +12,8 @@ major. The on-the-wire API is versioned separately under `/v1/...`.
 - `integration.ReceiveLoop`: a turn gated while a freed slot was being
   handed on could start ahead of the turns already waiting for that slot
   (for example the conversation whose turn had just failed, gated again by
-  the cycle that turn's end woke). Waiting turns now go first, in order, as
-  in the TypeScript kit.
+  the cycle that turn's end woke). Waiting turns now go first, in order,
+  and a refused admission hands its slot on to them.
 
 ## [1.3.0] — 2026-11-08
 

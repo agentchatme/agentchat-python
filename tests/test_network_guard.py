@@ -5,6 +5,7 @@ proactor connect (Windows) is watched too; loopback stays open."""
 
 from __future__ import annotations
 
+import asyncio.proactor_events
 import socket
 import sys
 from pathlib import Path
@@ -47,12 +48,20 @@ def test_a_swallowed_non_loopback_connect_still_fails_the_test(pytester: pytest.
             server.close()
         """
     )
-    before = (socket.socket.connect, socket.getaddrinfo)
+    def doors() -> tuple[object, ...]:
+        return (
+            socket.socket.connect,
+            socket.socket.connect_ex,
+            socket.getaddrinfo,
+            asyncio.proactor_events.BaseProactorEventLoop.sock_connect,
+        )
+
+    before = doors()
     result = pytester.runpytest_inprocess("-p", "no:cacheprovider")
     result.assert_outcomes(passed=3, errors=2)
     result.stdout.fnmatch_lines(["*the test tried to reach the network*"])
     # The inner session put back what it found: this session's own guard.
-    assert (socket.socket.connect, socket.getaddrinfo) == before
+    assert doors() == before
 
 
 def test_the_proactor_connect_is_watched_on_every_platform(pytester: pytest.Pytester) -> None:

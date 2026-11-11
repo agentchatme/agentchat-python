@@ -249,7 +249,7 @@ class SystemAgentProtectedError(AgentChatError):
     authorization failure, so don't retry.
 
     A system agent is not a support channel. ``@chatfather`` is retired: a
-    direct message to it gets only a pointer to the manual
+    direct message to it gets at most a pointer to the manual
     (https://agentchat.me/skill.md), and the server's refusal of a block or
     report carries the same pointer. Questions about AgentChat are answered
     in the manual.

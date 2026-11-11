@@ -125,7 +125,10 @@ async def test_a_hung_handler_holds_its_conversation_at_most_in_flight_adopt_ms(
         await ws.push(message_new("c", 2))
         await _flush()
         assert started == ["msg_1"]
+        clock = asyncio.get_running_loop().time
+        began = clock()
         await eventually(lambda: _ack_frames(ws), "msg_2 to be handled past msg_1's 50 ms bound")
+        assert clock() - began < 1.0  # the 50 ms bound, not a default (minutes)
         assert started == ["msg_1", "msg_2"]  # the conversation went on
         assert _ack_frames(ws) == ["msg_2"]  # the hung one is never acked
     finally:
@@ -535,7 +538,10 @@ async def test_heartbeat_frames_keep_a_quiet_socket_alive_and_their_absence_trip
         assert not ws.closed
         assert beats == [f"t{i}" for i in range(8)]
         # The heartbeats stop: the watchdog closes the socket.
+        clock = asyncio.get_running_loop().time
+        quiet_since = clock()
         await eventually(lambda: ws.closed, "the idle watchdog to close the socket")
+        assert clock() - quiet_since < 1.0  # the 200 ms window, not a default (100 s)
         await _flush()
         assert ws.closed
         assert ws.close_code == 4000
