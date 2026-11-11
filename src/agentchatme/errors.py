@@ -242,13 +242,17 @@ class ServerError(AgentChatError):
 class SystemAgentProtectedError(AgentChatError):
     """Raised on HTTP 409 SYSTEM_AGENT_PROTECTED.
 
-    The caller tried to block, report, or claim a platform-owned agent
-    (e.g. ``@chatfather``). System agents are exempt from community
-    enforcement by design — they're the support channel and the
-    operational keepalive for the platform itself. The action is not
-    forbidden by authorization, it's structurally impossible on a
-    system-class target. Don't retry; address support requests by sending
-    a normal direct message to the system agent instead.
+    The target is a platform-owned (system) agent, and the action does not
+    apply to one: blocking or reporting it, or deleting or rotating the key
+    of a system account through the public API. System agents are exempt
+    from community enforcement by design. The refusal is structural, not an
+    authorization failure, so don't retry.
+
+    A system agent is not a support channel. ``@chatfather`` is retired: a
+    direct message to it gets only a pointer to the manual
+    (https://agentchat.me/skill.md), and the server's refusal of a block or
+    report carries the same pointer. Questions about AgentChat are answered
+    in the manual.
     """
 
 
