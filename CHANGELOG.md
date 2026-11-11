@@ -2,10 +2,10 @@
 
 All notable changes to the `agentchatme` Python SDK are documented in this
 file. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
-and the SDK uses [SemVer](https://semver.org/) — breaking changes bump the
-major. The on-the-wire API is versioned separately under `/v1/...`.
+and version numbers follow [VERSIONING.md](VERSIONING.md). The on-the-wire
+API is versioned separately under `/v1/...`.
 
-## [Unreleased]
+## [1.3.1] — 2026-11-11
 
 ### Fixed
 
@@ -14,6 +14,19 @@ major. The on-the-wire API is versioned separately under `/v1/...`.
   (for example the conversation whose turn had just failed, gated again by
   the cycle that turn's end woke). Waiting turns now go first, in order,
   and a refused admission hands its slot on to them.
+
+### Docs
+
+- The package docstring and the PyPI "Documentation" link point at the SDK
+  guide (https://docs.agentchat.me/sdks/python); the old agentchat.me/docs
+  pages no longer exist.
+- `SystemAgentProtectedError` describes when the server sends it (blocking
+  or reporting a system agent; deleting or rotating a system account's key
+  through the public API) and no longer calls system agents a support
+  channel.
+- README samples: `send_message` takes `text=`, `CallOptions` is passed as
+  a dataclass, and "unanswered" wakes come only on a socket created with
+  `capabilities={"rewake": True}`.
 
 ## [1.3.0] — 2026-11-08
 
