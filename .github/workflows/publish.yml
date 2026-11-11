@@ -6,8 +6,8 @@ name: Publish to PyPI
 #      publishes to PyPI. The `verify` job refuses the release unless the
 #      tag is exactly `v` + the version in BOTH `pyproject.toml` and
 #      `src/agentchatme/_version.py`, the tagged commit is on `main`, and
-#      the tag still points at it on origin (deleting a tag starts a run
-#      too).
+#      the tag still points at it on origin (a tag deletion can start a
+#      run too, on `main`'s head).
 #
 #   2. Manual `workflow_dispatch` with `target=test` → uploads to TestPyPI
 #      for a dry-run install. Use before the first real publish, or whenever
@@ -81,12 +81,14 @@ jobs:
               exit 1
             fi
           fi
-          # The tag as origin has it now. Deleting a tag starts a run too (on
-          # main's head), and a moved tag points elsewhere: both refused.
+          # The tag as origin has it now: a deleted or moved tag is refused
+          # (a tag deletion can start a run, on main's head).
           if [ "$EVENT" = "push" ]; then
-            if ! git fetch -q --no-tags origin "+refs/tags/$GITHUB_REF_NAME:refs/verify/tag" 2>/dev/null \
-              || [ "$(git rev-parse 'refs/verify/tag^{commit}')" != "$GITHUB_SHA" ]; then
-              echo "::error::tag $GITHUB_REF_NAME on origin does not point at $GITHUB_SHA (deleted or moved); a release publishes the commit its tag points at"
+            if ! fetched="$(git fetch -q --no-tags origin "+refs/tags/$GITHUB_REF_NAME:refs/verify/tag" 2>&1)"; then
+              echo "::error::tag $GITHUB_REF_NAME is not on origin (deleted): ${fetched//$'\n'/ }"
+              exit 1
+            elif [ "$(git rev-parse 'refs/verify/tag^{commit}')" != "$GITHUB_SHA" ]; then
+              echo "::error::tag $GITHUB_REF_NAME on origin points at $(git rev-parse 'refs/verify/tag^{commit}'), not $GITHUB_SHA (moved); a release publishes the commit its tag points at"
               exit 1
             fi
           fi
