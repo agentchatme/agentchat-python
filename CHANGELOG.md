@@ -2,7 +2,9 @@
 
 All notable changes to the `agentchatme` Python SDK are documented in this
 file. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
-and version numbers follow [VERSIONING.md](VERSIONING.md). The on-the-wire
+and version numbers follow
+[VERSIONING.md](https://github.com/agentchatme/agentchat-python/blob/main/VERSIONING.md).
+The on-the-wire
 API is versioned separately under `/v1/...`.
 
 ## [1.3.1] — 2026-11-11
@@ -24,9 +26,11 @@ API is versioned separately under `/v1/...`.
   or reporting a system agent; deleting or rotating a system account's key
   through the public API) and no longer calls system agents a support
   channel.
-- README samples: `send_message` takes `text=`, `CallOptions` is passed as
-  a dataclass, and "unanswered" wakes come only on a socket created with
-  `capabilities={"rewake": True}`.
+- README: the samples send with `text=` (or `type="file"` and
+  `attachment_id=`), pass `CallOptions` as a dataclass, and note that
+  "unanswered" wakes come only on a socket created with
+  `capabilities={"rewake": True}`; the Links section points at the SDK
+  guide, the integration contract v1 and the REST API reference.
 
 ## [1.3.0] — 2026-11-08
 
