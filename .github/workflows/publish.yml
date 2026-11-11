@@ -5,7 +5,9 @@ name: Publish to PyPI
 #   1. Push a tag matching `v*` (e.g. `v1.0.2`) on a commit on `main` →
 #      publishes to PyPI. The `verify` job refuses the release unless the
 #      tag is exactly `v` + the version in BOTH `pyproject.toml` and
-#      `src/agentchatme/_version.py`, and the tagged commit is on `main`.
+#      `src/agentchatme/_version.py`, the tagged commit is on `main`, and
+#      the tag still points at it on origin (deleting a tag starts a run
+#      too).
 #
 #   2. Manual `workflow_dispatch` with `target=test` → uploads to TestPyPI
 #      for a dry-run install. Use before the first real publish, or whenever
@@ -76,6 +78,15 @@ jobs:
             git fetch --no-tags origin main
             if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
               echo "::error::$GITHUB_SHA is not on main; releases are cut from main only"
+              exit 1
+            fi
+          fi
+          # The tag as origin has it now. Deleting a tag starts a run too (on
+          # main's head), and a moved tag points elsewhere: both refused.
+          if [ "$EVENT" = "push" ]; then
+            if ! git fetch -q --no-tags origin "+refs/tags/$GITHUB_REF_NAME:refs/verify/tag" 2>/dev/null \
+              || [ "$(git rev-parse 'refs/verify/tag^{commit}')" != "$GITHUB_SHA" ]; then
+              echo "::error::tag $GITHUB_REF_NAME on origin does not point at $GITHUB_SHA (deleted or moved); a release publishes the commit its tag points at"
               exit 1
             fi
           fi
@@ -220,10 +231,10 @@ jobs:
   # awaiting-tap: fires after build succeeds, while the environment-gated
   # publish job sits waiting for the human approval — so the tap request
   # lives in Slack, not email. failure: any red job in the pipeline.
-  # Both fail-safe: absent secret → logged warning, exit 0. A post Slack
-  # refuses (a revoked webhook) or never answers fails its step: a failed
-  # step and an error annotation on the run. continue-on-error keeps the job
-  # and the run green, so a notification never fails the release.
+  # Both fail-safe: absent secret → logged warning, exit 0. A post that
+  # Slack refuses (a revoked webhook) or never answers fails its step, with
+  # an error annotation on the run; continue-on-error keeps the job and the
+  # run green. No publish job depends on a notify job.
   notify-awaiting-tap:
     runs-on: ubuntu-24.04
     needs: build
