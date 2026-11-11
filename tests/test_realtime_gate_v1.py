@@ -15,6 +15,7 @@ import pytest
 from agentchatme import RealtimeClient, _realtime
 from agentchatme._realtime import wake_payload_problem
 
+from ._wait import eventually
 from .test_realtime import MockAsyncClient, MockWebSocket, _ack_frames, _flush, _make_client
 from .test_realtime_engine import connected, message_new
 from .test_realtime_resilience import ControlledSleep, _client_with_sockets, _until
@@ -124,7 +125,10 @@ async def test_a_hung_handler_holds_its_conversation_at_most_in_flight_adopt_ms(
         await ws.push(message_new("c", 2))
         await _flush()
         assert started == ["msg_1"]
-        await asyncio.sleep(0.15)
+        clock = asyncio.get_running_loop().time
+        began = clock()
+        await eventually(lambda: _ack_frames(ws), "msg_2 to be handled past msg_1's 50 ms bound")
+        assert clock() - began < 1.0  # the 50 ms bound, not a default (minutes)
         assert started == ["msg_1", "msg_2"]  # the conversation went on
         assert _ack_frames(ws) == ["msg_2"]  # the hung one is never acked
     finally:
@@ -196,7 +200,9 @@ async def test_a_full_handler_queue_leaves_new_messages_with_the_server(ack_on_r
         assert acked == (["msg_1", "msg_2", "msg_3", "msg_4"] if ack_on_receipt else [])
         assert sum("handlers are behind" in str(e) for e in errors) == 1  # one notice
         release.set()
-        await asyncio.sleep(0.05)
+        await eventually(
+            lambda: len(seen) >= 4 and api.sync_calls and not rt._shedding, "the queue to drain back to half"
+        )
         assert seen == [1, 2, 3, 4]
         # Back to half: the client fetched what it left (the REST drain).
         assert len(api.sync_calls) >= 1 and not rt._shedding
@@ -320,7 +326,7 @@ async def test_handlers_of_one_conversation_start_in_seq_order() -> None:
         await ws.push(message_new("c", 1))
         await ws.push(message_new("c", 3))
         await ws.push(message_new("c", 2))
-        await asyncio.sleep(0.05)
+        await eventually(lambda: len(started) >= 3, "the three handlers to start")
         assert started == [1, 2, 3]
     finally:
         await rt.disconnect()
@@ -517,18 +523,25 @@ async def test_heartbeat_arms_the_idle_watchdog_on_a_socket_without_ping() -> No
 @pytest.mark.asyncio
 async def test_heartbeat_frames_keep_a_quiet_socket_alive_and_their_absence_trips_it() -> None:
     errors: list[BaseException] = []
-    rt, ws = await connected(capabilities=["ack", "heartbeat"], liveness_timeout_ms=150)
+    # A 200 ms window with a heartbeat every 50 ms, eight times: the frames
+    # outlast the window twice over and each gap stays 150 ms inside it, even
+    # with Windows timer granularity (15.6 ms) and a slow runner.
+    rt, ws = await connected(capabilities=["ack", "heartbeat"], liveness_timeout_ms=200)
     rt.on_error(errors.append)
     beats: list[str] = []
     rt.on("heartbeat", lambda m: beats.append(m["payload"]["at"]))
     try:
-        for i in range(4):
-            await asyncio.sleep(0.06)
+        for i in range(8):
+            await asyncio.sleep(0.05)
             await ws.push({"type": "heartbeat", "payload": {"at": f"t{i}"}})
         await _flush()
         assert not ws.closed
-        assert beats == ["t0", "t1", "t2", "t3"]
-        await asyncio.sleep(0.35)  # the heartbeats stop
+        assert beats == [f"t{i}" for i in range(8)]
+        # The heartbeats stop: the watchdog closes the socket.
+        clock = asyncio.get_running_loop().time
+        quiet_since = clock()
+        await eventually(lambda: ws.closed, "the idle watchdog to close the socket")
+        assert clock() - quiet_since < 1.0  # the 200 ms window, not a default (100 s)
         await _flush()
         assert ws.closed
         assert ws.close_code == 4000
@@ -644,7 +657,7 @@ async def test_a_re_offer_after_the_adoption_window_is_dispatched_afresh() -> No
         await _flush()
         # Past the window the re-offer is not adopted, and the hung handler no
         # longer holds its conversation: the re-offer is dispatched afresh.
-        await asyncio.sleep(0.02)
+        await eventually(lambda: len(calls) >= 2, "the re-offer to be dispatched")
         assert calls == ["msg_1", "msg_1"]
     finally:
         await rt.disconnect()

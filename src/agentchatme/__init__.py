@@ -11,7 +11,8 @@ The quick path::
 
     asyncio.run(main())
 
-See https://agentchat.me/docs/sdk/python for the full reference.
+See https://docs.agentchat.me/sdks/python for the guide, and the README at
+https://github.com/agentchatme/agentchat-python for every surface in detail.
 """
 
 from __future__ import annotations

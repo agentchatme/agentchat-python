@@ -16,6 +16,7 @@ import pytest
 from agentchatme import RealtimeClient, _realtime
 from agentchatme.types.ws import WakePayload
 
+from ._wait import eventually
 from .test_realtime import MockAsyncClient, MockWebSocket, _ack_frames, _flush, _make_client
 
 WAKE: dict[str, Any] = {
@@ -283,7 +284,9 @@ async def test_ack_on_receipt_acks_gap_fill_rows_when_fetched(
     try:
         await ws.push(message_new("c", 1))
         await ws.push(message_new("c", 3))
-        await asyncio.sleep(0.12)
+        await eventually(
+            lambda: len(dispatched) >= 3 and len(_ack_frames(ws)) >= 3, "the gap fill to be handed over and acked"
+        )
         await _flush()
         assert dispatched == [1, 2, 3]
         # Live frames at receipt, the gap-fill row at fetch, each exactly once.
@@ -423,7 +426,9 @@ async def test_default_mode_acks_gap_fill_rows_after_dispatch(
     try:
         await ws.push(message_new("c", 1))
         await ws.push(message_new("c", 3))
-        await asyncio.sleep(0.12)
+        await eventually(
+            lambda: len(dispatched) >= 3 and len(_ack_frames(ws)) >= 3, "the gap fill to be handed over and acked"
+        )
         await _flush()
         assert dispatched == [1, 2, 3]
         # The fetched row rides the live ack path: acked once dispatched.
@@ -763,7 +768,8 @@ async def test_a_frame_that_parks_while_a_resolved_gap_is_handled_is_dispatched(
         await ws.push(message_new("c", 5))
         await _flush()
         release.set()
-        await asyncio.sleep(0.2)
+        # Seq 5 is handed over once seq 3's handler is done, then acked.
+        await eventually(lambda: len(seen) >= 3 and len(_ack_frames(ws)) >= 3, "seq 5 to be handled and acked")
         assert seen == [1, 3, 5]
         assert sorted(_ack_frames(ws)) == ["msg_1", "msg_3", "msg_5"]
     finally:
@@ -802,7 +808,13 @@ async def test_the_missing_seq_arriving_while_a_resolved_gap_is_handled_is_not_a
         await ws.push(message_new("c", 2))
         await _flush()
         release.set()
-        await asyncio.sleep(0.2)
+        # Every handler done and the gap task ended: a crash or a second
+        # handover of seq 4 would have happened by then.
+        await eventually(
+            lambda: len(seen) >= 4 and not rt._bg_tasks and not rt._lanes,
+            "the gap task and every handler to finish",
+        )
+        await _flush()
         assert sorted(seen) == [1, 2, 3, 4]
         assert len(seen) == 4
         assert errors == []
@@ -1025,7 +1037,7 @@ async def test_a_frame_behind_a_new_hole_gets_its_own_gap_window(
         await _flush()
         assert seen == [1, 3, 4]
         assert [g.expected_seq for g in gaps] == [2]
-        await asyncio.sleep(0.3)
+        await eventually(lambda: len(seen) >= 4 and len(gaps) >= 2, "seq 6's own gap window to lapse")
         assert seen == [1, 3, 4, 6]
         assert [g.expected_seq for g in gaps] == [2, 5]
     finally:
@@ -1206,7 +1218,7 @@ async def test_two_instances_from_one_options_object_do_not_interfere() -> None:
 
     # b still reconnects after a server-side drop; a stays closed.
     await sockets["b"].close(code=1006, reason="blip")
-    await asyncio.sleep(0.1)
+    await eventually(lambda: len(connects) >= 3, "b to reconnect after its backoff")
     assert connects == ["a", "b", "b"]
     await b.disconnect()
 

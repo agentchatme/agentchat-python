@@ -19,6 +19,7 @@ import pytest
 from agentchatme import ConnectionError as AgentChatConnectionError
 from agentchatme import RealtimeClient, _realtime
 
+from ._wait import eventually
 from .test_realtime import MockWebSocket, _flush, _make_client
 from .test_realtime_engine import connected, message_new, other_tasks
 
@@ -421,7 +422,7 @@ async def test_liveness_watchdog_holds_while_pings_are_answered(
         await rt.connect()
         await _flush()
         await sock.push({"type": "hello.ok"})
-        await asyncio.sleep(0.2)
+        await eventually(lambda: sock.pings >= 2, "a second probe after an answered one")
         assert sock.pings >= 2  # probed repeatedly, every probe answered
         assert not sock.closed
         assert rt.state == "ready"
@@ -779,7 +780,10 @@ async def test_disconnect_from_a_state_handler_on_backoff_arms_no_timer() -> Non
     await sock.push({"type": "hello.ok"})
     await _flush()
     await sock.close(code=1006, reason="blip")
-    await asyncio.sleep(0.05)
+    # The handler's disconnect() has finished once every task is gone.
+    await eventually(
+        lambda: rt.state == "stopped" and other_tasks() - baseline == set(), "the handler's disconnect to finish"
+    )
     assert rt.state == "stopped"
     assert rt._reconnect_task is None
     assert sleeper.delays == []
