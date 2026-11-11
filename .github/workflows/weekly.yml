@@ -1,0 +1,84 @@
+name: Weekly
+
+# The conformance fixtures against the contract agentchat.me publishes, once
+# a week and on demand (Actions → Weekly → Run workflow). CI runs the same
+# script on every push and pull request; this run flags a contract change on
+# the server between pushes here. Only this comparison runs on the schedule,
+# not the test matrix.
+#
+# A scheduled run that fails opens an issue titled "Weekly checks failed",
+# or comments on the open one; a scheduled run that passes closes it. Only
+# the report job may write issues, with the run's own GITHUB_TOKEN.
+#
+# Its own file, not a trigger in ci.yml: GitHub turns scheduled workflows off
+# in a public repository after 60 days without activity, and that must only
+# ever stop this file, never CI. Actions → Weekly → "Enable workflow" turns
+# it back on.
+
+on:
+  schedule:
+    - cron: "29 6 * * 1" # Mondays, 06:29 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: weekly
+  cancel-in-progress: false
+
+jobs:
+  contract-fixtures:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - name: Conformance fixtures match the published contract
+        run: bash scripts/check-contract-fixtures.sh
+
+  report:
+    needs: [contract-fixtures]
+    if: always() && github.event_name == 'schedule'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      issues: write
+    steps:
+      - name: Open, update or close the "Weekly checks failed" issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          CONTRACT: ${{ needs.contract-fixtures.result }}
+        run: |
+          set -euo pipefail
+          TITLE="Weekly checks failed"
+          EXISTING=$(gh issue list --state open --search "in:title \"$TITLE\"" --json number,title \
+            --jq '[.[] | select(.title == "Weekly checks failed")][0].number // empty')
+
+          if [ "$CONTRACT" = "success" ]; then
+            if [ -n "$EXISTING" ]; then
+              gh issue comment "$EXISTING" --body "The weekly checks pass again: $RUN_URL"
+              gh issue close "$EXISTING"
+            fi
+            exit 0
+          fi
+          if [ "$CONTRACT" != "failure" ]; then
+            echo "No check failed (contract-fixtures: $CONTRACT): nothing to report."
+            exit 0
+          fi
+
+          {
+            echo "The scheduled run of \`.github/workflows/weekly.yml\` on \`main\` failed: $RUN_URL"
+            echo
+            echo "- **Contract fixtures: $CONTRACT.** \`conformance/v1/manifest.sha256\` against https://agentchat.me/contract/v1/conformance/manifest.sha256. A failure means the published contract changed (or could not be fetched): copy the published fixtures into \`conformance/v1/\` byte for byte, run the tests, and fix what they find."
+            echo
+            echo "A scheduled run that fails again comments here; one that passes closes this issue."
+          } > issue-body.md
+
+          if [ -n "$EXISTING" ]; then
+            gh issue comment "$EXISTING" --body-file issue-body.md
+            echo "Commented on issue #$EXISTING"
+          else
+            gh issue create --title "$TITLE" --body-file issue-body.md
+          fi
