@@ -18,6 +18,7 @@ import pytest
 
 from agentchatme import RealtimeClient, _realtime
 
+from ._wait import eventually
 from .test_realtime import MockWebSocket, _make_client
 
 FIXTURE = Path(__file__).resolve().parent.parent / "conformance" / "v1" / "engine-scenarios.json"
@@ -159,12 +160,9 @@ async def _run(scenario: dict[str, Any], mode: str) -> _Outcome:
                 # The client's gap window plus slack, in real time.
                 await asyncio.sleep(_realtime._GAP_FILL_WINDOW_S + 0.15)
             elif op == "wait_handler":
-                for _ in range(100):
-                    if any(p["id"] == step["message_id"] for p in out.dispatched):
-                        break
-                    await asyncio.sleep(0.001)
-                assert any(p["id"] == step["message_id"] for p in out.dispatched), (
-                    f"handler entered for {step['message_id']}"
+                mid = step["message_id"]
+                await eventually(
+                    lambda mid=mid: any(p["id"] == mid for p in out.dispatched), f"the handler to enter for {mid}"
                 )
             elif op == "close":
                 assert ws is not None

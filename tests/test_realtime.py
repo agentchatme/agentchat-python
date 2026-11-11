@@ -19,6 +19,8 @@ import pytest
 from agentchatme import VERSION, RealtimeClient, SequenceGapInfo, _realtime
 from agentchatme import ConnectionError as AgentChatConnectionError
 
+from ._wait import eventually
+
 # ─────────────── Mock infrastructure ───────────────
 
 
@@ -395,8 +397,7 @@ async def test_gap_fill_unavailable_without_client(monkeypatch: pytest.MonkeyPat
         await ws.push({"type": "message.new", "payload": {"conversation_id": "c1", "seq": 3}})
         await _flush()
         # Let the gap timer fire.
-        await asyncio.sleep(0.12)
-        await _flush()
+        await eventually(lambda: gaps and 3 in seqs, "the lapsed gap to be reported and seq 3 handed over")
         assert len(gaps) == 1
         assert gaps[0].recovered is False
         assert gaps[0].reason == "gap_fill_unavailable"
@@ -423,8 +424,7 @@ async def test_gap_fill_success_via_get_messages(monkeypatch: pytest.MonkeyPatch
         await ws.push({"type": "message.new", "payload": {"conversation_id": "c1", "seq": 1}})
         # Skip 2, push 3.
         await ws.push({"type": "message.new", "payload": {"conversation_id": "c1", "seq": 3}})
-        await asyncio.sleep(0.12)
-        await _flush()
+        await eventually(lambda: gaps and len(seqs) >= 3, "the gap fill to hand 2 and 3 over")
         assert len(gaps) == 1
         assert gaps[0].recovered is True
         assert gaps[0].reason == "gap_filled"
@@ -452,8 +452,7 @@ async def test_gap_fill_failure_surfaces_recovered_false(
         await _flush()
         await ws.push({"type": "message.new", "payload": {"conversation_id": "c1", "seq": 1}})
         await ws.push({"type": "message.new", "payload": {"conversation_id": "c1", "seq": 3}})
-        await asyncio.sleep(0.12)
-        await _flush()
+        await eventually(lambda: gaps, "the failed gap fill to be reported")
         assert len(gaps) == 1
         assert gaps[0].recovered is False
         assert gaps[0].reason == "gap_fill_failed"
@@ -534,11 +533,8 @@ async def test_offline_drain_after_hello_ok() -> None:
         await rt.connect()
         await _flush()
         await ws.push({"type": "hello.ok"})
-        # Give the fire-and-forget drain task enough time to resolve.
-        for _ in range(20):
-            await asyncio.sleep(0.01)
-            if mock_api.sync_ack_calls:
-                break
+        # The drain is fire-and-forget: wait for its cursor ack.
+        await eventually(lambda: mock_api.sync_ack_calls, "the drain to ack its cursor")
         assert len(mock_api.sync_calls) >= 1
         assert mock_api.sync_ack_calls == ["del_" + "0" * 32]
         assert 99 in seqs
@@ -912,7 +908,7 @@ async def test_auth_close_after_hello_ok_is_an_eviction_not_a_rejection(code: in
         await _flush()
         # Server evicts the authenticated session.
         await ws.close(code=code, reason="Key rotated")
-        await asyncio.sleep(0.1)
+        await eventually(lambda: len(connects) >= 2, "the client to reconnect after its backoff")
         assert len(connects) >= 2
         assert rt.state in ("connecting", "backoff")
         assert rt.blocked_reason is None
@@ -943,7 +939,7 @@ async def test_non_terminal_close_still_reconnects() -> None:
         await connects[0].push({"type": "hello.ok"})
         await _flush()
         await connects[0].close(code=1006)  # abnormal closure — transient
-        await asyncio.sleep(0.1)
+        await eventually(lambda: len(connects) >= 2, "the client to reconnect after its backoff")
         assert len(connects) >= 2
     finally:
         await rt.disconnect()
@@ -975,7 +971,8 @@ async def test_hello_timeout_self_close_is_not_terminal(
     rt.on_error(lambda e: errors.append(e))
     try:
         await rt.connect()
-        await asyncio.sleep(0.15)
+        # The 30 ms watchdog, our close, then the 10-20 ms backoff.
+        await eventually(lambda: len(connects) >= 2, "the client to reconnect after its own close")
         assert len(connects) >= 2  # kept reconnecting after our own close
         assert connects[0].close_code == _realtime._CLIENT_CLOSE_CODE
         assert connects[0].close_reason == "client handshake timeout"
@@ -1116,8 +1113,7 @@ async def test_stable_connection_clears_backoff(
         await rt.connect()
         await _flush()
         await ws.push({"type": "hello.ok"})
-        await asyncio.sleep(0.05)
-        await _flush()
+        await eventually(lambda: rt._reconnect_attempts == 0, "the stability window to clear the backoff")
         assert rt._reconnect_attempts == 0
     finally:
         await rt.disconnect()

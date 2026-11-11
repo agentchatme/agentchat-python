@@ -1206,9 +1206,11 @@ async def test_a_sync_model_call_past_its_deadline_is_simply_no_longer_waited_fo
     loop = _loop(client, call_model=call_model, start_turn=_Turns(), gate_call_timeout_ms=30)
     await loop.start()
     await _cycle(loop)
-    await asyncio.sleep(0.05)
     await loop.idle()
     assert loop.status().last_cycle.outcome == "fail_closed"  # type: ignore[union-attr]
+    # The cycle stops waiting at the deadline, whether or not the worker
+    # thread has started the call yet: wait for it to have.
+    await _eventually(lambda: handles, "the model call to start in its worker thread")
     assert handles and handles[0].is_set()
     released.set()
     await asyncio.sleep(0.02)
