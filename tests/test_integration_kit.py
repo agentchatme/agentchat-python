@@ -1399,6 +1399,40 @@ async def test_at_most_max_concurrent_turns_run_and_the_rest_wait_for_a_slot() -
 
 
 @pytest.mark.asyncio
+async def test_a_turn_gated_while_the_freed_slot_is_handed_on_queues_behind_the_waiting_ones() -> None:
+    # The freed slot is handed on by _pump, its own task. A cycle that runs
+    # first (here: the one c1's failed turn wakes, which gates c1 again) must
+    # not take the slot ahead of c2, which was waiting for it.
+    tray = _tray([_card("c1", "m1"), _card("c2", "m2")])
+    client = _LoopClient([tray])
+    turns = _Turns()
+    loop = _loop(client, call_model=lambda _p: _answer(("c1", "reply"), ("c2", "reply")), start_turn=turns)
+    hand_on = asyncio.Event()
+    pump = loop._pump
+
+    async def held_pump() -> None:  # the window, held open
+        await hand_on.wait()
+        await pump()
+
+    loop._pump = held_pump  # type: ignore[method-assign]
+    await loop.start()
+    await _cycle(loop)
+    assert [r.conversation_id for r in turns.requests] == ["c1"]
+    assert loop.status().counters["turns_waiting"] == 1
+    await _cycle(loop)  # cards held out while c1 runs: its end wakes a cycle
+    cycles = loop.status().coalescer["cycles"]
+    turns.ends[0].set_result(TurnEnd(status="failed"))
+    await _eventually(lambda: loop.status().coalescer["cycles"] > cycles, "c1's end to wake a cycle")
+    await loop.idle()
+    assert [r.conversation_id for r in turns.requests] == ["c1"]  # c1 again waits behind c2
+    assert loop.status().counters["turns_waiting"] == 2
+    hand_on.set()
+    await _eventually(lambda: len(turns.requests) == 2, "c2 to get the slot")
+    assert [r.conversation_id for r in turns.requests] == ["c1", "c2"]
+    await loop.stop()
+
+
+@pytest.mark.asyncio
 async def test_releasing_a_turn_that_never_ends_frees_its_slot() -> None:
     tray = _tray([_card("c1", "m1"), _card("c2", "m2")])
     client = _LoopClient([tray])

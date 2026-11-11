@@ -1086,8 +1086,13 @@ class ReceiveLoop:
         self, handle: TurnHandle, admit: Callable[[], Awaitable[bool]]
     ) -> Literal["started", "refused", "queued"]:
         """Start a turn now when a slot is free, else let it wait for one
-        (held out of the gate by its tracker entry meanwhile)."""
-        if len(self._active) >= self._max_turns:
+        (held out of the gate by its tracker entry meanwhile).
+
+        Waiting turns go first, in order: a freed slot is handed on by
+        :meth:`_pump`, which runs as its own task, so a turn gated before it
+        runs queues behind them instead of taking the slot (the TypeScript
+        kit's pump takes it synchronously, so it has no such window)."""
+        if self._waiting or len(self._active) >= self._max_turns:
             self._waiting.append((handle, admit))
             self._counts["turns_queued"] += 1
             return "queued"

@@ -5,6 +5,16 @@ file. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/
 and the SDK uses [SemVer](https://semver.org/) — breaking changes bump the
 major. The on-the-wire API is versioned separately under `/v1/...`.
 
+## [Unreleased]
+
+### Fixed
+
+- `integration.ReceiveLoop`: a turn gated while a freed slot was being
+  handed on could start ahead of the turns already waiting for that slot
+  (for example the conversation whose turn had just failed, gated again by
+  the cycle that turn's end woke). Waiting turns now go first, in order, as
+  in the TypeScript kit.
+
 ## [1.3.0] — 2026-11-08
 
 Contract v1 (the finished receive gate). A host that upgrades without
