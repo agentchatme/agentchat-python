@@ -2,13 +2,16 @@ name: Weekly
 
 # The conformance fixtures against the contract agentchat.me publishes, once
 # a week and on demand (Actions → Weekly → Run workflow). CI runs the same
-# script on every push and pull request; this run flags a contract change on
-# the server between pushes here. Only this comparison runs on the schedule,
-# not the test matrix.
+# script on every push to main and every pull request into main; this run
+# flags a contract change on the server between pushes here. Only this
+# comparison runs on the schedule, not the test matrix.
 #
-# A scheduled run that fails opens an issue titled "Weekly checks failed",
-# or comments on the open one; a scheduled run that passes closes it. Only
-# the report job may write issues, with the run's own GITHUB_TOKEN.
+# A run on main (scheduled or by hand) that does not pass, because the check
+# failed or timed out, opens an issue titled "Weekly checks failed", or
+# comments on the open one; a run on main that passes closes it. GitHub also
+# emails whoever last edited the cron line about a failed scheduled run; the
+# issue is the record everyone sees. Only the report job may write issues,
+# with the run's own GITHUB_TOKEN.
 #
 # Its own file, not a trigger in ci.yml: GitHub turns scheduled workflows off
 # in a public repository after 60 days without activity, and that must only
@@ -36,9 +39,11 @@ jobs:
       - name: Conformance fixtures match the published contract
         run: bash scripts/check-contract-fixtures.sh
 
+  # Not when the whole run was cancelled by hand; a job that timed out or
+  # failed is reported.
   report:
     needs: [contract-fixtures]
-    if: always() && github.event_name == 'schedule'
+    if: ${{ !cancelled() && github.ref == 'refs/heads/main' && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') }}
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     permissions:
@@ -56,6 +61,8 @@ jobs:
           EXISTING=$(gh issue list --state open --search "in:title \"$TITLE\"" --json number,title \
             --jq '[.[] | select(.title == "Weekly checks failed")][0].number // empty')
 
+          # Only a pass closes; anything else (a failure, a timeout) is
+          # reported.
           if [ "$CONTRACT" = "success" ]; then
             if [ -n "$EXISTING" ]; then
               gh issue comment "$EXISTING" --body "The weekly checks pass again: $RUN_URL"
@@ -63,17 +70,13 @@ jobs:
             fi
             exit 0
           fi
-          if [ "$CONTRACT" != "failure" ]; then
-            echo "No check failed (contract-fixtures: $CONTRACT): nothing to report."
-            exit 0
-          fi
 
           {
-            echo "The scheduled run of \`.github/workflows/weekly.yml\` on \`main\` failed: $RUN_URL"
+            echo "A run of \`.github/workflows/weekly.yml\` on \`main\` did not pass: $RUN_URL"
             echo
             echo "- **Contract fixtures: $CONTRACT.** \`conformance/v1/manifest.sha256\` against https://agentchat.me/contract/v1/conformance/manifest.sha256. A failure means the published contract changed (or could not be fetched): copy the published fixtures into \`conformance/v1/\` byte for byte, run the tests, and fix what they find."
             echo
-            echo "A scheduled run that fails again comments here; one that passes closes this issue."
+            echo "A run on main that does not pass comments here; one that passes closes this issue."
           } > issue-body.md
 
           if [ -n "$EXISTING" ]; then
