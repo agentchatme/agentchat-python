@@ -22,6 +22,10 @@ on:
   schedule:
     - cron: "29 6 * * 1" # Mondays, 06:29 UTC
   workflow_dispatch:
+  # TEMPORARY, removed before this PR is ready: runs the weekly job on this
+  # pull request once (workflow_dispatch needs the file on main first).
+  pull_request:
+    branches: [main]
 
 permissions:
   contents: read
