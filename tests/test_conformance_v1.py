@@ -96,6 +96,13 @@ def test_texts_sample_is_a_v1_set_with_the_gate_call_texts() -> None:
     assert "<handle>" in texts.identity_line_template
 
 
+def test_texts_sample_carries_the_reply_turn_template() -> None:
+    # Section 3.6: it names one conversation by <conversation_id>.
+    template = load("texts.sample.json").get("reply_turn_template")
+    assert isinstance(template, str) and "<conversation_id>" in template
+    assert template != load("texts.sample.json")["wake_instruction"]
+
+
 def test_tray_sample_with_texts_sample_renders_the_expected_prompt() -> None:
     tray = load("tray.sample.json")
     texts = load("texts.sample.json")

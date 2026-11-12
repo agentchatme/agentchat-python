@@ -6,12 +6,14 @@ twin.
 Two modes (contract v1, D5):
 
 - ``gate_call`` (Hermes, OpenClaw): read the tray, ask the agent's own model
-  the served gate question in a tool-less call (``call_model``), record
-  ``dismiss`` / ``defer`` at once, start one turn per ``reply``
-  (``start_turn``), and when a turn has ended record from what actually
-  happened (:func:`~agentchatme.integration.turn_outcome`). Each pending
-  invite on the tray gets one invite turn (``start_invite_turn``, default
-  ``start_turn``) and the same rule.
+  the served gate question in tool-less calls (``call_model``) of at most
+  ``gate_chunk_size`` cards each, record ``dismiss`` / ``defer`` at once,
+  then start one turn per ``reply`` (``start_turn``), prompted with the
+  served ``reply_turn_template`` for its one conversation, and when a turn
+  has ended record from what actually happened
+  (:func:`~agentchatme.integration.turn_outcome`). Each pending invite on the
+  tray gets one invite turn (``start_invite_turn``, default ``start_turn``)
+  and the same rule.
 - ``single_run`` (Claude Code, Codex, routines, a listener): when anything is
   owed, start one run (``start_run``) with the served wake text; the run
   reads the tray itself and records its own verdicts. The loop records
@@ -42,17 +44,44 @@ it within ``pace_ms`` unless an ``unanswered`` wake arrives. In single-run
 mode the run that would dismiss an ignored invite counts only when it ended
 at least ``pace_ms`` after the first counted one. In memory.
 
-Deadlines: one gate call may take ``gate_call_timeout_ms`` (60 s); past it
-the cycle fails closed for those cards (nothing recorded; the next wake
-retries). A whole cycle may take ``cycle_timeout_ms`` (10 min), not counting
-time spent starting turns or running a run; past it the cycle is abandoned
-(logged, summarised as ``abandoned``) and wakes are taken again, so a cycle
-that never finishes cannot leave the loop looking healthy while it
-processes nothing; an abandoned cycle records nothing more (a verdict
-already on its way is left to finish, and its card is held out of the next
-gate until it answers). ``status().recent_cycles`` holds the last outcomes
-for a host to alarm on. Either deadline: ``None`` is the default, ``0``
-turns it off.
+Chunks (contract v1, section 3.6): a tray holds up to 50 cards, and one
+answer for all of them can outgrow what a runtime lets its model write; a
+cut-off answer does not parse, so nothing would be recorded and the tray
+would never shrink. The cards are split, in tray order, into chunks of at
+most ``gate_chunk_size`` (10), and each chunk gets its own gate call, one
+after another, its prompt assembled exactly as for a whole tray with N =
+the cards in that chunk (a tray that fits one chunk gets exactly that
+tray's prompt). A chunk with nothing owed in it (muted cards only) costs no
+call: its cards are left as in a ``nothing_owed`` cycle. Each chunk's
+``dismiss`` / ``defer`` are recorded as soon as it answers. A chunk that
+fails (the call failed or ran past its deadline, or its answer held no
+usable verdict) leaves only its own cards undecided; the other chunks'
+verdicts are recorded. Reply turns start once every chunk has answered, so
+a turn never finds on its tray a card the gate has yet to decide. The cycle
+is ``decided`` when any chunk answered and ``fail_closed`` when none did;
+``chunks_ok`` / ``chunks_failed``, the ``failure`` and one ``gate_chunk``
+event per chunk say which.
+
+Deadlines: each gate call (one per chunk) may take ``gate_call_timeout_ms``
+(60 s); past it that chunk fails closed for its cards (nothing recorded for
+them; the next wake asks again), its cancel handle is set, and the next
+chunk gets a deadline of its own. A whole cycle may take
+``cycle_timeout_ms`` (10 min), not counting time spent starting turns,
+running a run, or inside gate calls while they have a deadline of their own
+(a tray gated in k chunks may take k deadlines; with ``gate_call_timeout_ms``
+off, gate calls count: the watchdog is then their only bound). Past it the
+cycle is abandoned (logged, summarised as ``abandoned``) and wakes are taken
+again, so a cycle that never finishes cannot leave the loop looking healthy
+while it processes nothing; an abandoned cycle records nothing more, asks no
+further chunk and starts no turn (a verdict already on its way is left to
+finish, and its card is held out of the next gate until it answers).
+``status().recent_cycles`` holds the last outcomes for a host to alarm on.
+Either deadline: ``None`` is the default, ``0`` turns it off. Both run on
+the loop's timer (``set_timer``) and clock (``now`` when given, else a
+monotonic one; a wall-clock ``now`` makes the watchdog wall-clock), so a
+test can move them by hand. A gate call whose deadline
+is longer than ``cycle_timeout_ms`` is not cut by the watchdog: time inside
+a deadline-bound gate call is not counted.
 
 Turns: at most ``max_concurrent_turns`` (default 1) reply and invite turns
 run at once; the rest wait for a slot, held out of the gate meanwhile (their
@@ -88,7 +117,7 @@ from .._client_identity import AgentChatClientIdentity
 from .._realtime import RealtimeClient
 from ..types.texts import Texts
 from .anchor import normalize_handle
-from .coalescer import SetTimer, TimerHandle, WakeCoalescer, _loop_timer
+from .coalescer import SetTimer, TimerHandle, WakeCoalescer, _loop_timer, _monotonic_ms
 from .outcome import (
     InviteOutcome,
     TurnEnd,
@@ -103,6 +132,9 @@ _log = logging.getLogger("agentchat.integration")
 
 TRAY_LIMIT = 50
 """Largest tray the server builds: the loop always reads all of it."""
+GATE_CHUNK_SIZE = 10
+"""Default for ``gate_chunk_size``: the most cards one gate call is asked
+about (contract v1, section 3.6: at most 10). Valid: 1 to ``TRAY_LIMIT``."""
 TURN_OVERDUE_MS = 30 * 60_000
 """A running turn older than this is shown as overdue in ``status()``."""
 _NO_PROGRESS_BACKOFF_MS = 1_000
@@ -114,7 +146,7 @@ CYCLE_TIMEOUT_MS = 10 * 60_000
 runs: past it the cycle is abandoned and wakes are taken again."""
 RECENT_CYCLES = 20
 """How many cycle summaries ``status()`` keeps."""
-_WATCHDOG_TICK_S = 1.0
+_WATCHDOG_RECHECK_MIN_MS = 5.0
 PACE_MS = 60_000
 """D5 pacing: how long a silent turn's card (or an invite after its turn) is
 not gated again at the same anchor."""
@@ -145,8 +177,10 @@ class TurnRequest:
 
     kind: Literal["reply", "invite"]
     prompt: str
-    """``reply``: the served wake instruction and the conversation id;
-    ``invite``: the served invite prompt and the invite id."""
+    """``reply``: the served reply-turn template with the conversation id
+    filled in (from a server that predates it: the served wake instruction
+    and the conversation id; see :func:`reply_prompt`); ``invite``: the
+    served invite prompt and the invite id."""
     texts: Texts
     stopping: asyncio.Event = field(repr=False)
     """Set when the loop stops."""
@@ -236,6 +270,18 @@ class CycleSummary:
     """Cards and invites left out by D5 pacing (a recent silent turn)."""
     truncated: bool = False
     failure: str | None = None
+    """Why the cycle could not finish, or, when some gate chunks failed, how
+    many and the first one's reason (``2 of 5 gate chunks failed; chunk 3:
+    …``; a cycle that made one gate call gives that call's reason as it is,
+    also when other chunks of its plan were skipped)."""
+    chunks_ok: int = 0
+    """Gate-call mode: gate calls (one per chunk of at most
+    ``gate_chunk_size`` cards) whose answer gave verdicts."""
+    chunks_failed: int = 0
+    """Gate calls that failed closed (the call failed or ran past its
+    deadline, or its answer held no usable verdict); only their own cards
+    stay undecided. A call the cycle's end cut short (:meth:`ReceiveLoop.stop`,
+    the watchdog) is neither: the cycle is ``abandoned``."""
 
 
 @dataclass(frozen=True)
@@ -258,8 +304,16 @@ class ReceiveLoopStatus:
 
 
 ReceiveLoopEvent = dict[str, Any]
-"""``{"type": "wake" | "echo" | "cycle" | "turn_started" | "turn_refused" |
-"turn_outcome" | "invite_outcome" | "run" | "error", ...}``."""
+"""``{"type": "wake" | "echo" | "cycle" | "gate_chunk" | "turn_started" |
+"turn_refused" | "turn_outcome" | "invite_outcome" | "run" | "error", ...}``.
+
+``gate_chunk`` (gate-call mode, one per gate call, in order, once its
+verdicts are recorded): ``cycle`` (the cycle's identifier: the chunks of one
+cycle share it), ``index`` (1-based, in tray order), ``of`` (how many chunks
+the cycle's cards were split into), ``cards`` (the N of its prompt),
+``outcome`` (``decided`` or ``fail_closed``), ``undecided`` (its cards left
+without a usable verdict) and ``failure``; a partial failure shows here
+chunk by chunk. A cycle the watchdog abandoned emits no further one."""
 
 TurnStarter = Callable[[TurnRequest], Any]
 RunStarter = Callable[[RunRequest], Any]
@@ -282,10 +336,31 @@ class _StaticTexts:
         return self._texts
 
 
+_CONVERSATION_PLACEHOLDER = "<conversation_id>"
+
+
 def reply_prompt(texts: Any, conversation_id: str) -> str:
-    """The prompt a reply turn starts with: the served wake instruction, then
-    the conversation it is for."""
-    instruction = texts.get("wake_instruction") if isinstance(texts, Mapping) else texts.wake_instruction
+    """The prompt a reply turn starts with: the served
+    ``reply_turn_template`` with every ``<conversation_id>`` replaced by the
+    conversation's id, which sends the turn to that one conversation and no
+    other. A served template without the placeholder is used as it is, with
+    a final ``conversation_id:`` line. Texts without the field (an older
+    server, a copy cached before it; or a value that is empty, blank or not
+    a string) fall back to the served wake instruction and a
+    ``conversation_id:`` line."""
+    if isinstance(texts, Mapping):
+        template = texts.get("reply_turn_template")
+        instruction = texts.get("wake_instruction")
+    else:
+        template = getattr(texts, "reply_turn_template", None)
+        instruction = texts.wake_instruction
+    if isinstance(template, str) and template.strip():
+        body = template.strip()
+        if _CONVERSATION_PLACEHOLDER in body:
+            return body.replace(_CONVERSATION_PLACEHOLDER, conversation_id)
+        # Served, but it does not name the conversation: the template still
+        # leads, and the conversation is named after it.
+        return f"{body}\n\nconversation_id: {conversation_id}"
     return f"{str(instruction).strip()}\n\nconversation_id: {conversation_id}"
 
 
@@ -310,6 +385,14 @@ def _consume_outcome(task: asyncio.Future[Any]) -> None:
         task.exception()
 
 
+def _number_text(value: float) -> str:
+    """A duration in a failure text: an integral value as an integer
+    (``1200000``, never ``1.2e+06``), any other as it is (``1.5``), as the
+    TypeScript kit prints it."""
+    number = float(value)
+    return str(int(number)) if number.is_integer() else repr(number)
+
+
 def _timeout_option(value: float | None, default: float, name: str) -> float:
     """A timeout option in ms: ``None`` → the default, ``0`` → off (returned
     as 0), a positive number → itself; anything else raises."""
@@ -331,6 +414,100 @@ class _StaleFlag:
 
     def is_set(self) -> bool:
         return self._stale()
+
+
+class _CallCancel:
+    """Cancel handles for the runtime's model call: an
+    :class:`asyncio.Event` for a coroutine ``call_model``, a
+    :class:`threading.Event` for a plain one (it runs in a worker thread).
+
+    Each cycle holds one; each gate call (one per chunk) takes a
+    :meth:`child`, set by that call's own deadline or with the cycle's (the
+    cycle abandoned, the loop stopped). A chunk past its deadline tells only
+    its own call: the next chunk's call starts with a fresh handle. Used on
+    the loop's event loop only."""
+
+    def __init__(self) -> None:
+        self.on_loop = asyncio.Event()
+        self.in_thread = threading.Event()
+        self._children: set[_CallCancel] = set()
+
+    def is_set(self) -> bool:
+        return self.in_thread.is_set()
+
+    def set(self) -> None:
+        self.on_loop.set()
+        self.in_thread.set()
+        for child in list(self._children):
+            child.set()
+
+    def child(self) -> _CallCancel:
+        handles = _CallCancel()
+        if self.is_set():
+            handles.set()
+        else:
+            self._children.add(handles)
+        return handles
+
+    def release(self, child: _CallCancel) -> None:
+        self._children.discard(child)
+
+
+def _chunked(cards: list[dict[str, Any]], size: int) -> list[list[dict[str, Any]]]:
+    """The cards to gate, in tray order, in chunks of at most ``size``
+    (contract v1, section 3.6). A tray that fits one chunk is that one chunk,
+    exactly as served, so its prompt is exactly the whole tray's."""
+    return [cards[start : start + size] for start in range(0, len(cards), size)]
+
+
+@dataclass
+class _ChunkedGate:
+    """What the gate's chunks of one cycle came to, together."""
+
+    gated: int = 0
+    """Cards sent to the model in a chunk whose call was not cut short; each
+    counts once, so it is ``reply`` + ``dismiss`` + ``defer`` +
+    ``undecided``."""
+    held: int = 0
+    """Cards left out of their chunk: a turn took them while earlier chunks
+    were gated."""
+    reply: list[_gate.AsyncGateReply] = field(default_factory=list)
+    """The replies, chunk by chunk, each chunk's in the model's order."""
+    verdicts: dict[str, int] = field(default_factory=lambda: {"reply": 0, "dismiss": 0, "defer": 0})
+    undecided: int = 0
+    recorded: int = 0
+    record_failures: int = 0
+    chunks: list[dict[str, Any]] = field(default_factory=list)
+    """The ``gate_chunk`` reports, in order."""
+
+
+def _chunk_failure(chunks: list[dict[str, Any]]) -> str | None:
+    """The cycle's failure from the gate calls it made (``chunks``: their
+    reports): none when every call decided; the reason as it is when one
+    call was made (also when the plan had more chunks, skipped as muted-only
+    or held); otherwise how many of the calls made failed, and the first
+    failed chunk's position in the plan and reason (each chunk's own is in
+    its ``gate_chunk`` event)."""
+    failed = [chunk for chunk in chunks if chunk["outcome"] == "fail_closed"]
+    if not failed:
+        return None
+    first = failed[0]
+    reason = first["failure"] or "no usable verdicts in the answer"
+    if len(chunks) == 1:
+        return str(reason)
+    # Counted over the calls made; the chunk named by its planned position,
+    # as in its gate_chunk event.
+    return f"{len(failed)} of {len(chunks)} gate chunks failed; chunk {first['index']}: {reason}"
+
+
+def _chunk_size_option(value: object) -> int:
+    """``gate_chunk_size``: ``None`` → the default, an int from 1 to
+    ``TRAY_LIMIT`` → itself; anything else raises."""
+    if value is None:
+        return GATE_CHUNK_SIZE
+    if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= TRAY_LIMIT:
+        raise ValueError(f"ReceiveLoop: gate_chunk_size must be an int from 1 to {TRAY_LIMIT}")
+    return value
 
 
 def _tray_invites(tray: Mapping[str, Any]) -> list[dict[str, Any]]:
@@ -401,7 +578,17 @@ class ReceiveLoop:
     (single-run mode, default ``True``) dismisses an invite still pending
     after two completed runs that left it; ``False`` leaves every invite to
     the runs (a host that forwards invites elsewhere): no read after the run
-    and nothing recorded for them.
+    and nothing recorded for them. ``gate_chunk_size`` (gate-call mode;
+    ``None``: :data:`GATE_CHUNK_SIZE`, 10; an int from 1 to
+    :data:`TRAY_LIMIT`) is the most cards one gate call decides: a larger
+    tray is gated in chunks of this size (see the module docstring); 50
+    gates the largest tray in one call. ``now`` (epoch ms) and ``set_timer``
+    are the loop's clock and timers: pacing, the coalescer, the backoff for
+    a truncated tray, the gate-call deadline and the watchdog run on them (a
+    test passes fakes). Without ``now`` the watchdog measures on a monotonic
+    clock; a ``now`` that is given is the watchdog's clock too, so a
+    wall-clock ``now`` makes the watchdog wall-clock (a clock step then
+    counts against, or for, the running cycle).
     """
 
     def __init__(
@@ -427,6 +614,7 @@ class ReceiveLoop:
         cycle_timeout_ms: float | None = None,
         turn_tracker: TurnTracker | None = None,
         dismiss_ignored_invites: bool = True,
+        gate_chunk_size: int | None = None,
         now: Callable[[], float] | None = None,
         set_timer: SetTimer | None = None,
     ) -> None:
@@ -438,6 +626,7 @@ class ReceiveLoop:
             raise ValueError("ReceiveLoop: single_run mode needs start_run")
         if not isinstance(max_concurrent_turns, int) or max_concurrent_turns < 1:
             raise ValueError("ReceiveLoop: max_concurrent_turns must be an int >= 1")
+        self._gate_chunk_size = _chunk_size_option(gate_chunk_size)
         self._client = client
         self._texts: Any = _StaticTexts(texts) if isinstance(texts, Texts) else texts
         self._mode: ReceiveLoopMode = mode
@@ -449,6 +638,9 @@ class ReceiveLoop:
         self._readiness = readiness
         self._on_event = on_event
         self._now = now or (lambda: time.time() * 1000.0)
+        # Durations the watchdog measures: the given clock (a test's), else
+        # a monotonic one, so a wall-clock step never cuts a cycle short.
+        self._clock: Callable[[], float] = now or _monotonic_ms
         self._handle = normalize_handle(handle) if handle else None
         self._tracker = turn_tracker if turn_tracker is not None else TurnTracker(now=self._now)
         self._pace_ms = pace_ms
@@ -499,8 +691,7 @@ class ReceiveLoop:
         # The running cycle's identity: an abandoned cycle goes stale and
         # acts no more; its cancel handles tell a pending model call.
         self._cycle_token = 0
-        self._cycle_cancel = asyncio.Event()
-        self._cycle_cancel_thread = threading.Event()
+        self._cycle_cancel = _CallCancel()
         # None: the default; 0: no deadline; a negative value is an error.
         self._gate_call_timeout_ms = _timeout_option(
             gate_call_timeout_ms, GATE_CALL_TIMEOUT_MS, "gate_call_timeout_ms"
@@ -508,12 +699,13 @@ class ReceiveLoop:
         self._cycle_timeout_s = (
             _timeout_option(cycle_timeout_ms, CYCLE_TIMEOUT_MS, "cycle_timeout_ms") / 1000.0
         )
-        # Time the running cycle spends starting its own turns or its run
-        # (left out by the cycle watchdog). An admission _pump starts runs
-        # outside any cycle and is not counted here.
-        self._turn_depth = 0
-        self._turn_since = 0.0
-        self._turn_clock = 0.0
+        # Time the running cycle spends starting its own turns, running its
+        # run, or inside a gate call that has a deadline of its own (left out
+        # by the cycle watchdog). An admission _pump starts runs outside any
+        # cycle and is not counted here.
+        self._uncounted_depth = 0
+        self._uncounted_since = 0.0
+        self._uncounted_clock = 0.0
         self._last_error: str | None = None
         self._counts: dict[str, int] = {
             "frames": 0,
@@ -527,6 +719,8 @@ class ReceiveLoop:
             "runs_failed": 0,
             "runs_not_started": 0,
             "outcome_record_failures": 0,
+            "chunks_ok": 0,
+            "chunks_failed": 0,
         }
         self._outcomes: dict[str, int] = {}
         self._realtime = self._build_socket(socket)
@@ -604,11 +798,10 @@ class ReceiveLoop:
             return
         self._stopped = True
         # The running cycle stops acting: a gate mid-way records no further
-        # verdict (its cards stay on the tray for the next start) and a
-        # pending model call is told through its cancel handle. A verdict
-        # already on its way is left to finish.
+        # verdict and asks no further chunk (their cards stay on the tray for
+        # the next start), and a pending model call is told through its
+        # cancel handle. A verdict already on its way is left to finish.
         self._cycle_cancel.set()
-        self._cycle_cancel_thread.set()
         self._coalescer.stop()
         self._clear_more_timer()
         self._unsubscribe_release()
@@ -758,10 +951,9 @@ class ReceiveLoop:
             return
         self._cycle_token += 1
         token = self._cycle_token
-        self._cycle_cancel = asyncio.Event()
-        self._cycle_cancel_thread = threading.Event()
+        cancel = self._cycle_cancel = _CallCancel()
         body: asyncio.Future[CycleSummary] = asyncio.ensure_future(
-            self._gate_call_cycle(token) if self._mode == "gate_call" else self._single_run_cycle(token)
+            self._gate_call_cycle(token, cancel) if self._mode == "gate_call" else self._single_run_cycle(token)
         )
         summary = await self._watch(body)
         self._last_cycle = summary
@@ -772,38 +964,53 @@ class ReceiveLoop:
 
     async def _watch(self, body: asyncio.Future[CycleSummary]) -> CycleSummary:
         """The cycle watchdog: a cycle running longer than
-        ``cycle_timeout_ms`` — not counting time spent starting turns or
-        runs — is abandoned (cancelled, logged, summarised as ``abandoned``)
-        so the coalescer takes wakes again and the next wake retries."""
-        if self._cycle_timeout_s <= 0:
+        ``cycle_timeout_ms`` — not counting time spent starting turns, runs,
+        or gate calls that have a deadline of their own — is abandoned
+        (cancelled, logged, summarised as ``abandoned``) so the coalescer
+        takes wakes again and the next wake retries. It runs on the loop's
+        timer (``set_timer``) and clock (``now`` when given, else a
+        monotonic one)."""
+        timeout_ms = self._cycle_timeout_s * 1000.0
+        if timeout_ms <= 0:
             return await body
-        started = time.monotonic()
-        turns_at_start = self._turn_seconds()
+        started = self._clock()
+        uncounted_at_start = self._uncounted_ms()
+        overdue: asyncio.Future[None] = asyncio.get_running_loop().create_future()
+        timer: TimerHandle | None = None
+
+        def check() -> None:
+            nonlocal timer
+            timer = None
+            if overdue.done() or body.done():
+                return
+            active = (self._clock() - started) - (self._uncounted_ms() - uncounted_at_start)
+            if active >= timeout_ms and self._uncounted_depth == 0:
+                overdue.set_result(None)
+                return
+            timer = self._set_timer(max(_WATCHDOG_RECHECK_MIN_MS, timeout_ms - active), check)
+
+        timer = self._set_timer(timeout_ms, check)
+        either: set[asyncio.Future[Any]] = {body, overdue}
         try:
-            while True:
-                used = (time.monotonic() - started) - (self._turn_seconds() - turns_at_start)
-                left = self._cycle_timeout_s - used
-                if left <= 0 and self._turn_depth == 0:
-                    break
-                done, _ = await asyncio.wait(
-                    {body}, timeout=max(0.005, min(left, _WATCHDOG_TICK_S))
-                )
-                if body in done:
-                    return body.result()
+            await asyncio.wait(either, return_when=asyncio.FIRST_COMPLETED)
         except asyncio.CancelledError:
             body.cancel()
             raise
+        finally:
+            if timer is not None:
+                timer.cancel()
+        if body.done():
+            return body.result()
         # Abandoned: the cycle goes stale (every step checks it), its pending
         # model call is told, and the coalescer takes wakes again.
         self._cycle_token += 1
         self._cycle_cancel.set()
-        self._cycle_cancel_thread.set()
         body.cancel()
         with contextlib.suppress(BaseException):
             await body
         failure = (
-            f"cycle abandoned after {self._cycle_timeout_s:g}s (a tray read, the texts,"
-            " the readiness check, the gate call or a verdict never finished); the next"
+            f"cycle abandoned after {_number_text(self._cycle_timeout_s)}s (a tray read, the texts,"
+            " the readiness check, a gate call or a verdict never finished); the next"
             " wake retries"
         )
         _log.error("receive loop: %s", failure)
@@ -812,25 +1019,28 @@ class ReceiveLoop:
     def _stale(self, token: int) -> bool:
         return token != self._cycle_token or self._stopped
 
-    def _turn_seconds(self) -> float:
-        extra = time.monotonic() - self._turn_since if self._turn_depth > 0 else 0.0
-        return self._turn_clock + extra
+    def _uncounted_ms(self) -> float:
+        extra = self._clock() - self._uncounted_since if self._uncounted_depth > 0 else 0.0
+        return self._uncounted_clock + extra
 
     @contextlib.contextmanager
-    def _inside_turn(self) -> Iterator[None]:
-        """Time the running cycle spends starting a turn or running a run:
-        not counted by the watchdog. Only the cycle's own: :meth:`_pump`
-        admits waiting turns as its own task, and an admission hanging there
-        must never keep the watchdog from abandoning a cycle that hangs."""
-        if self._turn_depth == 0:
-            self._turn_since = time.monotonic()
-        self._turn_depth += 1
+    def _uncounted(self) -> Iterator[None]:
+        """Time the running cycle spends starting a turn, running a run, or
+        inside a gate call that has a deadline of its own (a tray gated in k
+        chunks may take k deadlines; a cycle making progress is not
+        abandoned for it): not counted by the watchdog. Only the cycle's
+        own: :meth:`_pump` admits waiting turns as its own task, and an
+        admission hanging there must never keep the watchdog from
+        abandoning a cycle that hangs."""
+        if self._uncounted_depth == 0:
+            self._uncounted_since = self._clock()
+        self._uncounted_depth += 1
         try:
             yield
         finally:
-            self._turn_depth -= 1
-            if self._turn_depth == 0:
-                self._turn_clock += time.monotonic() - self._turn_since
+            self._uncounted_depth -= 1
+            if self._uncounted_depth == 0:
+                self._uncounted_clock += self._clock() - self._uncounted_since
 
     async def _read_tray(self) -> dict[str, Any] | None:
         try:
@@ -870,7 +1080,18 @@ class ReceiveLoop:
         )
         return str(reason or "not ready")
 
-    async def _gate_call_cycle(self, token: int) -> CycleSummary:
+    def _held(self, card: Mapping[str, Any]) -> bool:
+        """Held out of the gate: a running or waiting turn holds the card's
+        conversation, or a verdict for it is still being recorded (an
+        abandoned cycle's last call). Gating it again could record the same
+        verdict twice (a second defer climbs the ladder)."""
+        conversation_id = card["conversation_id"]
+        return (
+            self._tracker.conversation_running(conversation_id)
+            or conversation_id in self._records_in_flight
+        )
+
+    async def _gate_call_cycle(self, token: int, cancel: _CallCancel) -> CycleSummary:
         tray = await self._read_tray()
         if self._stale(token):
             return self._summary("abandoned")
@@ -878,15 +1099,7 @@ class ReceiveLoop:
             return self._summary("tray_failed", failure=self._last_error)
         cards = _gate.cards_of(tray)
         invites = _tray_invites(tray)
-        # Held out of this gate: a running or waiting turn, or a verdict still
-        # being recorded (an abandoned cycle's last call): gating it again
-        # could record the same verdict twice (a second defer climbs the
-        # ladder).
-        unheld = [
-            card
-            for card in self._tracker.without_running(cards)
-            if card["conversation_id"] not in self._records_in_flight
-        ]
+        unheld = [card for card in cards if not self._held(card)]
         held = len(cards) - len(unheld)
         if held > 0:
             self._held_while_running = True
@@ -922,8 +1135,8 @@ class ReceiveLoop:
         if unready is not None:
             return self._summary("tools_unavailable", failure=unready, **base)
 
-        gated = 0
         tally = {
+            "gated": 0,
             "reply": 0,
             "dismiss": 0,
             "defer": 0,
@@ -932,48 +1145,133 @@ class ReceiveLoop:
             "turns_started": 0,
             "turns_refused": 0,
             "turns_queued": 0,
+            "chunks_ok": 0,
+            "chunks_failed": 0,
         }
+        held_during_gate = 0
         outcome: CycleOutcome = "invites_only"
         failure: str | None = None
         recorded = 0
         if owed_cards:
-            gated = len(gate_cards)
-            result = await _gate.run_async(
-                {**tray, "conversations": gate_cards},
-                self._model_call(),
-                self._recording_client(token),
-                tool_namer=self._tool_namer,
-                texts=texts,
-                cancel=_StaleFlag(lambda: self._stale(token)),
-            )
-            if self._stale(token):
-                return self._summary("abandoned", **base)
-            for verdict in result.verdicts:
-                tally[verdict.decision] += 1
-            tally["undecided"] = len(result.undecided)
-            tally["record_failures"] = len(result.record_failures)
-            recorded = result.recorded
-            if result.outcome == "fail_closed":
-                outcome = "fail_closed"
-                failure = result.failure
-            else:
+            gate = await self._gate_in_chunks(token, cancel, tray, gate_cards, texts)
+            held_during_gate = gate.held
+            recorded = gate.recorded
+            tally["gated"] = gate.gated
+            for decision, count in gate.verdicts.items():
+                tally[decision] = count
+            tally["undecided"] = gate.undecided
+            tally["record_failures"] = gate.record_failures
+            tally["chunks_ok"] = sum(1 for chunk in gate.chunks if chunk["outcome"] == "decided")
+            tally["chunks_failed"] = len(gate.chunks) - tally["chunks_ok"]
+            failure = _chunk_failure(gate.chunks)
+            if tally["chunks_ok"] > 0:
                 outcome = "decided"
-                for reply in result.reply:
+                # Every chunk has answered and its dismiss / defer verdicts
+                # are recorded: only then do the turns start, so a turn never
+                # finds on its tray a card the gate has yet to decide.
+                for reply in gate.reply:
                     if self._stale(token):
                         break
                     tally[f"turns_{await self._start_reply_turn(reply, texts)}"] += 1
+            elif tally["chunks_failed"] > 0:
+                outcome = "fail_closed"
+            elif not owed_invites and not self._stale(token):
+                # Every card was taken by a turn while the gate ran: no call
+                # was made.
+                return self._summary("nothing_owed", **{**base, "held_by_turns": held + held_during_gate})
         for invite in owed_invites:
             if self._stale(token):
                 break
             tally[f"turns_{await self._start_invite_turn_for(invite, texts)}"] += 1
+        parts = {**base, "held_by_turns": held + held_during_gate, **tally}
+        # Stopped (or abandoned) part-way: what was done is still reported;
+        # the reason is the stop itself, not a failure.
         if self._stale(token):
-            return self._summary("abandoned", **base)
+            return self._summary("abandoned", **parts)
         # More conversations wait than one tray shows: read again for the
         # rest — at once after a cycle that made progress, else after a
         # backoff, so a cycle that cannot progress never spins.
         if tray.get("truncated") is True and outcome == "decided":
             self._read_the_rest(recorded > 0 or tally["turns_started"] > 0)
-        return self._summary(outcome, gated=gated, failure=failure, **base, **tally)
+        return self._summary(outcome, failure=failure, **parts)
+
+    async def _gate_in_chunks(
+        self,
+        token: int,
+        cancel: _CallCancel,
+        tray: dict[str, Any],
+        cards: list[dict[str, Any]],
+        texts: Texts,
+    ) -> _ChunkedGate:
+        """The gate in chunks (contract v1, section 3.6): the cards, in tray
+        order, split into chunks of at most ``gate_chunk_size``, one gate
+        call per chunk, one after another. Each chunk's prompt is the gate
+        prompt for its own cards (N = the cards in that chunk), each call has
+        its own deadline and the cycle's cancellation, and each chunk's
+        ``dismiss`` / ``defer`` verdicts are recorded as soon as it answers.
+        A chunk that fails closed leaves only its own cards undecided.
+        Before each call the chunk is checked again for cards a turn has
+        taken since the tray was read (a shared tracker), so a longer gate
+        never decides a card a turn holds; a chunk left with muted cards
+        only is owed nothing and costs no call. Stops once the cycle is
+        stale: a call :meth:`stop` cut short is not counted as a failed
+        chunk, and a cycle the watchdog abandoned counts and reports no
+        further chunk."""
+        chunks = _chunked(cards, self._gate_chunk_size)
+        out = _ChunkedGate()
+        call_model = self._model_call(cancel)
+        recording = self._recording_client(token)
+        stale = _StaleFlag(lambda: self._stale(token))
+        for index, planned in enumerate(chunks, start=1):
+            if self._stale(token):
+                break
+            chunk = [card for card in planned if not self._held(card)]
+            if len(chunk) < len(planned):
+                out.held += len(planned) - len(chunk)
+                self._held_while_running = True
+            if not any(card.get("muted") is not True for card in chunk):
+                # Nothing owed in it (empty, or muted cards only): no model
+                # call, the cycle's own rule applied per chunk. Its muted
+                # cards are left as in a nothing_owed cycle.
+                continue
+            result = await _gate.run_async(
+                {**tray, "conversations": chunk},
+                call_model,
+                recording,
+                tool_namer=self._tool_namer,
+                texts=texts,
+                cancel=stale,
+            )
+            if token != self._cycle_token:
+                break  # abandoned by the watchdog: this cycle reports nothing more
+            if self._stopped and result.outcome != "decided":
+                break  # cut short by stop(): not this chunk's failure
+            out.gated += len(chunk)
+            # A stop part-way through the recording leaves the rest undecided
+            # (the gate moves them there): each card counts once, as a
+            # verdict or as undecided.
+            left = set(result.undecided)
+            for verdict in result.verdicts:
+                if verdict.conversation_id not in left:
+                    out.verdicts[verdict.decision] += 1
+            out.reply.extend(result.reply)
+            out.undecided += len(result.undecided)
+            out.recorded += result.recorded
+            out.record_failures += len(result.record_failures)
+            decided = result.outcome == "decided"
+            report: dict[str, Any] = {
+                "cycle": token,
+                "index": index,
+                "of": len(chunks),
+                "cards": len(chunk),
+                "outcome": "decided" if decided else "fail_closed",
+                "undecided": len(result.undecided),
+                "failure": result.failure,
+            }
+            out.chunks.append(report)
+            self._counts["chunks_ok" if decided else "chunks_failed"] += 1
+            self._emit({"type": "gate_chunk", **report})
+        return out
 
     async def _single_run_cycle(self, token: int) -> CycleSummary:
         tray = await self._read_tray()
@@ -1021,7 +1319,7 @@ class ReceiveLoop:
         request = RunRequest(prompt=prompt, texts=texts, cards=cards, invites=invites, stopping=self._stopping)
         try:
             assert self._start_run is not None
-            with self._inside_turn():
+            with self._uncounted():
                 raw = await self._call(self._start_run, request)
             end = raw if isinstance(raw, RunEnd) else RunEnd(status="failed", detail=f"start_run returned {type(raw).__name__}")
         except Exception as err:
@@ -1102,7 +1400,7 @@ class ReceiveLoop:
             self._counts["turns_queued"] += 1
             return "queued"
         self._active.add(handle)
-        with self._inside_turn():  # the cycle's own admission
+        with self._uncounted():  # the cycle's own admission
             started = await admit()
         if started:
             return "started"
@@ -1409,40 +1707,78 @@ class ReceiveLoop:
 
         return SimpleNamespace(decisions=SimpleNamespace(record=record))
 
-    def _model_call(self) -> Callable[[str], Any]:
-        """The runtime's model call, bounded by ``gate_call_timeout_ms`` (and
-        by the cycle's own abandonment). A ``call_model`` that takes a
-        ``cancel`` keyword is handed a cancel handle that is set when the
-        answer is no longer wanted: an :class:`asyncio.Event` for a coroutine
-        function, a :class:`threading.Event` for a plain function (which runs
-        in a worker thread; the cycle simply stops waiting for it)."""
+    def _model_call(self, cycle_cancel: _CallCancel) -> Callable[[str], Any]:
+        """The runtime's model call for one gate call (one chunk), bounded by
+        ``gate_call_timeout_ms`` (and by the cycle's abandonment or the
+        loop's stop). A ``call_model`` that takes a ``cancel`` keyword is
+        handed this call's own cancel handle, set when its answer is no
+        longer wanted (its deadline passed, the cycle was abandoned, the
+        loop stopped): an :class:`asyncio.Event` for a coroutine function, a
+        :class:`threading.Event` for a plain function (which runs in a
+        worker thread; the cycle simply stops waiting for it). A chunk past
+        its deadline tells only its own call.
+
+        While a call has a deadline, its time does not count against the
+        cycle's (a tray gated in k chunks may take k deadlines, and a cycle
+        that is making progress is not abandoned for it); with the deadline
+        off the watchdog is the calls' only bound, so they count."""
         assert self._call_model is not None
         call: Callable[..., Any] = self._call_model
         is_async = _is_async(call)
         takes_cancel = _accepts_keyword(call, "cancel")
-        timeout_s = self._gate_call_timeout_ms / 1000.0 if self._gate_call_timeout_ms > 0 else None
-        cancel_async = self._cycle_cancel
-        cancel_thread = self._cycle_cancel_thread
+        timeout_ms = self._gate_call_timeout_ms
 
         async def bounded(prompt: str) -> Any:
-            if is_async:
-                pending: Any = call(prompt, cancel=cancel_async) if takes_cancel else call(prompt)
-            elif takes_cancel:
-                pending = asyncio.to_thread(functools.partial(call, prompt, cancel=cancel_thread))
-            else:
-                pending = asyncio.to_thread(call, prompt)
+            handles = cycle_cancel.child()
+            uncounted: contextlib.AbstractContextManager[None] = (
+                self._uncounted() if timeout_ms > 0 else contextlib.nullcontext()
+            )
             try:
-                if timeout_s is None:
-                    return await pending
-                return await asyncio.wait_for(pending, timeout_s)
-            except asyncio.TimeoutError:
-                cancel_async.set()
-                cancel_thread.set()
-                raise asyncio.TimeoutError(
-                    f"no answer within {self._gate_call_timeout_ms:g} ms"
-                ) from None
+                with uncounted:
+                    if is_async:
+                        pending: Any = call(prompt, cancel=handles.on_loop) if takes_cancel else call(prompt)
+                    elif takes_cancel:
+                        pending = asyncio.to_thread(functools.partial(call, prompt, cancel=handles.in_thread))
+                    else:
+                        pending = asyncio.to_thread(call, prompt)
+                    if timeout_ms <= 0:
+                        return await pending
+                    return await self._within(pending, timeout_ms, handles)
+            finally:
+                cycle_cancel.release(handles)
 
         return bounded
+
+    async def _within(self, pending: Awaitable[Any], timeout_ms: float, handles: _CallCancel) -> Any:
+        """One gate call bounded by its deadline, on the loop's timer
+        (``set_timer``). Past it the call's cancel handle is set, the call is
+        cancelled and no longer waited for (a plain function in a worker
+        thread is left to finish, unheard), and :class:`asyncio.TimeoutError`
+        is raised. Cancelled from outside (the loop stopped, the cycle
+        abandoned), the call is cancelled too."""
+        task = asyncio.ensure_future(pending)
+        deadline: asyncio.Future[None] = asyncio.get_running_loop().create_future()
+
+        def expire() -> None:
+            if not deadline.done():
+                deadline.set_result(None)
+
+        timer = self._set_timer(timeout_ms, expire)
+        either: set[asyncio.Future[Any]] = {task, deadline}
+        try:
+            await asyncio.wait(either, return_when=asyncio.FIRST_COMPLETED)
+        except BaseException:
+            task.cancel()
+            task.add_done_callback(_consume_outcome)
+            raise
+        finally:
+            timer.cancel()
+        if task.done():
+            return task.result()
+        handles.set()
+        task.cancel()
+        task.add_done_callback(_consume_outcome)
+        raise asyncio.TimeoutError(f"no answer within {_number_text(timeout_ms)} ms")
 
     async def _call(self, fn: Callable[..., Any], *args: Any) -> Any:
         if _is_async(fn):
@@ -1527,6 +1863,7 @@ def _resolved(value: TurnEnd) -> Awaitable[TurnEnd]:
 
 
 __all__ = [
+    "GATE_CHUNK_SIZE",
     "TRAY_LIMIT",
     "CycleOutcome",
     "CycleSummary",
