@@ -595,6 +595,14 @@ def run(
     stops the gate: once set, no further verdict is recorded and no reply is
     handed back (the cards not yet recorded count as undecided). A
     ``call_model`` that takes a ``cancel`` keyword is handed it too.
+
+    One call decides every card it is given. A host may gate a larger tray
+    in chunks (contract v1, section 3.6): the cards, in tray order, in
+    chunks of at most 10, one ``run`` per chunk with the chunk as the tray's
+    ``conversations`` (the prompt then numbers that chunk's cards); a chunk
+    that fails closed leaves only its own cards undecided. The
+    :class:`~agentchatme.integration.ReceiveLoop` does this
+    (``gate_chunk_size``).
     """
     prepared = _prepare(tray)
     if not prepared.ids:

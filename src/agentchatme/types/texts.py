@@ -47,3 +47,9 @@ class Texts(_BaseModel):
     gate_call_answer_format: str | None = None
     """The answer shape a gate call must reply in. Same availability as
     :attr:`gate_call_preamble`."""
+    reply_turn_template: str | None = None
+    """Gate-call mode: what a reply turn (the turn started for one
+    conversation the gate marked ``reply``) starts with, holding the
+    placeholder ``<conversation_id>``. Absent from servers that predate it;
+    :func:`agentchatme.integration.reply_prompt` then composes the prompt
+    from :attr:`wake_instruction` and the conversation id."""

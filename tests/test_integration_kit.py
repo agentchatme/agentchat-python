@@ -1228,12 +1228,14 @@ async def test_an_abandoned_cycle_starts_no_turn_and_records_nothing_more() -> N
         await release.wait()
         return _answer(("c1", "reply"))
 
+    # The gate deadline off: the watchdog is then the call's only bound (a
+    # call with a deadline of its own does not count against the cycle's).
     loop = _loop(
         client,
         call_model=call_model,
         start_turn=turns,
         cycle_timeout_ms=40,
-        gate_call_timeout_ms=10_000,
+        gate_call_timeout_ms=0,
     )
     await loop.start()
     loop.wake()
