@@ -15,6 +15,7 @@ import pytest
 from agentchatme import gate
 from agentchatme.integration import (
     AgentChatCallCount,
+    Readiness,
     ReceiveLoop,
     TextsCache,
     TrackedTurn,
@@ -418,6 +419,76 @@ async def test_a_card_a_turn_took_while_an_earlier_chunk_was_gated_is_held_out_o
     await loop.stop()
 
 
+@pytest.mark.parametrize(
+    "muted",
+    [0, 3],
+    ids=["owed cards only", "owed cards and muted ones"],
+)
+@pytest.mark.asyncio
+async def test_every_owed_card_taken_by_a_turn_before_its_chunk_is_nothing_owed(muted: int) -> None:
+    # Free when the tray was read, every owed card is taken by a host's turn
+    # (a shared tracker) before its chunk is asked: no call, nothing_owed.
+    owed = _cards(5)
+    cards = owed + [_card(f"c{i}", f"m{i}", muted=True) for i in range(6, 6 + muted)]
+    tracker = TurnTracker()
+    calls: list[str] = []
+
+    async def readiness() -> Readiness:
+        for card in owed:
+            assert tracker.begin(TrackedTurn.reply(card["conversation_id"], card["last_message_id"])) is not None
+        return Readiness(ready=True)
+
+    client = _LoopClient([_tray(cards)])
+    loop = _loop(
+        client,
+        call_model=lambda p: calls.append(p) or _answer_for(p),
+        start_turn=_Turns(),
+        turn_tracker=tracker,
+        readiness=readiness,
+    )
+    await loop.start()
+    await _cycle(loop)
+    assert calls == [] and client.decisions.recorded == []
+    summary = loop.status().last_cycle
+    assert summary is not None and summary.outcome == "nothing_owed"
+    assert (summary.held_by_turns, summary.gated, summary.undecided) == (5, 0, 0)
+    assert (summary.chunks_ok, summary.chunks_failed, summary.turns_started) == (0, 0, 0)
+    await loop.stop()
+
+
+@pytest.mark.asyncio
+async def test_a_card_held_mid_gate_is_read_again_when_a_turn_of_the_loop_ends() -> None:
+    # c15 is taken by a host's turn while chunk 1 is gated, so the cycle
+    # leaves it out. When a turn of the loop's own ends (c01's), the cards
+    # left out meanwhile are read again: c15 is gated in the next cycle.
+    tracker = TurnTracker()
+    tray = _tray(_cards(20))
+    client = _LoopClient([tray, _tray([]), _tray([_card("c15", "m15")])])
+    turns = _Turns()
+    calls: list[list[str]] = []
+    host: list[Any] = []
+
+    async def call_model(prompt: str) -> str:
+        calls.append(_ids(prompt))
+        if len(calls) == 1:
+            host.append(tracker.begin(TrackedTurn.reply("c15", "m15")))
+        return _answer_for(prompt, replies=frozenset({"c01"}))
+
+    loop = _loop(client, call_model=call_model, start_turn=turns, turn_tracker=tracker)
+    await loop.start()
+    await _cycle(loop)
+    assert len(calls) == 2 and "c15" not in calls[1]
+    assert [r.conversation_id for r in turns.requests] == ["c01"]
+    tracker.end(host[0])  # the host's turn ends (the loop is not told)
+    cycles = loop.status().coalescer["cycles"]
+    turns.ends[0].set_result(TurnEnd(status="completed", agentchat_calls=AgentChatCallCount(made=2, failed=0)))
+    await _eventually(lambda: loop.status().coalescer["cycles"] > cycles, "a cycle after c01's turn ends")
+    await loop.idle()
+    assert calls[-1] == ["c15"]
+    assert client.decisions.recorded[-1]["conversation_id"] == "c15"
+    await loop.stop()
+
+
 @pytest.mark.asyncio
 async def test_a_truncated_tray_with_a_failed_chunk_still_reads_the_rest_at_once() -> None:
     client = _LoopClient([_tray(_cards(20), truncated=True)])
@@ -563,6 +634,67 @@ async def test_a_gate_deadline_longer_than_the_cycle_deadline_is_not_cut_by_the_
     answer.set()
     await _eventually(lambda: loop.status().last_cycle is not None, "the cycle")
     assert loop.status().last_cycle.outcome == "decided"  # type: ignore[union-attr]
+    await loop.stop()
+
+
+@pytest.mark.asyncio
+async def test_a_deadline_does_not_wait_for_a_call_that_ignores_its_cancellation() -> None:
+    # A runtime call that swallows CancelledError and keeps waiting: past its
+    # deadline the cycle no longer waits for it (cancel-then-await would hang
+    # the cycle until the call chose to end).
+    fake = _FakeTime()
+    client = _LoopClient([_tray(_cards(3))])
+    calling = asyncio.Event()
+    release = asyncio.Event()
+    swallowed: list[bool] = []
+
+    async def call_model(prompt: str) -> str:
+        calling.set()
+        while not release.is_set():
+            try:
+                await release.wait()
+            except asyncio.CancelledError:
+                swallowed.append(True)  # ignores the cancellation
+        return _answer_for(prompt)
+
+    loop = _fake_loop(client, fake, call_model=call_model, start_turn=_Turns(), gate_call_timeout_ms=60_000)
+    await loop.start()
+    try:
+        loop.wake()
+        await asyncio.wait_for(calling.wait(), 5.0)
+        fake.advance(60_000)
+        await _eventually(lambda: loop.status().last_cycle is not None, "the cycle to end at the deadline")
+        summary = loop.status().last_cycle
+        assert summary is not None and summary.outcome == "fail_closed"
+        assert summary.failure == "model call timed out: no answer within 60000 ms"
+        assert swallowed == [True]  # the call is still running, unheard
+        release.set()  # its late answer is not acted on
+        for _ in range(20):
+            await asyncio.sleep(0)
+        assert client.decisions.recorded == []
+    finally:
+        release.set()  # a regression that waits for the call must fail, not hang
+        await asyncio.wait_for(loop.stop(), 5.0)
+
+
+@pytest.mark.asyncio
+async def test_a_large_deadline_is_printed_as_an_integer_in_the_failure() -> None:
+    fake = _FakeTime()
+    client = _LoopClient([_tray(_cards(2))])
+    calling = asyncio.Event()
+
+    async def call_model(_prompt: str, *, cancel: asyncio.Event) -> str:
+        calling.set()
+        await cancel.wait()
+        return ""
+
+    loop = _fake_loop(client, fake, call_model=call_model, start_turn=_Turns(), gate_call_timeout_ms=1_200_000)
+    await loop.start()
+    loop.wake()
+    await asyncio.wait_for(calling.wait(), 5.0)
+    fake.advance(1_200_000)
+    await _eventually(lambda: loop.status().last_cycle is not None, "the cycle")
+    assert loop.status().last_cycle.failure == "model call timed out: no answer within 1200000 ms"  # type: ignore[union-attr]
     await loop.stop()
 
 

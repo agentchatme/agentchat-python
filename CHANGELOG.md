@@ -74,10 +74,16 @@ API is versioned separately under `/v1/...`.
   `gate_call_timeout_ms`) plus `cycle_timeout_ms` before it is abandoned.
   Lower `gate_call_timeout_ms` to bound a single call more tightly.
 - The gate-call deadline and the cycle watchdog run on the loop's timer
-  (`set_timer`) and clock (`now` when given, else a monotonic one, as
-  before), so a host's tests can move them by hand. A host that passes its
-  own `set_timer` now also receives these timers. At the deadline the call
-  is cancelled and no longer waited for.
+  (`set_timer`) and clock, so a host's tests can move them by hand. A host
+  that passes its own `set_timer` now also receives these timers.
+  **Behaviour change** for a host that passes `now`: the watchdog used to
+  measure on a monotonic clock always, ignoring `now`; now it measures on
+  the `now` that is given, so a wall-clock `now` makes the watchdog
+  wall-clock (a clock step counts against, or for, the running cycle).
+  Without `now` it stays monotonic. At the deadline the call is cancelled
+  and no longer waited for (one that ignores the cancellation can no longer
+  hold the cycle). Deadlines in failure texts are printed as integers
+  (`no answer within 1200000 ms`).
 - A cycle that `stop()` cuts short reports what it did (chunks, verdicts) in
   its `abandoned` summary instead of zeros. Verdicts the stop cut short
   count as undecided, each card once (`gated` = `reply` + `dismiss` +

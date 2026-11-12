@@ -78,7 +78,8 @@ finish, and its card is held out of the next gate until it answers).
 ``status().recent_cycles`` holds the last outcomes for a host to alarm on.
 Either deadline: ``None`` is the default, ``0`` turns it off. Both run on
 the loop's timer (``set_timer``) and clock (``now`` when given, else a
-monotonic one), so a test can move them by hand. A gate call whose deadline
+monotonic one; a wall-clock ``now`` makes the watchdog wall-clock), so a
+test can move them by hand. A gate call whose deadline
 is longer than ``cycle_timeout_ms`` is not cut by the watchdog: time inside
 a deadline-bound gate call is not counted.
 
@@ -384,6 +385,14 @@ def _consume_outcome(task: asyncio.Future[Any]) -> None:
         task.exception()
 
 
+def _number_text(value: float) -> str:
+    """A duration in a failure text: an integral value as an integer
+    (``1200000``, never ``1.2e+06``), any other as it is (``1.5``), as the
+    TypeScript kit prints it."""
+    number = float(value)
+    return str(int(number)) if number.is_integer() else repr(number)
+
+
 def _timeout_option(value: float | None, default: float, name: str) -> float:
     """A timeout option in ms: ``None`` → the default, ``0`` → off (returned
     as 0), a positive number → itself; anything else raises."""
@@ -575,9 +584,11 @@ class ReceiveLoop:
     tray is gated in chunks of this size (see the module docstring); 50
     gates the largest tray in one call. ``now`` (epoch ms) and ``set_timer``
     are the loop's clock and timers: pacing, the coalescer, the backoff for
-    a truncated tray, the gate-call deadline and the watchdog run on them
-    (a test passes fakes; without ``now`` the watchdog measures on a
-    monotonic clock).
+    a truncated tray, the gate-call deadline and the watchdog run on them (a
+    test passes fakes). Without ``now`` the watchdog measures on a monotonic
+    clock; a ``now`` that is given is the watchdog's clock too, so a
+    wall-clock ``now`` makes the watchdog wall-clock (a clock step then
+    counts against, or for, the running cycle).
     """
 
     def __init__(
@@ -998,7 +1009,7 @@ class ReceiveLoop:
         with contextlib.suppress(BaseException):
             await body
         failure = (
-            f"cycle abandoned after {self._cycle_timeout_s:g}s (a tray read, the texts,"
+            f"cycle abandoned after {_number_text(self._cycle_timeout_s)}s (a tray read, the texts,"
             " the readiness check, a gate call or a verdict never finished); the next"
             " wake retries"
         )
@@ -1767,7 +1778,7 @@ class ReceiveLoop:
         handles.set()
         task.cancel()
         task.add_done_callback(_consume_outcome)
-        raise asyncio.TimeoutError(f"no answer within {timeout_ms:g} ms")
+        raise asyncio.TimeoutError(f"no answer within {_number_text(timeout_ms)} ms")
 
     async def _call(self, fn: Callable[..., Any], *args: Any) -> Any:
         if _is_async(fn):
