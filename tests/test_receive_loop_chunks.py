@@ -85,6 +85,53 @@ def _texts_with(**overrides: Any) -> Texts:
     return Texts.model_validate(texts_body(**overrides))
 
 
+class _FakeTime:
+    """The loop's clock (``now``) and timers (``set_timer``), moved only by
+    the test: a deadline passes when the test says so, never because a
+    machine was slow. A 0 ms timer (the coalescer's windows at
+    ``quiet_ms=0``) runs on the event loop at once."""
+
+    def __init__(self) -> None:
+        self.now = 1_000_000.0
+        self._seq = 0
+        self.pending: list[tuple[float, int, Any]] = []
+
+    def clock(self) -> float:
+        return self.now
+
+    def set_timer(self, delay_ms: float, fn: Any) -> Any:
+        if delay_ms <= 0:
+            return asyncio.get_running_loop().call_later(0, fn)
+        self._seq += 1
+        entry = (self.now + delay_ms, self._seq, fn)
+        self.pending.append(entry)
+        pending = self.pending
+
+        class _Handle:
+            def cancel(self) -> None:
+                if entry in pending:
+                    pending.remove(entry)
+
+        return _Handle()
+
+    def advance(self, ms: float) -> None:
+        """Move the clock by ``ms``, firing every timer due by then, in order."""
+        target = self.now + ms
+        while True:
+            due = [entry for entry in self.pending if entry[0] <= target]
+            if not due:
+                break
+            entry = min(due, key=lambda e: (e[0], e[1]))
+            self.pending.remove(entry)
+            self.now = entry[0]
+            entry[2]()
+        self.now = target
+
+
+def _fake_loop(client: _LoopClient, fake: _FakeTime, **kwargs: Any) -> ReceiveLoop:
+    return _loop(client, now=fake.clock, set_timer=fake.set_timer, **kwargs)
+
+
 # ─────────────── chunks ───────────────
 
 
@@ -137,7 +184,9 @@ async def test_a_50_card_tray_is_five_calls_of_10_and_a_cut_off_chunk_3_leaves_o
     assert (summary.gated, summary.chunks_ok, summary.chunks_failed, summary.undecided) == (50, 4, 1, 10)
     assert (summary.dismiss, summary.defer, summary.reply) == (20, 20, 0)
     assert summary.failure == "1 of 5 gate chunks failed; chunk 3: no usable verdicts in the answer"
-    reports = [{k: v for k, v in e.items() if k != "type"} for e in events if e["type"] == "gate_chunk"]
+    chunk_events = [e for e in events if e["type"] == "gate_chunk"]
+    assert len({e["cycle"] for e in chunk_events}) == 1  # one cycle's chunks share its identifier
+    reports = [{k: v for k, v in e.items() if k not in ("type", "cycle")} for e in chunk_events]
     assert reports == [
         {
             "index": i,
@@ -395,19 +444,28 @@ async def test_a_truncated_tray_with_a_failed_chunk_still_reads_the_rest_at_once
 
 @pytest.mark.asyncio
 async def test_each_chunk_has_its_own_deadline_and_cancel_handle_async() -> None:
+    fake = _FakeTime()
     client = _LoopClient([_tray(_cards(30))])
     handles: list[tuple[asyncio.Event, bool]] = []
+    second = asyncio.Event()
 
     async def call_model(prompt: str, *, cancel: asyncio.Event) -> str:
         handles.append((cancel, cancel.is_set()))
         if len(handles) == 2:
-            await cancel.wait()  # past its deadline: told, and it stops
+            second.set()
+            await cancel.wait()  # hangs until told
             return ""
         return _answer_for(prompt)
 
-    loop = _loop(client, call_model=call_model, start_turn=_Turns(), gate_call_timeout_ms=50)
+    loop = _fake_loop(client, fake, call_model=call_model, start_turn=_Turns(), gate_call_timeout_ms=60_000)
     await loop.start()
-    await _cycle(loop)
+    loop.wake()
+    await asyncio.wait_for(second.wait(), 5.0)
+    fake.advance(59_999)
+    for _ in range(20):
+        await asyncio.sleep(0)
+    assert len(handles) == 2 and not handles[1][0].is_set()  # not yet past its deadline
+    fake.advance(1)  # chunk 2's own 60 s are up
     await _eventually(lambda: loop.status().last_cycle is not None, "the cycle")
     assert len(handles) == 3
     assert [was_set for _h, was_set in handles] == [False, False, False]  # each call starts fresh
@@ -418,13 +476,14 @@ async def test_each_chunk_has_its_own_deadline_and_cancel_handle_async() -> None
     assert summary is not None and summary.outcome == "decided"
     assert (summary.chunks_ok, summary.chunks_failed, summary.undecided) == (2, 1, 10)
     assert summary.failure == (
-        "1 of 3 gate chunks failed; chunk 2: model call timed out: no answer within 50 ms"
+        "1 of 3 gate chunks failed; chunk 2: model call timed out: no answer within 60000 ms"
     )
     await loop.stop()
 
 
 @pytest.mark.asyncio
 async def test_each_chunk_has_its_own_deadline_and_cancel_handle_plain() -> None:
+    fake = _FakeTime()
     client = _LoopClient([_tray(_cards(30))])
     handles: list[tuple[threading.Event, bool]] = []
     lock = threading.Lock()
@@ -434,15 +493,18 @@ async def test_each_chunk_has_its_own_deadline_and_cancel_handle_plain() -> None
             handles.append((cancel, cancel.is_set()))
             index = len(handles)
         if index == 2:
-            cancel.wait(5.0)  # a blocking runtime call, told at the deadline
+            cancel.wait(30.0)  # a blocking runtime call, told at the deadline
             return _answer_for(prompt)  # a late answer is not acted on
         return _answer_for(prompt)
 
-    loop = _loop(client, call_model=call_model, start_turn=_Turns(), gate_call_timeout_ms=50)
+    loop = _fake_loop(client, fake, call_model=call_model, start_turn=_Turns(), gate_call_timeout_ms=60_000)
     await loop.start()
-    await _cycle(loop)
-    await _eventually(lambda: loop.status().last_cycle is not None and len(handles) == 3, "the cycle")
+    loop.wake()
+    await _eventually(lambda: len(handles) == 2, "chunk 2's call to start in its worker thread")
+    fake.advance(60_000)
+    await _eventually(lambda: loop.status().last_cycle is not None, "the cycle")
     await loop.idle()
+    assert len(handles) == 3
     assert [was_set for _h, was_set in handles] == [False, False, False]
     assert handles[1][0].is_set() and not handles[2][0].is_set()
     assert _recorded(client) == [f"c{i:02d}" for i in [*range(1, 11), *range(21, 31)]]
@@ -454,17 +516,18 @@ async def test_each_chunk_has_its_own_deadline_and_cancel_handle_plain() -> None
 
 @pytest.mark.asyncio
 async def test_time_inside_gate_calls_with_a_deadline_does_not_count_against_the_cycle() -> None:
-    # Three chunks of 150 ms each against a 100 ms cycle deadline: each call
-    # is bounded by its own deadline, and a cycle making progress is not
-    # abandoned for taking k of them.
+    # Three calls of 150 ms each (of the loop's clock) against a 100 ms cycle
+    # deadline: each is bounded by its own deadline, and a cycle making
+    # progress is not abandoned for taking three of them.
+    fake = _FakeTime()
     client = _LoopClient([_tray(_cards(30))])
 
     async def call_model(prompt: str) -> str:
-        await asyncio.sleep(0.15)
+        fake.advance(150)
         return _answer_for(prompt)
 
-    loop = _loop(
-        client, call_model=call_model, start_turn=_Turns(), gate_call_timeout_ms=2_000, cycle_timeout_ms=100
+    loop = _fake_loop(
+        client, fake, call_model=call_model, start_turn=_Turns(), gate_call_timeout_ms=1_000, cycle_timeout_ms=100
     )
     await loop.start()
     loop.wake()
@@ -472,6 +535,34 @@ async def test_time_inside_gate_calls_with_a_deadline_does_not_count_against_the
     summary = loop.status().last_cycle
     assert summary is not None and summary.outcome == "decided" and summary.chunks_ok == 3
     assert len(client.decisions.recorded) == 30
+    await loop.stop()
+
+
+@pytest.mark.asyncio
+async def test_a_gate_deadline_longer_than_the_cycle_deadline_is_not_cut_by_the_watchdog() -> None:
+    fake = _FakeTime()
+    client = _LoopClient([_tray(_cards(5))])
+    calling = asyncio.Event()
+    answer = asyncio.Event()
+
+    async def call_model(prompt: str) -> str:
+        calling.set()
+        await answer.wait()
+        return _answer_for(prompt)
+
+    loop = _fake_loop(
+        client, fake, call_model=call_model, start_turn=_Turns(), gate_call_timeout_ms=900_000, cycle_timeout_ms=600_000
+    )
+    await loop.start()
+    loop.wake()
+    await asyncio.wait_for(calling.wait(), 5.0)
+    fake.advance(800_000)  # past the cycle's 10 min, inside the call's 15
+    for _ in range(20):
+        await asyncio.sleep(0)
+    assert loop.status().last_cycle is None
+    answer.set()
+    await _eventually(lambda: loop.status().last_cycle is not None, "the cycle")
+    assert loop.status().last_cycle.outcome == "decided"  # type: ignore[union-attr]
     await loop.stop()
 
 
@@ -507,34 +598,181 @@ async def test_stop_during_a_chunk_tells_its_call_asks_no_later_chunk_and_starts
 
 
 @pytest.mark.asyncio
+async def test_stop_while_a_chunk_records_counts_each_card_once() -> None:
+    # The answer parsed; c05's verdict is on its way when stop() comes. c05
+    # is recorded (never aborted); c06-c10 are not, and count as undecided
+    # only: gated is the sum of the outcomes.
+    cards = _cards(20)
+    on_its_way = asyncio.Event()
+    release = asyncio.Event()
+
+    class HeldDecisions:
+        def __init__(self) -> None:
+            self.recorded: list[dict[str, Any]] = []
+
+        async def record(self, conversation_id: str, **kwargs: Any) -> Any:
+            if conversation_id == "c05":
+                on_its_way.set()
+                await release.wait()
+            self.recorded.append({"conversation_id": conversation_id, **kwargs})
+            return {"id": "d"}
+
+    client = _LoopClient([_tray(cards)])
+    client.decisions = HeldDecisions()  # type: ignore[assignment]
+    calls: list[str] = []
+    loop = _loop(client, call_model=lambda p: calls.append(p) or _answer_for(p), start_turn=_Turns())
+    await loop.start()
+    loop.wake()
+    await asyncio.wait_for(on_its_way.wait(), 5.0)
+    stopping = asyncio.ensure_future(loop.stop())
+    await _eventually(lambda: loop.status().stopped)
+    release.set()
+    await asyncio.wait_for(stopping, 5.0)
+    assert len(calls) == 1  # chunk 2 is never asked
+    assert _recorded(client) == ["c01", "c02", "c03", "c04", "c05"]
+    summary = loop.status().last_cycle
+    assert summary is not None and summary.outcome == "abandoned"
+    assert (summary.dismiss, summary.defer, summary.reply, summary.undecided) == (3, 2, 0, 5)
+    assert summary.gated == summary.dismiss + summary.defer + summary.reply + summary.undecided == 10
+
+
+@pytest.mark.asyncio
 async def test_a_watchdog_abandonment_with_the_gate_deadline_off_stops_between_chunks() -> None:
+    fake = _FakeTime()
     client = _LoopClient([_tray(_cards(30))])
     turns = _Turns()
+    events: list[dict[str, Any]] = []
     handles: list[asyncio.Event] = []
+    second = asyncio.Event()
 
     async def call_model(prompt: str, *, cancel: asyncio.Event) -> str:
         handles.append(cancel)
         if len(handles) == 2:
+            second.set()
             await cancel.wait()  # hangs until told
-            return _answer_for(prompt)
+            return _answer_for(prompt)  # a late answer: never acted on
         return _answer_for(prompt, replies=frozenset({"c01"}))
 
-    loop = _loop(
+    loop = _fake_loop(
         client,
+        fake,
         call_model=call_model,
         start_turn=turns,
         gate_call_timeout_ms=0,
         cycle_timeout_ms=100,
         max_concurrent_turns=5,
+        on_event=events.append,
     )
     await loop.start()
     loop.wake()
+    await asyncio.wait_for(second.wait(), 5.0)
+    fake.advance(99)
+    for _ in range(20):
+        await asyncio.sleep(0)
+    assert loop.status().last_cycle is None  # not yet
+    fake.advance(1)  # the cycle's 100 ms are up, all of it counted
     await _eventually(lambda: loop.status().last_cycle is not None, "the abandoned cycle")
-    await asyncio.sleep(0.05)
+    for _ in range(20):
+        await asyncio.sleep(0)
     assert loop.status().last_cycle.outcome == "abandoned"  # type: ignore[union-attr]
-    assert len(handles) == 2 and handles[1].is_set()
+    assert len(handles) == 2 and handles[1].is_set()  # chunk 3 never asked
     assert _recorded(client) == [f"c{i:02d}" for i in range(2, 11)]
     assert turns.requests == []
+    # The abandoned cycle reported chunk 1 and nothing after it.
+    first = [e for e in events if e["type"] == "gate_chunk"]
+    assert [(e["index"], e["outcome"]) for e in first] == [(1, "decided")]
+    assert (loop.status().counters["chunks_ok"], loop.status().counters["chunks_failed"]) == (1, 0)
+    # The next cycle's chunks carry an identifier of their own.
+    loop.wake()
+    await _eventually(lambda: len([e for e in events if e["type"] == "cycle"]) == 2, "the next cycle")
+    later = [e for e in events if e["type"] == "gate_chunk"][1:]
+    assert [e["index"] for e in later] == [1, 2, 3]
+    assert len({e["cycle"] for e in later}) == 1 and later[0]["cycle"] != first[0]["cycle"]
+    await loop.stop()
+
+
+# ─────────────── muted cards ───────────────
+
+
+@pytest.mark.asyncio
+async def test_a_chunk_of_muted_cards_only_costs_no_model_call() -> None:
+    owed = _cards(10)
+    muted = [_card(f"c{i}", f"m{i}", muted=True) for i in range(11, 14)]
+    client = _LoopClient([_tray(owed + muted)])
+    calls: list[list[str]] = []
+    events: list[dict[str, Any]] = []
+    loop = _loop(
+        client, call_model=lambda p: calls.append(_ids(p)) or _answer_for(p), start_turn=_Turns(), on_event=events.append
+    )
+    await loop.start()
+    await _cycle(loop)
+    assert calls == [[c["conversation_id"] for c in owed]]  # 10 owed + 3 muted: one call
+    assert sorted(_recorded(client)) == [c["conversation_id"] for c in owed]
+    summary = loop.status().last_cycle
+    assert summary is not None and summary.outcome == "decided"
+    # The muted cards are left as in a nothing_owed cycle: not gated, not undecided.
+    assert (summary.gated, summary.undecided, summary.chunks_ok, summary.chunks_failed) == (10, 0, 1, 0)
+    assert [(e["index"], e["of"]) for e in events if e["type"] == "gate_chunk"] == [(1, 2)]
+    await loop.stop()
+
+
+@pytest.mark.asyncio
+async def test_one_call_made_gives_its_bare_reason_even_when_the_plan_had_more_chunks() -> None:
+    # 10 owed + 3 muted: two chunks planned, one call made; it answers
+    # nothing parsable.
+    owed = _cards(10)
+    muted = [_card(f"c{i}", f"m{i}", muted=True) for i in range(11, 14)]
+    client = _LoopClient([_tray(owed + muted)])
+    events: list[dict[str, Any]] = []
+    loop = _loop(client, call_model=lambda _p: "", start_turn=_Turns(), on_event=events.append)
+    await loop.start()
+    await _cycle(loop)
+    summary = loop.status().last_cycle
+    assert summary is not None and summary.outcome == "fail_closed"
+    assert summary.failure == "no usable verdicts in the answer"
+    assert (summary.chunks_ok, summary.chunks_failed, summary.undecided, summary.gated) == (0, 1, 10, 10)
+    assert [(e["index"], e["of"]) for e in events if e["type"] == "gate_chunk"] == [(1, 2)]
+    await loop.stop()
+
+
+@pytest.mark.asyncio
+async def test_the_failure_counts_the_calls_made_and_names_the_chunk_by_its_planned_position() -> None:
+    # Three chunks planned; the middle one is muted cards only (no call).
+    # Of the two calls made, the second (chunk 3) answers nothing parsable.
+    cards = (
+        _cards(10)
+        + [_card(f"c{i}", f"m{i}", muted=True) for i in range(11, 21)]
+        + [_card(f"c{i}", f"m{i}") for i in range(21, 26)]
+    )
+    client = _LoopClient([_tray(cards)])
+    events: list[dict[str, Any]] = []
+    calls: list[str] = []
+
+    def call_model(prompt: str) -> str:
+        calls.append(prompt)
+        return "" if len(calls) == 2 else _answer_for(prompt)
+
+    loop = _loop(client, call_model=call_model, start_turn=_Turns(), on_event=events.append)
+    await loop.start()
+    await _cycle(loop)
+    assert len(calls) == 2
+    summary = loop.status().last_cycle
+    assert summary is not None and summary.outcome == "decided"
+    assert summary.failure == "1 of 2 gate chunks failed; chunk 3: no usable verdicts in the answer"
+    reports = [(e["index"], e["of"], e["outcome"]) for e in events if e["type"] == "gate_chunk"]
+    assert reports == [(1, 3, "decided"), (3, 3, "fail_closed")]
+    await loop.stop()
+
+
+@pytest.mark.asyncio
+async def test_muted_cards_in_a_chunk_with_owed_ones_are_gated_with_them_as_before() -> None:
+    cards = [_card("c01", "m01"), _card("c02", "m02", muted=True), _card("c03", "m03")]
+    client = _LoopClient([_tray(cards)])
+    calls: list[list[str]] = []
+    loop = _loop(client, call_model=lambda p: calls.append(_ids(p)) or _answer_for(p), start_turn=_Turns())
+    await loop.start()
+    await _cycle(loop)
+    assert calls == [["c01", "c02", "c03"]]
     await loop.stop()
 
 
@@ -553,16 +791,29 @@ def test_reply_prompt_fills_every_placeholder_of_the_served_template() -> None:
 
 @pytest.mark.parametrize(
     "template",
-    [None, "", "Reply to the conversation named above."],
-    ids=["absent", "empty", "no placeholder"],
+    [None, "", "  \n\t "],
+    ids=["absent", "empty", "blank"],
 )
-def test_reply_prompt_without_a_usable_template_is_the_wake_instruction_and_the_id(template: Any) -> None:
+def test_reply_prompt_without_the_template_is_the_wake_instruction_and_the_id(template: Any) -> None:
     body = texts_body()
     if template is not None:
         body["reply_turn_template"] = template
     expected = f"{body['wake_instruction']}\n\nconversation_id: conv_1"
     assert reply_prompt(Texts.model_validate(body), "conv_1") == expected
     assert reply_prompt(body, "conv_1") == expected
+
+
+@pytest.mark.parametrize("value", [42, ["x <conversation_id>"], {"text": "<conversation_id>"}])
+def test_reply_prompt_from_raw_texts_whose_template_is_not_a_string_is_the_wake_instruction(value: Any) -> None:
+    body = {**texts_body(), "reply_turn_template": value}
+    assert reply_prompt(body, "conv_1") == f"{body['wake_instruction']}\n\nconversation_id: conv_1"
+
+
+def test_reply_prompt_from_a_template_without_the_placeholder_names_the_conversation_after_it() -> None:
+    template = "  Reply to the one conversation this turn is for; leave the rest alone.\n"
+    expected = f"{template.strip()}\n\nconversation_id: conv_1"
+    assert reply_prompt(_texts_with(reply_turn_template=template), "conv_1") == expected
+    assert reply_prompt({**texts_body(), "reply_turn_template": template}, "conv_1") == expected
 
 
 def test_texts_take_the_optional_reply_turn_template() -> None:

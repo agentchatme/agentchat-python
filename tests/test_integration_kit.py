@@ -1362,7 +1362,15 @@ async def test_a_truncated_tray_without_progress_reads_again_after_a_growing_bac
     async def refuse(_request: TurnRequest) -> TurnAdmission:
         return TurnAdmission(started=False, error="runtime busy")
 
-    loop = _loop(client, call_model=lambda _p: _answer(("c1", "reply")), start_turn=refuse, set_timer=timers)
+    # The deadlines off: they run on set_timer too, and are not under test here.
+    loop = _loop(
+        client,
+        call_model=lambda _p: _answer(("c1", "reply")),
+        start_turn=refuse,
+        set_timer=timers,
+        gate_call_timeout_ms=0,
+        cycle_timeout_ms=0,
+    )
     await loop.start()
     await _cycle(loop)
     assert timers.delays == [1000]
@@ -1378,7 +1386,14 @@ async def test_a_truncated_tray_after_progress_is_read_again_at_once() -> None:
     truncated = _tray([_card("c1", "m1")], truncated=True)
     client = _LoopClient([truncated, _tray([])])
     timers = _Timers()
-    loop = _loop(client, call_model=lambda _p: _answer(("c1", "dismiss")), start_turn=_Turns(), set_timer=timers)
+    loop = _loop(
+        client,
+        call_model=lambda _p: _answer(("c1", "dismiss")),
+        start_turn=_Turns(),
+        set_timer=timers,
+        gate_call_timeout_ms=0,
+        cycle_timeout_ms=0,
+    )
     await loop.start()
     await _cycle(loop)
     await asyncio.sleep(0.02)
@@ -1518,6 +1533,8 @@ async def test_a_waiting_turn_that_is_released_never_starts() -> None:
         quiet_ms=5_000,
         max_ms=5_000,
         set_timer=timers,
+        gate_call_timeout_ms=0,
+        cycle_timeout_ms=0,
     )
     await loop.start()
     loop.wake()
