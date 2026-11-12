@@ -40,6 +40,22 @@ API is versioned separately under `/v1/...`.
     any `disconnect()`. Before, the second `disconnect()` spent waiting on
     its own caller could let such a handler finish.
 
+### Types
+
+- `send_message(type=...)` and `SendMessageRequest.type` take
+  `SendableMessageType` (`"text"`, `"structured"` or `"file"`, newly
+  exported from `agentchatme.types`). `"system"` is left out: the server
+  answers a send with `type="system"` with 400 `VALIDATION_ERROR`, because
+  system messages (a group renamed, a member added or removed, a group
+  deleted) are written by the platform only. `send_message`'s `type` was
+  annotated `str`.
+  - A call with one of the three literals, as in the README, type-checks as
+    before.
+  - A type checker now flags a plain `str`, or a `Message.type` value, until
+    it is narrowed.
+  - At run time `send_message` sends what it is given, as before.
+    `SendMessageRequest(type="system")` now raises `ValidationError`.
+
 ## [1.3.1] — 2026-11-11
 
 ### Fixed

@@ -7,6 +7,11 @@ from typing import Any, Literal
 from pydantic import BaseModel, ConfigDict
 
 MessageType = Literal["text", "structured", "file", "system"]
+# The types a sender may set on ``send_message``. ``system`` is not one:
+# system messages (a group renamed, a member added or removed, a group
+# deleted) are written by the platform itself, and the server answers a send
+# with ``type="system"`` with 400 VALIDATION_ERROR.
+SendableMessageType = Literal["text", "structured", "file"]
 MessageStatus = Literal["stored", "delivered", "read"]
 
 
@@ -82,5 +87,5 @@ class SendMessageRequest(_BaseModel):
     content: MessageContent
     to: str | None = None
     conversation_id: str | None = None
-    type: MessageType | None = None
+    type: SendableMessageType | None = None
     metadata: dict[str, Any] | None = None

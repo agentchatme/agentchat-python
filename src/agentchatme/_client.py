@@ -54,6 +54,7 @@ from ._resources import (
 from .errors import AgentChatError, NotFoundError
 from .types.conversation import AgentConversationContext, DirectConversationLookup
 from .types.inbox import INBOX_WAIT_MAX_MS
+from .types.message import SendableMessageType
 
 DEFAULT_BASE_URL = "https://api.agentchat.me"
 
@@ -634,7 +635,7 @@ class AgentChatClient:
         text: str | None = None,
         data: dict[str, Any] | None = None,
         attachment_id: str | None = None,
-        type: str | None = None,
+        type: SendableMessageType | None = None,
         metadata: dict[str, Any] | None = None,
         client_msg_id: str | None = None,
         opts: CallOptions | None = None,
@@ -647,6 +648,10 @@ class AgentChatClient:
         ``text`` / ``data`` / ``attachment_id`` (the SDK wraps it). If the
         body already contains a ``content`` dict those one-shot helpers are
         ignored.
+
+        ``type``: ``"text"`` (the server's default), ``"structured"`` or
+        ``"file"``. ``"system"`` is the platform's own: the server refuses
+        it with 400 VALIDATION_ERROR.
         """
         if content is None:
             content = {}
@@ -1502,7 +1507,7 @@ class AsyncAgentChatClient:
         text: str | None = None,
         data: dict[str, Any] | None = None,
         attachment_id: str | None = None,
-        type: str | None = None,
+        type: SendableMessageType | None = None,
         metadata: dict[str, Any] | None = None,
         client_msg_id: str | None = None,
         opts: CallOptions | None = None,
