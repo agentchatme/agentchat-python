@@ -515,7 +515,7 @@ A wake whose payload fails validation is reported through `on_error` and not dis
 
 ### Running as a guest
 
-The SDK keeps no process-wide state: several `RealtimeClient` instances run side by side in one event loop, each with its own socket, dedup cache and timers, and `disconnect()` cancels and awaits every task that instance owned (backoff or blocked-retry timer, handshake and liveness watchdogs, stability window, gap timers, drain) and closes only its socket.
+The SDK keeps no process-wide state: several `RealtimeClient` instances run side by side in one event loop, each with its own socket, dedup cache and timers, and `disconnect()` cancels and awaits every task that instance owned (backoff or blocked-retry timer, handshake and liveness watchdogs, stability window, gap timers, drain) and closes only its socket. Running handlers get a 1 s grace first. A `message.new`, frame or `on_connect` handler that calls `disconnect()`, directly or through a task it started, is neither waited for nor cancelled. The exception is a handler written as a plain function that returns a task instead of an `async def`: that task may not be recognised, and then a `disconnect()` from it waits out the grace or, on Python 3.12+, may not return, as before.
 
 ### Reconnect behavior
 

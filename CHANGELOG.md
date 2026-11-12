@@ -7,6 +7,39 @@ and version numbers follow
 The on-the-wire
 API is versioned separately under `/v1/...`.
 
+## [Unreleased]
+
+### Fixed
+
+- `integration.ReceiveLoop`: the cycle watchdog (`cycle_timeout_ms`) counted
+  a turn admission started by a freed slot as the running cycle's own. That
+  admission runs when the loop hands a slot on, outside any cycle. While one
+  hung, the watchdog never abandoned a cycle that hung too; while one ran,
+  its time was left out of the running cycle's deadline. Only a cycle's own
+  admissions and its run are left out now.
+- `RealtimeClient.disconnect()` called from inside an async `message.new`
+  handler always took the whole 1 s dispose grace. It waited for the
+  handler's own conversation lane, which was waiting on that handler. That
+  lane no longer gets the grace. It is still cancelled, so a message queued
+  behind the handler never starts.
+  - The handler that asks is the caller, whatever kind it is (`message.new`,
+    a frame handler such as wake or presence, or `on_connect`) and however
+    it asks: awaiting `disconnect()` directly, through a task it started
+    (`asyncio.gather`, `ensure_future`, `wait_for` before Python 3.12), or
+    through a task it does not await. `disconnect()` neither waits for it
+    nor cancels it. The exception is a handler written as a plain function
+    that returns a task instead of an `async def`: that task may not be
+    recognised, and then a `disconnect()` from it waits out the grace or,
+    on Python 3.12+, may not return, as before.
+  - Before, a call through a task could wait out the grace, cancel the
+    handler, or never return (on Python 3.12+, a recursion error). A handler
+    that started `disconnect()` without awaiting it got the grace and was
+    then cancelled; now it runs on.
+  - Other handlers still running get the grace as before. An async
+    `on_connect` handler that did not ask is cancelled without one, as in
+    any `disconnect()`. Before, the second `disconnect()` spent waiting on
+    its own caller could let such a handler finish.
+
 ## [1.3.1] — 2026-11-11
 
 ### Fixed
