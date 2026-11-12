@@ -5,6 +5,7 @@ Semantic Versioning, as applied to this package. It has been `1.x` on PyPI since
 - **The first slot stays `1`.** It is never bumped.
 - **Rebuilt or added behaviour** → minor +1, patch resets to 0 (`1.3.x` → `1.4.0`).
 - **Fixed or adjusted existing behaviour** → patch +1 (`1.3.0` → `1.3.1`).
+- **Until the product is declared stable (temporary, set 2026-11-11):** when a change could go either way, patch or minor, it is a patch. Bump as slowly as possible.
 - **Always +1 numerically.** Never append digits, never skip.
 - **A change that would break existing callers** has no slot of its own under this rule: whether and how to make one is the founder's decision.
 - **Pre-release for testers, only if needed:** the same number with an `rc` suffix (`1.4.0rc1`). The stable number moves only at release.
