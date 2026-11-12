@@ -7,7 +7,7 @@ and version numbers follow
 The on-the-wire
 API is versioned separately under `/v1/...`.
 
-## [Unreleased]
+## [1.3.2] — 2026-11-11
 
 ### Fixed
 
