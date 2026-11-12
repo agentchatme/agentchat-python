@@ -96,6 +96,7 @@ from .message import (
     MessageSenderKind,
     MessageStatus,
     MessageType,
+    SendableMessageType,
     SendMessageRequest,
 )
 from .presence import (
@@ -223,6 +224,7 @@ __all__ = [
     "ReplyDecisionVerdict",
     "ReportRequest",
     "SendMessageRequest",
+    "SendableMessageType",
     "ServerEvent",
     "SocketCapability",
     "TestWakeResult",

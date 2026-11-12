@@ -1268,6 +1268,56 @@ async def test_time_spent_starting_a_turn_does_not_count_against_the_cycle() -> 
 
 
 @pytest.mark.asyncio
+async def test_an_admission_the_pump_started_does_not_hold_off_the_cycle_watchdog() -> None:
+    # A freed slot is handed on by _pump, its own task, outside any cycle. The
+    # time its admissions take is not the running cycle's: one that hangs
+    # there must not keep the watchdog from abandoning a cycle that hangs.
+    client = _LoopClient([_tray([_card("c1", "m1"), _card("c2", "m2")])])
+    turns = _Turns()
+    never = asyncio.Event()
+
+    async def start_turn(request: TurnRequest) -> TurnAdmission:
+        if request.conversation_id == "c2":
+            await never.wait()  # the runtime never answers this admission
+            return TurnAdmission(started=False, error="never answered")
+        return await turns(request)
+
+    checks = 0
+
+    async def readiness() -> Readiness:
+        nonlocal checks
+        checks += 1
+        if checks == 2:
+            await never.wait()  # the second cycle never gets past its readiness check
+        return Readiness(ready=True)
+
+    loop = _loop(
+        client,
+        call_model=lambda _p: _answer(("c1", "reply"), ("c2", "reply")),
+        start_turn=start_turn,
+        readiness=readiness,
+        cycle_timeout_ms=50,
+    )
+    await loop.start()
+    await _cycle(loop)
+    assert [r.conversation_id for r in turns.requests] == ["c1"]  # c2 waits for the slot
+    turns.ends[0].set_result(TurnEnd(status="failed"))  # c1 ends: the pump admits c2, which hangs
+    await _eventually(
+        lambda: loop.status().counters["turns_waiting"] == 0 and loop.status().counters["turns_active"] == 1,
+        "the pump to be admitting c2",
+    )
+    loop.wake()  # c1 is gated again, and this cycle hangs
+    await _eventually(
+        lambda: [c.outcome for c in loop.status().recent_cycles] == ["decided", "abandoned"],
+        "the hung cycle to be abandoned",
+        timeout=2.0,
+    )
+    assert checks == 2
+    never.set()
+    await loop.stop()
+
+
+@pytest.mark.asyncio
 async def test_status_keeps_the_recent_cycle_outcomes() -> None:
     client = _LoopClient([_tray([])])
     loop = _loop(client, call_model=lambda _p: "", start_turn=_Turns())

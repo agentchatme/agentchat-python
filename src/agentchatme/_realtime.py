@@ -57,6 +57,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import contextvars
 import inspect
 import json
 import logging
@@ -404,6 +405,51 @@ _RATE_LIMIT_JITTER = 0.1
 # are cancelled. Handlers run off the receive loop, so this is the one place
 # they are waited for.
 _DISPOSE_GRACE_S = 1.0
+
+
+class _HandlerMark:
+    """The task running host handler code, while it does: a lane job's
+    handlers, an async frame handler, or the on_connect handlers. Mutable,
+    so a mark that tasks a handler started still hold can be cleared when
+    the handler phase ends (``task = None``)."""
+
+    __slots__ = ("task",)
+
+    def __init__(self, task: asyncio.Future[Any] | None) -> None:
+        self.task = task
+
+
+# A task a handler starts copies this, so disconnect() knows which handler
+# asked, also through asyncio.gather, ensure_future, wait_for (a task before
+# Python 3.12) or a task never awaited.
+_HANDLER_TASK: contextvars.ContextVar[_HandlerMark | None] = contextvars.ContextVar(
+    "agentchatme_handler_task", default=None
+)
+
+
+def _handler_task() -> asyncio.Future[Any] | None:
+    mark = _HANDLER_TASK.get()
+    return mark.task if mark is not None else None
+
+
+def _close_if_cancelled(coro: Coroutine[Any, Any, Any]) -> Callable[[asyncio.Future[Any]], None]:
+    """A done callback: a task cancelled before it started never awaited
+    ``coro``; close it (no "never awaited" warning). After a start it has
+    already finished, and closing it again does nothing."""
+
+    def done(task: asyncio.Future[Any]) -> None:
+        if task.cancelled():
+            coro.close()
+
+    return done
+
+
+async def _as_handler_task(coro: Coroutine[Any, Any, Any]) -> Any:
+    """Run an async frame handler's coroutine as its own task, marked as one
+    (see ``_HandlerMark``)."""
+    _HANDLER_TASK.set(_HandlerMark(asyncio.current_task()))
+    return await coro
+
 
 # After this many consecutive failed attempts (about half an hour at the
 # default 30 s cap) the outage is long: one error line is logged for the
@@ -1893,16 +1939,26 @@ class RealtimeClient:
         :meth:`_flush_parked_frames`), then the socket closes, then every
         background task (backoff or blocked-retry timer, handshake and idle
         watchdogs, stability timer, gap timers, drain) is cancelled **and
-        awaited**, so nothing of this instance survives in the loop. Fires
-        ``on("stopped")`` last. After this, :meth:`connect` raises — create
-        a fresh :class:`RealtimeClient` to reopen.
+        awaited**, so nothing of this instance survives in the loop. Running
+        handlers get a short grace (1 s) to finish, then are cancelled. The
+        one exception is the ``message.new``, frame or ``on_connect`` handler
+        that called this, directly or through a task it started (awaited or
+        not): it is neither waited for nor cancelled. (A handler written as
+        a plain function that returns a task instead of an ``async def``:
+        that task may not be recognised, and then a disconnect() from it
+        waits out the grace or, on Python 3.12+, may not return, as before.)
+        Fires ``on("stopped")`` last. After this, :meth:`connect` raises — create a fresh
+        :class:`RealtimeClient` to reopen.
         """
         self._disposed = True
         self._opts.reconnect = False
         self._refetch_pending = False
         await self._set_state("stopped")
 
-        current = asyncio.current_task()
+        # The caller: this task, and the handler that asked, when it asks
+        # through a task of its own (see _HANDLER_TASK). disconnect() neither
+        # waits for nor cancels it.
+        callers = {task for task in (asyncio.current_task(), _handler_task()) if task is not None}
         owned: list[asyncio.Future[Any]] = []
         for task in (
             self._reconnect_task,
@@ -1929,7 +1985,7 @@ class RealtimeClient:
         # still running get a short grace to finish, then are cancelled.
         # (A handler may be the one calling disconnect(): it is skipped, and
         # so is the outcome waiting on it.)
-        await self._release_dispatches(current)
+        await self._release_dispatches(callers)
 
         ws = self._ws
         self._ws = None
@@ -1939,11 +1995,11 @@ class RealtimeClient:
 
         recv_task = self._recv_task
         self._recv_task = None
-        if recv_task is not None and recv_task is not current:
+        if recv_task is not None and recv_task not in callers:
             with contextlib.suppress(asyncio.CancelledError, asyncio.TimeoutError, Exception):
                 await asyncio.wait_for(recv_task, timeout=1.0)
 
-        await _release_tasks(owned, current)
+        await _release_tasks(owned, callers)
 
         self._authenticated = False
         self._ack_negotiated = False
@@ -1956,22 +2012,35 @@ class RealtimeClient:
 
     # ─── Dispatch ────────────────────────────────────────────────────
 
-    async def _release_dispatches(self, current: asyncio.Future[Any] | None) -> None:
-        """disconnect(): let running lanes (and on_connect handlers) finish
-        within the grace, then cancel the rest; a cancelled lane records its
-        frames as not handled, so nothing is acked for them. The lane whose
-        handler is calling disconnect() is skipped."""
+    async def _release_dispatches(self, callers: set[asyncio.Future[Any]]) -> None:
+        """disconnect(): let running message handlers (lanes) and frame
+        handlers finish within the grace, then cancel the rest; a cancelled
+        lane records its frames as not handled, so nothing is acked for
+        them. (Async ``on_connect`` handlers run in an owned task that
+        disconnect() cancels without a grace.)
+
+        The handler that called disconnect() is left alone: neither waited
+        for nor cancelled, whether it awaits disconnect() directly or through
+        a task it started, awaited or not (``callers``). Its lane's worker
+        waits on that handler, so it gets no grace (waiting for it would only
+        run the grace out); it is still cancelled with the rest, so the jobs
+        queued behind the caller never start."""
+        lanes = list(self._lanes.values())
         workers = [
             lane.worker
-            for lane in list(self._lanes.values())
-            if lane.worker is not None and lane.worker is not current and not lane.worker.done()
+            for lane in lanes
+            if lane.worker is not None and lane.worker not in callers and not lane.worker.done()
         ]
-        connects = [t for t in self._dispatch_tasks if t is not current and not t.done()]
+        waits_on_caller = {
+            lane.worker for lane in lanes if lane.worker is not None and lane.jobs and lane.jobs[0].run in callers
+        }
+        connects = [t for t in self._dispatch_tasks if t not in callers and not t.done()]
         running: list[asyncio.Future[Any]] = [*workers, *connects]
-        if running:
+        graced = [task for task in running if task not in waits_on_caller]
+        if graced:
             with contextlib.suppress(Exception):
-                await asyncio.wait(running, timeout=_DISPOSE_GRACE_S)
-        await _release_tasks(running, current)
+                await asyncio.wait(graced, timeout=_DISPOSE_GRACE_S)
+        await _release_tasks(running, callers)
         self._dispatch_tasks.clear()
 
     async def _emit_error(self, error: BaseException) -> None:
@@ -1999,15 +2068,23 @@ class RealtimeClient:
     async def _after_hello(self, pending: list[Any]) -> None:
         """Await the async ``on_connect`` handlers in order, then start the
         offline drain when it is on."""
-        for index, awaitable in enumerate(pending):
-            try:
-                await awaitable
-            except asyncio.CancelledError:
-                for rest in pending[index + 1 :]:
-                    _discard_awaitable(rest)
-                raise
-            except Exception:
-                _log.warning("realtime handler raised", exc_info=True)
+        # Marked as a handler task while the on_connect handlers run, never
+        # during the drain, not even for tasks they started (see _HandlerMark).
+        mark = _HandlerMark(asyncio.current_task())
+        marked = _HANDLER_TASK.set(mark)
+        try:
+            for index, awaitable in enumerate(pending):
+                try:
+                    await awaitable
+                except asyncio.CancelledError:
+                    for rest in pending[index + 1 :]:
+                        _discard_awaitable(rest)
+                    raise
+                except Exception:
+                    _log.warning("realtime handler raised", exc_info=True)
+        finally:
+            mark.task = None
+            _HANDLER_TASK.reset(marked)
         if self._disposed:
             return
         if self._opts.auto_drain_on_connect and self._opts.client is not None:
@@ -2059,7 +2136,16 @@ class RealtimeClient:
                 _log.warning("realtime handler raised", exc_info=True)
                 continue
             if inspect.isawaitable(result):
-                task = asyncio.ensure_future(result)
+                # A coroutine runs in a marked task; a handler that returned
+                # a task or future is its own task already.
+                if inspect.iscoroutine(result):
+                    coro = result
+                    task = asyncio.ensure_future(_as_handler_task(coro))
+                    # Cancelled before it started: close the handler's
+                    # coroutine (never awaited) quietly.
+                    task.add_done_callback(_close_if_cancelled(coro))
+                else:
+                    task = asyncio.ensure_future(result)
                 self._dispatch_tasks.add(task)
                 task.add_done_callback(self._dispatch_tasks.discard)
                 task.add_done_callback(_log_handler_failure)
@@ -2216,6 +2302,8 @@ class RealtimeClient:
             )
 
     async def _finish_job(self, job: _Job) -> None:
+        # This task's own context, copied by the tasks its handlers start.
+        _HANDLER_TASK.set(_HandlerMark(asyncio.current_task()))
         try:
             await self._run_job(job)
         except asyncio.CancelledError:
@@ -2951,13 +3039,11 @@ def wake_payload_problem(payload: Any, *, rewake: bool = True) -> str | None:
     return None if "step" not in payload or integer_step else "step is not an integer"
 
 
-async def _release_tasks(
-    tasks: list[asyncio.Future[Any]], current: asyncio.Future[Any] | None
-) -> None:
+async def _release_tasks(tasks: list[asyncio.Future[Any]], callers: set[asyncio.Future[Any]]) -> None:
     """Cancel ``tasks`` and wait for them to finish, so a closed client
-    leaves nothing behind in the loop. The calling task is skipped: a
-    handler may close the client from inside one of these tasks."""
-    pending = [task for task in tasks if task is not current and not task.done()]
+    leaves nothing behind in the loop. The callers are skipped: a handler
+    may close the client from inside one of these tasks."""
+    pending = [task for task in tasks if task not in callers and not task.done()]
     for task in pending:
         task.cancel()
     if not pending:

@@ -508,7 +508,9 @@ class ReceiveLoop:
         self._cycle_timeout_s = (
             _timeout_option(cycle_timeout_ms, CYCLE_TIMEOUT_MS, "cycle_timeout_ms") / 1000.0
         )
-        # Time spent starting turns / runs (excluded from the cycle watchdog).
+        # Time the running cycle spends starting its own turns or its run
+        # (left out by the cycle watchdog). An admission _pump starts runs
+        # outside any cycle and is not counted here.
         self._turn_depth = 0
         self._turn_since = 0.0
         self._turn_clock = 0.0
@@ -816,8 +818,10 @@ class ReceiveLoop:
 
     @contextlib.contextmanager
     def _inside_turn(self) -> Iterator[None]:
-        """Time the cycle spends starting a turn or running a run: not
-        counted by the watchdog."""
+        """Time the running cycle spends starting a turn or running a run:
+        not counted by the watchdog. Only the cycle's own: :meth:`_pump`
+        admits waiting turns as its own task, and an admission hanging there
+        must never keep the watchdog from abandoning a cycle that hangs."""
         if self._turn_depth == 0:
             self._turn_since = time.monotonic()
         self._turn_depth += 1
@@ -1098,7 +1102,9 @@ class ReceiveLoop:
             self._counts["turns_queued"] += 1
             return "queued"
         self._active.add(handle)
-        if await admit():
+        with self._inside_turn():  # the cycle's own admission
+            started = await admit()
+        if started:
             return "started"
         self._slot_freed(handle)
         return "refused"
@@ -1320,8 +1326,7 @@ class ReceiveLoop:
         whole turn in a worker thread and returns its :class:`TurnEnd`."""
         try:
             if _is_async(start):
-                with self._inside_turn():
-                    answer = await start(request)
+                answer = await start(request)
             else:
                 return TurnAdmission(started=True, done=asyncio.ensure_future(self._run_sync_turn(start, request)))
         except Exception as err:

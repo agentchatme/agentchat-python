@@ -517,6 +517,250 @@ async def test_on_disconnect_fires_on_close() -> None:
     await rt.disconnect()
 
 
+@pytest.mark.asyncio
+async def test_disconnect_from_a_message_handler_does_not_wait_on_itself() -> None:
+    # The handler's own lane waits on the handler, which is waiting in
+    # disconnect(): giving that lane the dispose grace only ran it out (1 s).
+    rt, ws = _make_client()
+    took: list[float] = []
+
+    async def handler(_msg: dict[str, Any]) -> None:
+        started = time.monotonic()
+        await rt.disconnect()
+        took.append(time.monotonic() - started)
+
+    rt.on("message.new", handler)
+    await rt.connect()
+    await _flush()
+    await ws.push({"type": "hello.ok"})
+    await _flush()
+    await ws.push({"type": "message.new", "payload": {"id": "m1", "conversation_id": "c1", "seq": 1}})
+    await eventually(lambda: took, "the handler's disconnect() to return")
+    assert rt.state == "stopped"
+    assert took[0] < 0.5, f"disconnect() from the handler took {took[0]:.2f}s"
+
+
+@pytest.mark.parametrize("through", ["ensure_future", "gather", "wait_for"])
+@pytest.mark.asyncio
+async def test_disconnect_awaited_through_a_task_of_the_handlers_own_is_still_its_callers(through: str) -> None:
+    # The handler awaits disconnect() through a task it started (wait_for runs
+    # its coroutine as a task before Python 3.12). The caller is still known:
+    # its own task is neither waited for nor cancelled.
+    rt, ws = _make_client()
+    took: list[float] = []
+    after: list[str] = []
+
+    async def handler(_msg: dict[str, Any]) -> None:
+        started = time.monotonic()
+        if through == "ensure_future":
+            await asyncio.ensure_future(rt.disconnect())
+        elif through == "gather":
+            await asyncio.gather(rt.disconnect())
+        else:
+            await asyncio.wait_for(rt.disconnect(), timeout=5)
+        took.append(time.monotonic() - started)
+        after.append("the handler went on")
+
+    rt.on("message.new", handler)
+    await rt.connect()
+    await _flush()
+    await ws.push({"type": "hello.ok"})
+    await _flush()
+    await ws.push({"type": "message.new", "payload": {"id": "m1", "conversation_id": "c1", "seq": 1}})
+    await eventually(lambda: took, "the handler's disconnect() to return")
+    assert after == ["the handler went on"]  # not cancelled
+    assert rt.state == "stopped"
+    assert took[0] < 0.5, f"disconnect() through {through} took {took[0]:.2f}s"
+
+
+@pytest.mark.parametrize("kind", ["frame", "on_connect"])
+@pytest.mark.asyncio
+async def test_a_frame_or_on_connect_handler_awaiting_disconnect_through_a_task_is_its_caller(kind: str) -> None:
+    rt, ws = _make_client()
+    took: list[float] = []
+    after: list[str] = []
+
+    async def handler(*_args: Any) -> None:
+        started = time.monotonic()
+        await asyncio.gather(rt.disconnect())
+        took.append(time.monotonic() - started)
+        after.append("the handler went on")
+
+    if kind == "frame":
+        rt.on("presence.update", handler)
+    else:
+        rt.on_connect(handler)
+    await rt.connect()
+    await _flush()
+    await ws.push({"type": "hello.ok"})
+    await _flush()
+    if kind == "frame":
+        await ws.push({"type": "presence.update", "payload": {"handle": "@alice", "status": "online"}})
+    await eventually(lambda: took, "the handler's disconnect() to return")
+    assert after == ["the handler went on"]  # not cancelled
+    assert rt.state == "stopped"
+    assert took[0] < 0.5, f"disconnect() from the {kind} handler took {took[0]:.2f}s"
+
+
+@pytest.mark.asyncio
+async def test_a_frame_handler_that_returns_a_task_is_still_its_own_caller() -> None:
+    # The handler hands back a task it started; that task is the dispatch
+    # task, and it awaits disconnect() directly.
+    rt, ws = _make_client()
+    took: list[float] = []
+
+    async def body(_msg: dict[str, Any]) -> None:
+        started = time.monotonic()
+        await rt.disconnect()
+        took.append(time.monotonic() - started)
+
+    rt.on("presence.update", lambda msg: asyncio.ensure_future(body(msg)))
+    await rt.connect()
+    await _flush()
+    await ws.push({"type": "hello.ok"})
+    await _flush()
+    await ws.push({"type": "presence.update", "payload": {"handle": "@alice", "status": "online"}})
+    await eventually(lambda: took, "the handler's disconnect() to return")
+    assert took[0] < 0.5, f"disconnect() took {took[0]:.2f}s"
+
+
+@pytest.mark.asyncio
+async def test_a_task_an_on_connect_handler_started_does_not_shield_the_drain() -> None:
+    # The mark lasts only while the on_connect handlers run: a task one of
+    # them started, calling disconnect() during the drain, gets the drain
+    # cancelled like any other owned task.
+    class HeldSync(MockAsyncClient):
+        def __init__(self) -> None:
+            super().__init__()
+            self.entered = asyncio.Event()
+            self.release = asyncio.Event()
+
+        async def sync(self, **kwargs: Any) -> list[dict[str, Any]]:
+            self.sync_calls.append(kwargs)
+            self.entered.set()
+            await self.release.wait()
+            return []
+
+    api = HeldSync()
+    rt, ws = _make_client(client=api, auto_drain_on_connect=True)
+    phase: list[asyncio.Future[Any]] = []
+    asked: list[asyncio.Future[None]] = []
+
+    async def ask_during_the_drain() -> None:
+        await api.entered.wait()
+        await rt.disconnect()
+
+    async def on_connect() -> None:
+        task = asyncio.current_task()
+        assert task is not None
+        phase.append(task)  # the task running the on_connect handlers, then the drain
+        asked.append(asyncio.ensure_future(ask_during_the_drain()))
+
+    rt.on_connect(on_connect)
+    await rt.connect()
+    await _flush()
+    await ws.push({"type": "hello.ok"})
+    await asyncio.wait_for(asked_done(asked), timeout=5)
+    assert rt.state == "stopped"
+    assert phase[0].done()  # the drain was cancelled, not left running
+    api.release.set()
+
+
+async def asked_done(asked: list[asyncio.Future[None]]) -> None:
+    await eventually(lambda: asked, "the on_connect handler to start its task")
+    await asked[0]
+
+
+@pytest.mark.asyncio
+async def test_a_handler_that_asks_for_disconnect_and_goes_on_is_its_caller() -> None:
+    # Fire and forget: the handler that started disconnect() is its caller,
+    # as when it awaits it: neither waited for nor cancelled.
+    rt, ws = _make_client()
+    finished = asyncio.Event()
+    cancelled: list[bool] = []
+    asked: list[asyncio.Future[None]] = []
+
+    async def handler(_msg: dict[str, Any]) -> None:
+        asked.append(asyncio.ensure_future(rt.disconnect()))  # not awaited
+        try:
+            await asyncio.sleep(0.2)  # its own wrap-up, after asking
+        except asyncio.CancelledError:
+            cancelled.append(True)
+            raise
+        finished.set()
+
+    rt.on("message.new", handler)
+    await rt.connect()
+    await _flush()
+    await ws.push({"type": "hello.ok"})
+    await _flush()
+    await ws.push({"type": "message.new", "payload": {"id": "m1", "conversation_id": "c1", "seq": 1}})
+    await eventually(lambda: rt.state == "stopped", "disconnect() to run")
+    await asyncio.wait_for(finished.wait(), timeout=5)
+    assert cancelled == []
+    assert asked[0].done()
+
+
+@pytest.mark.asyncio
+async def test_disconnect_from_a_message_handler_still_gives_other_handlers_their_grace() -> None:
+    rt, ws = _make_client()
+    order: list[str] = []
+    took: list[float] = []
+    c2_running = asyncio.Event()
+
+    async def handler(msg: dict[str, Any]) -> None:
+        if msg["payload"]["conversation_id"] == "c2":
+            c2_running.set()
+            await asyncio.sleep(0.15)  # inside the 1 s grace
+            order.append("c2 finished")
+            return
+        started = time.monotonic()
+        await rt.disconnect()
+        took.append(time.monotonic() - started)
+        order.append("c1's disconnect() returned")
+
+    rt.on("message.new", handler)
+    await rt.connect()
+    await _flush()
+    await ws.push({"type": "hello.ok"})
+    await _flush()
+    await ws.push({"type": "message.new", "payload": {"id": "m2", "conversation_id": "c2", "seq": 1}})
+    await c2_running.wait()
+    await ws.push({"type": "message.new", "payload": {"id": "m1", "conversation_id": "c1", "seq": 1}})
+    await eventually(lambda: took, "the handler's disconnect() to return")
+    assert order == ["c2 finished", "c1's disconnect() returned"]  # c2 was waited for, not cancelled
+    assert took[0] < 0.8, f"disconnect() from the handler took {took[0]:.2f}s"
+
+
+@pytest.mark.asyncio
+async def test_disconnect_from_a_message_handler_never_starts_the_next_message_in_its_lane() -> None:
+    rt, ws = _make_client()
+    entered: list[str] = []
+    second_queued = asyncio.Event()
+    returned = asyncio.Event()
+
+    async def handler(msg: dict[str, Any]) -> None:
+        entered.append(msg["payload"]["id"])
+        if msg["payload"]["id"] == "m1":
+            await second_queued.wait()
+            await rt.disconnect()
+            returned.set()
+
+    rt.on("message.new", handler)
+    await rt.connect()
+    await _flush()
+    await ws.push({"type": "hello.ok"})
+    await _flush()
+    await ws.push({"type": "message.new", "payload": {"id": "m1", "conversation_id": "c1", "seq": 1}})
+    await ws.push({"type": "message.new", "payload": {"id": "m2", "conversation_id": "c1", "seq": 2}})
+    await eventually(lambda: entered == ["m1"] and len(rt._lanes.get("conversation:c1", _realtime._Lane()).jobs) == 2, "m2 to wait behind m1")
+    second_queued.set()
+    await asyncio.wait_for(returned.wait(), timeout=5)
+    await asyncio.sleep(0.05)  # negative check: nothing more starts
+    assert entered == ["m1"]
+    assert rt.state == "stopped"
+
+
 # ─────────────── Offline drain (bare-array wire) ───────────────
 
 
