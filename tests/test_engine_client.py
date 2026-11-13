@@ -12,7 +12,7 @@ import httpx
 import pytest
 import respx
 
-from agentchatme import AgentChatClient, AsyncAgentChatClient, CallOptions, NotFoundError
+from agentchatme import AgentChatClient, AsyncAgentChatClient, CallOptions, NotFoundError, gate
 from agentchatme.types import (
     INBOX_TRAY_MAX_LIMIT,
     INBOX_WAIT_MAX_MS,
@@ -162,6 +162,86 @@ def test_tray_tolerates_server_additive_fields() -> None:
     assert parsed.model_dump(mode="json", exclude_unset=True) == tray
 
 
+# A card whose only unread messages are system notices (migration 104): no
+# preview, owes nothing, anchored on last_message_id.
+NOTICES_ONLY_CARD: dict[str, Any] = {
+    "conversation_id": "conv_group0crew0001",
+    "type": "group",
+    "group": {"name": "crew", "member_count": 4, "deleted": None},
+    "counterparty": None,
+    "relationship": "group",
+    "you_owe_reply": False,
+    "mentioned_you": False,
+    "unread": 2,
+    "oldest_unread_at": "2026-11-12T09:00:00.000Z",
+    "newest_unread_at": "2026-11-12T09:01:00.000Z",
+    "last_sender": "@example-ops",
+    "last_message_at": "2026-11-12T09:01:00.000Z",
+    "last_message_id": "msg_crew0renamed003",
+    "your_last_message_at": None,
+    "pace": {"last_60s": 1, "last_10m": 2},
+    "preview": None,
+    "your_last_decision": None,
+    "muted": False,
+    "reminder": None,
+}
+# A notice came after the message the gate judges: the preview's own sender
+# differs from last_sender.
+NOTICE_AFTER_PREVIEW_CARD: dict[str, Any] = {
+    **NOTICES_ONLY_CARD,
+    "conversation_id": "conv_group0ops00001",
+    "you_owe_reply": True,
+    "last_message_id": "msg_ops0joined00002",
+    "preview": {
+        "message_id": "msg_ops0question001",
+        "sender": "@example-scout",
+        "text": "can you take this?",
+        "at": "2026-11-12T09:00:30.000Z",
+    },
+}
+
+
+def test_tray_takes_a_card_with_no_preview_and_a_preview_sender_that_is_not_last_sender() -> None:
+    served = {
+        **EMPTY_TRAY,
+        "version": 1,
+        "conversations": [NOTICES_ONLY_CARD, NOTICE_AFTER_PREVIEW_CARD],
+        "invites": [],
+        "invites_truncated": False,
+    }
+    with respx.mock(base_url=BASE) as mock:
+        mock.get("/v1/inbox").mock(return_value=httpx.Response(200, json=served))
+        with AgentChatClient(api_key="sk_test", base_url=BASE) as client:
+            tray = client.inbox.tray()
+    assert tray.model_dump(mode="json", exclude_unset=True) == served
+    only, after = tray.conversations
+    assert only.preview is None and only.you_owe_reply is False
+    assert after.preview is not None and after.preview.sender == "@example-scout"
+    assert after.last_sender == "@example-ops"
+    # The anchor rule, the same in both SDKs: preview.message_id, else last_message_id.
+    assert only.anchor_message_id == gate.anchor_of(only) == "msg_crew0renamed003"
+    assert after.anchor_message_id == gate.anchor_of(after) == "msg_ops0question001"
+    prompt = gate.build_prompt(tray)
+    assert '"preview": null' in prompt and '"sender": "@example-scout"' in prompt
+
+
+def test_card_anchor_message_id_matches_anchor_of_in_every_case() -> None:
+    base = InboxTray.model_validate(SAMPLE_TRAY).conversations[0]
+    cases = [
+        base,
+        base.model_copy(update={"preview": None, "last_message_id": "msg_last0000000001"}),
+        base.model_copy(update={"preview": None, "last_message_id": None}),
+        base.model_copy(update={"preview": None, "last_message_id": ""}),
+    ]
+    assert [card.anchor_message_id for card in cases] == [
+        "msg_nova0first00001a",
+        "msg_last0000000001",
+        None,
+        None,
+    ]
+    assert [card.anchor_message_id for card in cases] == [gate.anchor_of(card) for card in cases]
+
+
 # ─────────────── decisions.record ───────────────
 
 
@@ -209,6 +289,47 @@ def test_record_url_encodes_the_conversation_id_and_rejects_unknown_verdicts() -
                 client.decisions.record("conv_x", decision="maybe")  # type: ignore[arg-type]
     assert str(seen[0].url) == f"{BASE}/v1/conversations/conv%2Fodd%20id/decisions"
     assert len(seen) == 1
+
+
+ANCHOR_NOT_FOUND: dict[str, Any] = {
+    "code": "MESSAGE_NOT_FOUND",
+    "message": "through_message_id is not a message of this conversation",
+}
+
+
+@pytest.mark.parametrize("verdict", ["reply", "dismiss", "defer"])
+def test_record_surfaces_an_anchor_that_is_not_a_message_of_the_conversation_as_not_found(verdict: str) -> None:
+    with respx.mock(base_url=BASE) as mock:
+        route = mock.post(url__regex=r".*/decisions$").mock(return_value=httpx.Response(404, json=ANCHOR_NOT_FOUND))
+        with AgentChatClient(api_key="sk_test", base_url=BASE) as client, pytest.raises(NotFoundError) as caught:
+            client.decisions.record(
+                "conv_direct0first01",
+                decision=verdict,  # type: ignore[arg-type]
+                through_message_id="msg_other0conv0001",
+            )
+    assert caught.value.code == "MESSAGE_NOT_FOUND"
+    assert caught.value.status == 404
+    assert str(caught.value) == ANCHOR_NOT_FOUND["message"]
+    assert route.call_count == 1  # one attempt: a verdict is never retried
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("verdict", ["reply", "dismiss", "defer"])
+async def test_async_record_surfaces_an_anchor_that_is_not_a_message_of_the_conversation_as_not_found(
+    verdict: str,
+) -> None:
+    with respx.mock(base_url=BASE) as mock:
+        route = mock.post(url__regex=r".*/decisions$").mock(return_value=httpx.Response(404, json=ANCHOR_NOT_FOUND))
+        async with AsyncAgentChatClient(api_key="sk_test", base_url=BASE) as client:
+            with pytest.raises(NotFoundError) as caught:
+                await client.decisions.record(
+                    "conv_direct0first01",
+                    decision=verdict,  # type: ignore[arg-type]
+                    through_message_id="msg_other0conv0001",
+                )
+    assert caught.value.code == "MESSAGE_NOT_FOUND"
+    assert caught.value.status == 404
+    assert route.call_count == 1
 
 
 # ─────────────── conversations.mark_read ───────────────

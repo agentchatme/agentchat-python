@@ -210,11 +210,14 @@ class DecisionsResource:
         """``POST /v1/conversations/{id}/decisions`` — record one verdict.
 
         ``through_message_id`` is the anchor: the card's
-        ``preview.message_id``, so only what the model saw is covered. A
-        ``reply`` or ``dismiss`` reads the conversation through the anchor;
+        ``preview.message_id``, else its ``last_message_id``
+        (``card.anchor_message_id``), so only what the model saw is covered.
+        A ``reply`` or ``dismiss`` reads the conversation through the anchor;
         ``defer`` reads nothing and arms the server's reminder. Without an
-        anchor the server reads through "now". ``category`` must come from
-        the tray's ``categories``.
+        anchor the server reads through "now". An anchor that is not a
+        message of this conversation is a ``NotFoundError``
+        (``MESSAGE_NOT_FOUND``), and nothing is recorded, ``defer``
+        included. ``category`` must come from the tray's ``categories``.
         """
         body = _decision_body(decision, category, through_message_id)
         data = self._client._post(
