@@ -1814,3 +1814,177 @@ async def test_the_socket_wakes_echoes_do_not_and_the_handle_is_learned() -> Non
     acks = [json.loads(s)["message_id"] for s in ws.sent if json.loads(s).get("type") == "ack"]
     assert acks == ["m1", "m2"]  # acked on receipt
     await loop.stop()
+
+
+# ─────────────── system notices: acked, never a wake (contract v1 section 4) ───────────────
+
+
+def _notice(mid: str, cid: str, seq: int, **data: Any) -> dict[str, Any]:
+    """A system notice as the socket carries it: a ``message.new`` whose
+    message has ``type: "system"``."""
+    return {
+        "type": "message.new",
+        "payload": {
+            "id": mid,
+            "conversation_id": cid,
+            "sender": "@example-ops",
+            "client_msg_id": f"sys_{mid}",
+            "seq": seq,
+            "type": "system",
+            "content": {"data": {"schema_version": 1, **data}},
+            "metadata": {},
+            "created_at": "2026-11-12T09:00:00.000Z",
+        },
+    }
+
+
+def _peer_message(mid: str, cid: str, seq: int) -> dict[str, Any]:
+    return {
+        "type": "message.new",
+        "payload": {
+            "id": mid,
+            "conversation_id": cid,
+            "sender": "@example-scout",
+            "seq": seq,
+            "type": "text",
+            "content": {"text": "are you there?"},
+        },
+    }
+
+
+class _SocketLoop:
+    """A loop on a mock socket, past its connect cycle (an empty tray)."""
+
+    def __init__(self, mode: str, quiet_ms: int) -> None:
+        from agentchatme.integration import ReceiveLoopSocketOptions
+
+        self.ws = MockWebSocket()
+        self.client = _LoopClient([_tray([])])
+        self.events: list[dict[str, Any]] = []
+        self.prompts: list[str] = []
+        self.runs: list[Any] = []
+        ws = self.ws
+
+        async def connect(_url: str, **_kw: Any) -> MockWebSocket:
+            return ws
+
+        def call_model(prompt: str) -> str:
+            self.prompts.append(prompt)
+            return _answer(("conv_direct0first01", "dismiss"))
+
+        def start_run(request: Any) -> RunEnd:
+            self.runs.append(request)
+            return RunEnd(status="completed")
+
+        modes: dict[str, Any] = (
+            {"call_model": call_model, "start_turn": _Turns()} if mode == "gate_call" else {"start_run": start_run}
+        )
+        self.loop = _loop(
+            self.client,
+            mode=mode,
+            socket=ReceiveLoopSocketOptions(api_key="k", websocket_connect=connect),
+            on_event=self.events.append,
+            quiet_ms=quiet_ms,
+            max_ms=quiet_ms * 10,
+            **modes,
+        )
+
+    async def start(self) -> None:
+        await self.loop.start()
+        await _flush()
+        await self.ws.push({"type": "hello.ok", "capabilities": ["ack", "heartbeat", "rewake"]})
+        await _eventually(lambda: self.loop.status().coalescer["cycles"] == 1, "the connect cycle")
+        await self.loop.idle()
+
+    def acks(self) -> list[str]:
+        frames = [json.loads(raw) for raw in self.ws.sent]
+        return [f["message_id"] for f in frames if f.get("type") == "ack"]
+
+    def notices(self) -> list[dict[str, Any]]:
+        return [e for e in self.events if e["type"] == "notice"]
+
+    def wake_sources(self) -> list[str]:
+        return [e["source"] for e in self.events if e["type"] == "wake"]
+
+
+@pytest.mark.asyncio
+async def test_a_group_deleted_notice_is_acked_on_receipt_and_starts_no_cycle_and_no_gate_call() -> None:
+    s = _SocketLoop("gate_call", 0)
+    await s.start()
+    reads = s.client.inbox.reads
+    await s.ws.push(_notice("msg_gone0deleted01d", "conv_group0gone0001", 7, event="group_deleted", actor_handle="example-ops"))
+    await s.ws.push(
+        {
+            "type": "group.deleted",
+            "payload": {
+                "group_id": "conv_group0gone0001",
+                "deleted_by_handle": "example-ops",
+                "deleted_at": "2026-11-12T09:00:00.000Z",
+            },
+        }
+    )
+    await s.ws.push(_notice("msg_crew0joined0001", "conv_group0crew0001", 3, event="member_joined", agent_handle="example-quill"))
+    await _eventually(lambda: len(s.notices()) == 2, "both notices handled")
+    await asyncio.sleep(0.02)
+    await s.loop.idle()
+    # Delivered: this machine has them. Nothing else happened.
+    assert s.acks() == ["msg_gone0deleted01d", "msg_crew0joined0001"]
+    status = s.loop.status()
+    assert status.coalescer["cycles"] == 1 and status.coalescer["wakes"] == 1
+    assert s.client.inbox.reads == reads
+    assert s.prompts == []
+    assert s.wake_sources() == ["connect"]
+    assert s.notices() == [
+        {"type": "notice", "conversation_id": "conv_group0gone0001"},
+        {"type": "notice", "conversation_id": "conv_group0crew0001"},
+    ]
+    assert status.counters["frames"] == 2 and status.counters["notices"] == 2 and status.counters["echoes"] == 0
+    await s.loop.stop()
+
+
+@pytest.mark.asyncio
+async def test_a_real_message_in_the_same_burst_as_notices_still_starts_its_cycle() -> None:
+    s = _SocketLoop("gate_call", 20)
+    await s.start()
+    s.client.inbox.trays = [_tray([_card("conv_direct0first01", "msg_nova0first00001a")])]
+    # One burst inside the quiet window: a notice, a real message, a notice.
+    await s.ws.push(_notice("msg_crew0joined0001", "conv_group0crew0001", 1, event="member_joined", agent_handle="example-quill"))
+    await s.ws.push(_peer_message("msg_crew0hello00002", "conv_group0crew0001", 2))
+    await s.ws.push(
+        _notice("msg_crew0renamed003", "conv_group0crew0001", 3, event="name_changed", new_name="crew", actor_handle="example-ops")
+    )
+    await _eventually(lambda: len(s.notices()) == 2, "the burst handled")
+    await _eventually(lambda: s.loop.status().coalescer["cycles"] == 2, "the message cycle")
+    await s.loop.idle()
+    status = s.loop.status()
+    assert status.coalescer["cycles"] == 2 and status.coalescer["wakes"] == 2
+    assert len(s.prompts) == 1
+    assert s.client.decisions.recorded == [
+        {"conversation_id": "conv_direct0first01", "decision": "dismiss", "through_message_id": "msg_nova0first00001a"}
+    ]
+    assert s.acks() == ["msg_crew0joined0001", "msg_crew0hello00002", "msg_crew0renamed003"]
+    assert s.wake_sources() == ["connect", "message"]
+    # The order inside the burst does not matter: a message after a notice wakes too.
+    await s.ws.push(_notice("msg_crew0left000004", "conv_group0crew0001", 4, event="member_left", agent_handle="example-quill"))
+    await s.ws.push(_peer_message("msg_crew0again00005", "conv_group0crew0001", 5))
+    await _eventually(lambda: s.loop.status().coalescer["cycles"] == 3, "the second message cycle")
+    assert s.loop.status().counters["notices"] == 3
+    await s.loop.stop()
+
+
+@pytest.mark.asyncio
+async def test_single_run_a_notice_starts_no_run_and_a_real_message_does() -> None:
+    s = _SocketLoop("single_run", 0)
+    await s.start()
+    assert s.runs == []  # the connect cycle found an empty tray
+    s.client.inbox.trays = [_tray([_card("conv_direct0first01", "msg_nova0first00001a")])]
+    await s.ws.push(_notice("msg_crew0joined0001", "conv_group0crew0001", 1, event="member_joined", agent_handle="example-quill"))
+    await _eventually(lambda: len(s.notices()) == 1, "the notice handled")
+    await asyncio.sleep(0.02)
+    await s.loop.idle()
+    assert s.loop.status().coalescer["cycles"] == 1 and s.loop.status().coalescer["wakes"] == 1
+    assert s.runs == []
+    await s.ws.push(_peer_message("msg_direct0next0001", "conv_direct0first01", 1))
+    await _eventually(lambda: len(s.runs) == 1, "the run for a real message")
+    assert s.acks() == ["msg_crew0joined0001", "msg_direct0next0001"]
+    await s.loop.stop()
