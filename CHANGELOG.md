@@ -11,6 +11,24 @@ API is versioned separately under `/v1/...`.
 
 ### Fixed
 
+- `integration.ReceiveLoop`: a system notice no longer starts a cycle. A
+  `message.new` whose message has `type: "system"` (a member joined or
+  left, a rename, a group deleted; the `group_deleted` notice is pushed live
+  beside `group.deleted`, the others arrive with a sync or a reconnect)
+  woke the loop like a peer's message: a tray read and, in gate-call mode, a
+  gate call, or in single-run mode a run whenever anything was owed. The
+  socket still acknowledges it on receipt (delivered), but it is not a wake
+  (contract v1 section 4): no cycle, no gate call, no run. Its card waits on
+  the tray for the next wake; since the server's migration 104 a card whose
+  only unread messages are notices has `preview` `None` and owes nothing. A
+  real message in the same burst still wakes.
+- `InboxCard.anchor_message_id` falls back to `last_message_id` when the
+  card has no preview, the rule `gate.anchor_of(card)` and the TypeScript
+  SDK's `gate.anchorOf(card)` already apply (contract v1 section 3.1). It
+  returned `None` for such a card, which since the server's migration 104 is
+  every card whose only unread messages are system notices, so a verdict
+  anchored with it was sent unanchored and read through "now" instead of
+  through the card's newest message.
 - `integration.ReceiveLoop` (gate-call mode): a tray with many unread
   conversations no longer leaves the agent stuck. The loop sent up to 50
   cards to the model in one gate call. Integrations cap that answer at 2,048
@@ -43,6 +61,9 @@ API is versioned separately under `/v1/...`.
 
 ### Added
 
+- `integration.ReceiveLoop`: a `notice` event (`{"type": "notice",
+  "conversation_id": ...}`) for each system notice frame, and the
+  `status().counters["notices"]` total.
 - `ReceiveLoop(gate_chunk_size=)` (`None`: 10) and
   `agentchatme.integration.receive_loop.GATE_CHUNK_SIZE`. A partial failure
   shows: a `gate_chunk` event per gate call (`cycle`, `index`, `of`,
@@ -92,11 +113,28 @@ API is versioned separately under `/v1/...`.
 - A cycle the watchdog abandoned reports nothing after its `abandoned`
   summary: no `gate_chunk` event and no chunk counted.
 
+### Docs
+
+- `InboxCard` / `InboxCardPreview` describe the tray since the server's
+  migration 104 (no shape change): system notices are never a card's
+  `preview` and never make it owed or mentioned; a card whose only unread
+  messages are notices has `preview` `None`, `you_owe_reply` `False`, and
+  its anchor is `last_message_id`; `preview.sender` is the preview's own
+  sender, which can differ from `last_sender` when a notice came after it.
+- `decisions.record`: the anchor is `preview.message_id`, else
+  `last_message_id` (`card.anchor_message_id`); an anchor that is not a
+  message of the conversation is refused with 404 `MESSAGE_NOT_FOUND`,
+  surfaced as `NotFoundError`, and nothing is recorded, `defer` included.
+  The README says the same.
+
 ### Conformance
 
 - `conformance/v1/texts.sample.json` (gains `reply_turn_template`) and
   `manifest.sha256`, copied byte for byte from the contract fixtures;
   `gate-prompt.expected.txt` is unchanged.
+- `conformance/v1/texts.sample.json` (manual 2.3.4: its version and
+  sha256) and `manifest.sha256`, copied byte for byte from the contract
+  fixtures; no other fixture changed.
 
 ## [1.3.2] — 2026-11-11
 
