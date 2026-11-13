@@ -29,7 +29,12 @@ frame, and :meth:`ReceiveLoop.wake` for whatever the integration hears
 itself (a wake webhook). The socket is the SDK's
 :class:`~agentchatme.RealtimeClient` with ``ack_on_receipt`` and the
 ``ack``, ``heartbeat`` and ``rewake`` capabilities: delivered means this
-machine received the message; only a verdict reads it.
+machine received the message; only a verdict reads it. A system notice (a
+``message.new`` whose message has ``type: "system"``: a member joined or
+left, a rename, a group deleted) is acked on receipt like any message but is
+not a wake (contract v1 section 4): it starts no cycle and no gate call, and
+its card waits on the tray for the next wake. A real message in the same
+burst still wakes.
 
 There is no retry ladder here. A cycle that could not finish (the tray could
 not be read, the model failed, a turn was refused or failed) leaves the
@@ -304,8 +309,12 @@ class ReceiveLoopStatus:
 
 
 ReceiveLoopEvent = dict[str, Any]
-"""``{"type": "wake" | "echo" | "cycle" | "gate_chunk" | "turn_started" |
-"turn_refused" | "turn_outcome" | "invite_outcome" | "run" | "error", ...}``.
+"""``{"type": "wake" | "echo" | "notice" | "cycle" | "gate_chunk" |
+"turn_started" | "turn_refused" | "turn_outcome" | "invite_outcome" | "run" |
+"error", ...}``.
+
+``notice`` (a system notice frame: acked on receipt, no wake):
+``conversation_id`` (``None`` when the frame named none).
 
 ``gate_chunk`` (gate-call mode, one per gate call, in order, once its
 verdicts are recorded): ``cycle`` (the cycle's identifier: the chunks of one
@@ -710,6 +719,7 @@ class ReceiveLoop:
         self._counts: dict[str, int] = {
             "frames": 0,
             "echoes": 0,
+            "notices": 0,
             "turns_started": 0,
             "turns_refused": 0,
             "turns_queued": 0,
@@ -889,6 +899,16 @@ class ReceiveLoop:
         payload = message.get("payload")
         data = payload if isinstance(payload, dict) else {}
         conversation_id = data.get("conversation_id") if isinstance(data.get("conversation_id"), str) else None
+        if data.get("type") == "system":
+            # A system notice (a member joined or left, a rename, a group
+            # deleted). The socket acked it on receipt: delivered. It is not a
+            # wake (contract v1 section 4): no cycle and no gate call; its card
+            # waits on the tray for the next wake, where a notices-only card
+            # has no preview and owes nothing. A real message in the same
+            # burst wakes on its own frame.
+            self._counts["notices"] += 1
+            self._emit({"type": "notice", "conversation_id": conversation_id})
+            return
         raw = data.get("sender") or data.get("from") or data.get("sender_handle")
         sender = normalize_handle(raw) if isinstance(raw, str) else ""
         if self._handle is not None and sender == self._handle:

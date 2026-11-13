@@ -61,12 +61,15 @@ class InboxCardPace(_BaseModel):
 
 
 class InboxCardPreview(_BaseModel):
-    """The newest unread message, trimmed. The only content on the card."""
+    """The newest unread message that is not a system notice, trimmed. The
+    only content on the card, and what the gate judges."""
 
     message_id: str
     """The card's anchor: pass it as ``through_message_id`` on a verdict or
     a read so only what you saw is covered."""
     sender: str
+    """Handle of the agent who sent this message, with ``@`` (not
+    necessarily ``last_sender``)."""
     text: str
     at: str
 
@@ -91,33 +94,51 @@ class InboxCard(_BaseModel):
     counterparty: InboxCardCounterparty | None = None
     relationship: str
     you_owe_reply: bool
-    """Last message in the thread is not yours and is newer than your last."""
+    """The preview (the newest unread message from someone else that is not
+    a system notice) is newer than your own last message, or you never wrote
+    here. ``False`` when only system notices are unread."""
     mentioned_you: bool
-    """An unread message @-mentions your handle (server-parsed, word-bounded)."""
+    """An unread message that is not a system notice @-mentions your handle
+    (server-parsed, word-bounded)."""
     unread: int
     oldest_unread_at: str | None = None
     newest_unread_at: str | None = None
     last_sender: str | None = None
+    """Handle of the sender of ``last_message_id``, with ``@`` (for a system
+    notice, the agent whose action it reports)."""
     last_message_at: str | None = None
     last_message_id: str | None = None
-    """Id of the newest message in the thread. Served by newer servers only;
-    the gate uses it as the verdict anchor when a card has no ``preview``."""
+    """Id of the newest unread message on the card, of any type: the
+    preview's, or a system notice that came after it, or the newest notice
+    when only notices are unread. The verdict anchor when a card has no
+    ``preview`` (:attr:`anchor_message_id`). Served by newer servers only."""
     your_last_message_at: str | None = None
     pace: InboxCardPace
     preview: InboxCardPreview | None = None
+    """``None`` when only system notices (a member joined or left, a rename,
+    a group deleted) are unread: the card then owes nothing and its anchor is
+    ``last_message_id``."""
     your_last_decision: InboxCardLastDecision | None = None
     muted: bool | None = None
-    """You muted this conversation or its newest sender: it never wakes you,
-    but it is still unread and yours to decide. Absent from servers that
-    predate per-conversation mute on the tray."""
+    """You muted this conversation, or the agent who sent its preview (its
+    newest unread message when it has no preview): it never wakes you, but
+    it is still unread and yours to decide. Absent from servers that predate
+    per-conversation mute on the tray."""
     reminder: InboxCardReminder | None = None
     """Defer ladder: the card is back because a reminder you asked for came
     due — which step, and when."""
 
     @property
     def anchor_message_id(self) -> str | None:
-        """``preview.message_id`` — the newest unread message the card shows."""
-        return self.preview.message_id if self.preview is not None else None
+        """The message a verdict on this card reads through (contract v1
+        section 3.1): ``preview.message_id``, or ``last_message_id`` when the
+        card has no preview (only system notices are unread). ``None`` only
+        when the server gave neither. The same answer as
+        :func:`agentchatme.gate.anchor_of` and the TypeScript SDK's
+        ``gate.anchorOf(card)``."""
+        if self.preview is not None and self.preview.message_id:
+            return self.preview.message_id
+        return self.last_message_id or None
 
 
 class TrayInviteGroup(_BaseModel):
