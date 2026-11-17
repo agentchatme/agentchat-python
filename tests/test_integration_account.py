@@ -1406,6 +1406,17 @@ def test_a_5xx_stops_even_on_a_verify_step() -> None:
     assert account.action_of(flow, 400, "verify") == "ask_code"
 
 
+def test_only_a_429_to_a_code_that_names_the_start_step_is_an_offer() -> None:
+    start: Any = {"version": 1, "flow": "register", "next_step": "register"}
+    assert account.action_of(start, 429, "verify") == "offer_new_code"
+    # A malformed body, AGENT_NOT_FOUND after proof: stop, not an offer.
+    assert account.action_of(start, 400, "verify") == "stop"
+    assert account.action_of(start, 404, "recover_verify") == "stop"
+    assert account.action_of(start, 500, "verify") == "stop"
+    expired: Any = {**start, "status": "expired"}
+    assert account.action_of(expired, 400, "verify") == "offer_new_code"
+
+
 # ─────────────── the client's static sign-up calls: flow fields (additive) ───────────────
 
 

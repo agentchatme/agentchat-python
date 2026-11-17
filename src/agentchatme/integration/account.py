@@ -81,9 +81,9 @@ SignupAction = Literal[
 - ``ask_param``: a start step with ``param``: re-ask that field, call the
   start step again.
 - ``offer_new_code``: a start step, no ``param``, the code is gone
-  (``status`` ``expired`` / ``max_attempts_reached``, or the call was a
-  code), no wait over 60 s: ask before sending a new code (wait
-  ``retry_after_s`` first when set).
+  (``status`` ``expired`` / ``max_attempts_reached``, or a 429 to a code),
+  no wait over 60 s: ask before sending a new code (wait ``retry_after_s``
+  first when set).
 - ``wait_then_retry``: 429 with ``retry_after_s`` <= 60 naming the step
   that was called: wait, then repeat it.
 - ``stop``: a longer wait, a 5xx, an unknown ``next_step``, anything else:
@@ -238,13 +238,15 @@ def action_of(flow: SignupFlow | None, http_status: int, called_step: str) -> Si
 
     - ``legacy``: no flow object.
     - ``done``: ``next_step`` is ``done``.
-    - ``stop``: a ``next_step`` this release does not know, or a 5xx.
+    - ``stop``: a ``next_step`` this release does not know, or any 5xx (the
+      account may exist after a verify 500: never steer to a second one).
     - ``ask_code``: a verify step, no ``retry_after_s``.
     - ``ask_param``: a start step with ``param``.
     - ``offer_new_code``: a start step, no ``param``, the code is gone
-      (``status`` ``expired`` / ``max_attempts_reached``, or the call was a
+      (``status`` ``expired`` / ``max_attempts_reached``, or a 429 to a
       code), and no ``retry_after_s`` or one of at most 60 s (waited out
-      only if the person says yes).
+      only if the person says yes). Any other 4xx to a code (a malformed
+      body, ``AGENT_NOT_FOUND`` after proof) is ``stop``.
     - ``wait_then_retry``: a 429 with ``retry_after_s`` <= 60 that names the
       step that was called (repeating it sends nothing new).
     - ``stop``: anything else.
@@ -265,7 +267,8 @@ def action_of(flow: SignupFlow | None, http_status: int, called_step: str) -> Si
         if flow.get("param") is not None:
             return "ask_param"
         code_gone = flow.get("status") in ("expired", "max_attempts_reached")
-        if (code_gone or called_step in _VERIFY_STEPS) and (wait is None or wait <= MAX_WAIT_S):
+        turned_away = http_status == 429 and called_step in _VERIFY_STEPS
+        if (code_gone or turned_away) and (wait is None or wait <= MAX_WAIT_S):
             return "offer_new_code"
     if http_status == 429 and wait is not None and wait <= MAX_WAIT_S and step == called_step:
         return "wait_then_retry"
