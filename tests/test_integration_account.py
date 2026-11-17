@@ -12,6 +12,7 @@ import asyncio
 import json
 from collections.abc import Iterator
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from typing import Any, Union
 
 import httpx
@@ -172,18 +173,29 @@ def cooldown(seconds: int, kind: str = "register") -> httpx.Response:
 # ─────────────── a scripted person, on fake time ───────────────
 
 
+# pending() expires at 10:10:00Z; the fake wall clock starts at 10:00:00Z.
+WALL_START = datetime(2026, 11, 17, 10, 0, tzinfo=timezone.utc).timestamp()
+
+
 class Clock:
-    def __init__(self) -> None:
+    """Fake time: a monotonic clock and a wall clock that move together."""
+
+    def __init__(self, wall_start: float = WALL_START) -> None:
         self.now = 1000.0
+        self.wall_start = wall_start
 
     def __call__(self) -> float:
         return self.now
+
+    def wall(self) -> float:
+        return self.wall_start + (self.now - 1000.0)
 
 
 @pytest.fixture
 def clock(monkeypatch: pytest.MonkeyPatch) -> Iterator[Clock]:
     fake = Clock()
     monkeypatch.setattr(account, "_now", fake)
+    monkeypatch.setattr(account, "_wall_now", fake.wall)
     yield fake
 
 
@@ -331,14 +343,121 @@ def test_a_new_code_asked_for_inside_resend_after_s_waits_what_is_left(clock: Cl
     assert server.bodies()[2] == {"pending_id": "pnd_2", "code": "654321"}
 
 
-def test_a_new_code_that_would_wait_over_60_s_stops_with_the_server_message(clock: Clock) -> None:
+def test_a_new_code_that_would_wait_over_60_s_asks_for_the_held_code_again(clock: Clock) -> None:
+    # Nothing is sent: the code the person holds still works.
+    server = Server([sent(resend_after_s=1800), registered()])
+    person = Person([NEW_CODE, value("123456")], clock=clock)
+    result = run_with(server, person)
+
+    assert result.outcome == "done"
+    assert [q.field for q in person.asked] == ["code", "code"]
+    assert person.slept == []
+    assert server.paths() == ["/v1/register", "/v1/register/verify"]
+
+
+def test_a_new_code_that_would_wait_over_60_s_after_the_held_code_expired_stops(clock: Clock) -> None:
     server = Server([sent(resend_after_s=1800)])
-    person = Person([NEW_CODE], clock=clock)
+    person = Person([NEW_CODE], clock=clock, think_s=11 * 60)
     result = run_with(server, person)
 
     assert result == account.RunResult(outcome="stopped", code=None, message=SENT_TEXT)
     assert person.slept == []
     assert len(server.seen) == 1
+
+
+CAP = "Too many codes have been sent. Enter the last code you received, or try again in 30 minutes."
+
+
+def hourly_cap() -> httpx.Response:
+    return error(
+        429,
+        "OTP_HOURLY_CAP",
+        CAP,
+        {"flow": "register", "next_step": "register", "retry_after_s": 1800},
+        {"Retry-After": "1800"},
+    )
+
+
+def test_hourly_cap_while_the_held_code_still_works_asks_for_that_code_again(clock: Clock) -> None:
+    server = Server([sent("register", "pnd_1", resend_after_s=0), hourly_cap(), registered()])
+    person = Person([NEW_CODE, value("123456")], clock=clock)
+    result = run_with(server, person)
+
+    assert result == account.RunResult(outcome="done", api_key="key_test_1", handle="alice")
+    assert person.shown[1] == CAP
+    assert [q.field for q in person.asked] == ["code", "code"]
+    again = person.asked[1].flow
+    assert again is not None and (again.get("pending_id"), again["next_step"]) == ("pnd_1", "verify")
+    assert person.slept == []
+    assert server.paths() == ["/v1/register", "/v1/register", "/v1/register/verify"]
+    assert server.bodies()[2] == {"pending_id": "pnd_1", "code": "123456"}
+
+
+def test_hourly_cap_after_the_held_code_expired_stops(clock: Clock) -> None:
+    server = Server([sent("register", "pnd_1", resend_after_s=0), hourly_cap()])
+    person = Person([NEW_CODE], clock=clock, think_s=11 * 60)
+    assert run_with(server, person) == account.RunResult(outcome="stopped", code="OTP_HOURLY_CAP", message=CAP)
+    assert len(person.asked) == 1
+
+
+def test_a_cooldown_over_60_s_while_the_held_code_works_goes_back_to_it(clock: Clock) -> None:
+    server = Server([sent("register", "pnd_1", resend_after_s=0), cooldown(90), registered()])
+    person = Person([NEW_CODE, value("123456")], clock=clock)
+    assert run_with(server, person).outcome == "done"
+    assert person.shown[1] == "You can request a new code in 90 seconds."
+    assert person.slept == []
+    assert server.bodies()[2] == {"pending_id": "pnd_1", "code": "123456"}
+
+
+def test_the_held_code_keeps_its_expiry_through_an_answer_that_does_not_repeat_it(clock: Clock) -> None:
+    server = Server(
+        [
+            sent("register", "pnd_1", resend_after_s=0),
+            error(
+                400,
+                "VALIDATION_ERROR",
+                "Enter the code using only 6 digits.",
+                {"flow": "register", "next_step": "verify", "param": "code", "code_length": 6},
+            ),
+            hourly_cap(),
+            registered(),
+        ]
+    )
+    person = Person([value("12a456"), NEW_CODE, value("123456")], clock=clock)
+    assert run_with(server, person).outcome == "done"
+    assert server.bodies()[3] == {"pending_id": "pnd_1", "code": "123456"}
+
+
+def test_a_held_code_with_no_known_expiry_stops(clock: Clock) -> None:
+    server = Server(
+        [
+            respond(200, {"pending_id": "pnd_1", "message": "Verification code sent to email"}),
+            respond(429, {"code": "OTP_HOURLY_CAP", "message": "Maximum 20 verification codes per hour."}, {"Retry-After": "1800"}),
+        ]
+    )
+    result = run_with(server, Person([NEW_CODE], clock=clock))
+    assert (result.outcome, result.code) == ("stopped", "OTP_HOURLY_CAP")
+
+
+def test_another_code_refused_for_long_still_stops(clock: Clock) -> None:
+    server = Server(
+        [
+            sent("register", "pnd_1", resend_after_s=0),
+            error(
+                429,
+                "RATE_LIMITED",
+                "Too many attempts. Try again in 25 minutes.",
+                {"flow": "register", "next_step": "register", "retry_after_s": 1500},
+            ),
+        ]
+    )
+    result = run_with(server, Person([NEW_CODE], clock=clock))
+    assert (result.outcome, result.code) == ("stopped", "RATE_LIMITED")
+
+
+def test_cancel_at_the_held_code(clock: Clock) -> None:
+    server = Server([sent("register", "pnd_1", resend_after_s=0), hourly_cap()])
+    assert run_with(server, Person([NEW_CODE, CANCEL], clock=clock)) == account.RunResult(outcome="cancelled")
 
 
 def test_cancel_at_the_code(clock: Clock) -> None:

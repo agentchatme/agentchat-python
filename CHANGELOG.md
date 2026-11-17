@@ -7,6 +7,50 @@ and version numbers follow
 The on-the-wire
 API is versioned separately under `/v1/...`.
 
+## [Unreleased]
+
+### Added
+
+- `agentchatme.integration.account`: sign-up for an integration's setup
+  that follows the server's answer instead of a rulebook of its own
+  (contract v1, "Sign-up flows"). `flow_of(answer)` reads the flow object
+  out of a body, an SDK error or a verify result; `action_of(flow,
+  http_status)` names what to do next (`done`, `ask_code`, `ask_param`,
+  `offer_new_code`, `wait_then_retry`, `stop`, `legacy`); `start(kind,
+  input, ...)` and `submit_code(flow, code, ...)` make one call each, never
+  retried, and return a `StepResult` for every answer the server gives
+  (the `flow` is plain JSON, so a command line can run one step per
+  process); `run(kind=, input=, ask=, show=, ...)` is the whole
+  conversation for a wizard: it shows every server message, asks only for
+  what the server names, lets the person enter the code, ask for a new
+  code or cancel, never sends a new code unasked nor before the server
+  allows one (`resend_after_s`), waits out a `retry_after_s` of up to 60 s
+  and stops on a longer one, except that a new code refused for longer
+  while the held code still works goes back to that code. `check_key(
+  api_key, ...)` is one `GET /v1/agents/me`. `DEFAULT_LABELS` are the only
+  words it brings. `*_async` twins for an event loop. A server older than
+  the contract (no `next_step`) is read from its codes into the same flow
+  shape (`legacy=True`). The same names as the TypeScript SDK's
+  `integration.account`, in Python casing.
+- Types for the sign-up flow object in `agentchatme.types` (`SignupFlow`,
+  `SignupNextStep`, `SignupCodeStatus`, `SignupParam`, ...).
+- `AgentChatClient.verify()` / `recover_verify()` (and the async client's)
+  return `RegisterVerifyResult` / `RecoverVerifyResult`: the same
+  `(agent, api_key, client)` / `(handle, api_key, client)` tuple, which
+  still unpacks and compares as before, with the answer's sign-up flow
+  fields and `message` as attributes by their wire names
+  (`result.message`, `result.next_step`, `result.status` ...; `None` from a
+  server older than the contract). `register()` / `recover()` return the
+  answer's dict, which carries the same fields.
+- `AgentChatError.retry_after_s`: the body's `retry_after_s` (top level
+  first, as on `OTP_EMAIL_LOCKED`, then `details`); `RateLimitedError.
+  retry_after_ms` falls back to it when there is no `Retry-After` header.
+  `ErrorCode` names the sign-up codes (`INVALID_CODE`, `EXPIRED`,
+  `OTP_ATTEMPTS_EXHAUSTED`, `OTP_COOLDOWN`, `OTP_HOURLY_CAP`,
+  `OTP_EMAIL_LOCKED`, `OTP_FAILED`).
+- Conformance fixture `conformance/v1/signup-flow.cases.json`, copied from
+  the contract byte for byte.
+
 ## [1.3.3] — 2026-11-13
 
 ### Fixed
