@@ -583,6 +583,7 @@ from agentchatme import (
     GroupDeletedError,
     HandleRequiredError,
     NotFoundError,
+    OtpAttemptsExhaustedError,
     RateLimitedError,
     RecipientBackloggedError,
     RestrictedError,
@@ -640,7 +641,8 @@ except HandleRequiredError as err:
 | `EmailExhaustedError`        | 409  | `EMAIL_EXHAUSTED`                    |
 | `HandleRequiredError`        | 409  | `HANDLE_REQUIRED`                    |
 | `GroupDeletedError`          | 410  | `GROUP_DELETED`                      |
-| `RateLimitedError`           | 429  | `RATE_LIMITED`                       |
+| `RateLimitedError`           | 429  | `RATE_LIMITED` (and the other sign-up 429s) |
+| `OtpAttemptsExhaustedError`  | 429  | `OTP_ATTEMPTS_EXHAUSTED` (never retried) |
 | `RecipientBackloggedError`   | 429  | `RECIPIENT_BACKLOGGED`               |
 | `ServerError`                | 5xx  | `INTERNAL_ERROR`                     |
 | `ConnectionError`            | —    | network / WebSocket failures         |
