@@ -379,9 +379,11 @@ def _legacy_flow(
     if error.status == 429:
         if error.code == "OTP_ATTEMPTS_EXHAUSTED":
             return start_flow(status="max_attempts_reached")
+        # A 429 that names no wait is a bare start step: stop.
         wait = _legacy_wait_seconds(error)
-        extra = {"retry_after_s": wait} if wait is not None else {}
-        return pending_again(**extra) if called == "verify" else start_flow(**extra)
+        if wait is None:
+            return start_flow()
+        return pending_again(retry_after_s=wait) if called == "verify" else start_flow(retry_after_s=wait)
     code = error.code
     if code in ("HANDLE_TAKEN", "INVALID_HANDLE", "HANDLE_REQUIRED"):
         return start_flow(param="handle")
