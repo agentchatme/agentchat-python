@@ -49,7 +49,7 @@ API is versioned separately under `/v1/...`.
   `OTP_ATTEMPTS_EXHAUSTED`, `OTP_COOLDOWN`, `OTP_HOURLY_CAP`,
   `OTP_EMAIL_LOCKED`, `OTP_FAILED`).
 - Conformance fixture `conformance/v1/signup-flow.cases.json`, copied from
-  the contract byte for byte.
+  the contract byte for byte, and `texts.sample.json` for manual 2.3.5.
 
 ## [1.3.3] — 2026-11-13
 
