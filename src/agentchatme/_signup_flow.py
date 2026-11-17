@@ -8,10 +8,28 @@ from collections.abc import Mapping
 from typing import Any, cast
 
 from .errors import AgentChatError
-from .types.signup import SignupFlow
+from .types.signup import SIGNUP_FLOW_VERSION, SignupFlow
 
-_FLOW_STR_FIELDS = ("status", "pending_id", "param", "expires_at")
-_FLOW_INT_FIELDS = (
+SIGNUP_FLOW_FIELDS = (
+    "version",
+    "flow",
+    "next_step",
+    "status",
+    "param",
+    "expires_at",
+    "expires_in_s",
+    "code_length",
+    "attempts",
+    "max_attempts",
+    "resend_after_s",
+    "retry_after_s",
+    "message",
+)
+"""The flow fields and ``message`` a 2xx sign-up body carries, by wire name
+(the keys the TypeScript SDK copies onto its results)."""
+
+_STR_FIELDS = ("status", "pending_id", "param", "expires_at")
+_INT_FIELDS = (
     "expires_in_s",
     "code_length",
     "attempts",
@@ -22,51 +40,58 @@ _FLOW_INT_FIELDS = (
 
 
 def whole_seconds(value: Any) -> int | None:
-    """A whole number of seconds >= 0, else ``None`` (``bool`` is not one)."""
-    if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
-        return value
-    return None
+    """A whole number >= 0 (``3`` or ``3.0``), else ``None`` (``bool`` is not one)."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    if isinstance(value, float) and not value.is_integer():
+        return None
+    return int(value) if value >= 0 else None
+
+
+def _text(value: Any) -> str | None:
+    return value if isinstance(value, str) and value else None
 
 
 def flow_of(answer: Any) -> SignupFlow | None:
-    """The flow object of a sign-up answer, or ``None`` when it has none.
+    """The flow object of a sign-up answer: of a 2xx body, of an error body
+    (its ``details``), of an :class:`~agentchatme.AgentChatError` the SDK
+    raised (its ``details``), or of a verify result
+    (:class:`~agentchatme.RegisterVerifyResult`). ``None`` when there is
+    none: a server older than the flow contract, or anything else.
 
-    ``answer`` is a 2xx body (a mapping), an error body, or an
-    :class:`~agentchatme.AgentChatError` the SDK raised. The flow is the
-    error's ``details``, or the body itself on a 2xx
-    (``body["details"] if body.get("code") else body``). Only the fields of
-    the contract are kept, and only well-typed ones; ``version``, ``flow``
-    and ``next_step`` must be there. Pure.
+    It is a flow only when it has a string ``next_step``. Pure; only the
+    contract's fields, each only when it has the contract's type (a
+    non-empty string, a whole number >= 0); ``version`` defaults to ``1``
+    and ``flow`` to ``""`` when absent.
     """
-    raw: Any
+    source: Any
     if isinstance(answer, AgentChatError):
-        raw = answer.details
+        source = answer.details
     elif isinstance(answer, Mapping):
         body = cast("Mapping[str, Any]", answer)
-        raw = body.get("details") if body.get("code") else body
+        source = body.get("details") if isinstance(body.get("code"), str) else body
     else:
+        source = getattr(answer, "_signup_fields", None)
+    if not isinstance(source, Mapping):
         return None
-    if not isinstance(raw, Mapping):
+    record = cast("Mapping[str, Any]", source)
+    next_step = _text(record.get("next_step"))
+    if next_step is None:
         return None
-    source = cast("Mapping[str, Any]", raw)
-    version = source.get("version")
-    kind = source.get("flow")
-    next_step = source.get("next_step")
-    if (
-        not isinstance(version, int)
-        or isinstance(version, bool)
-        or not isinstance(kind, str)
-        or not isinstance(next_step, str)
-        or not next_step
-    ):
-        return None
-    flow: dict[str, Any] = {"version": version, "flow": kind, "next_step": next_step}
-    for name in _FLOW_STR_FIELDS:
-        value = source.get(name)
-        if isinstance(value, str):
-            flow[name] = value
-    for name in _FLOW_INT_FIELDS:
-        number = whole_seconds(source.get(name))
+    version = record.get("version")
+    flow: dict[str, Any] = {
+        "version": version
+        if isinstance(version, (int, float)) and not isinstance(version, bool)
+        else SIGNUP_FLOW_VERSION,
+        "flow": _text(record.get("flow")) or "",
+        "next_step": next_step,
+    }
+    for name in _STR_FIELDS:
+        text = _text(record.get(name))
+        if text is not None:
+            flow[name] = text
+    for name in _INT_FIELDS:
+        number = whole_seconds(record.get(name))
         if number is not None:
             flow[name] = number
     return cast("SignupFlow", flow)

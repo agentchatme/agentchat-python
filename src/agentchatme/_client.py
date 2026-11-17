@@ -53,12 +53,11 @@ from ._resources import (
     TextsResource,
     WakeWebhookResource,
 )
-from ._signup_flow import flow_of
+from ._signup_flow import SIGNUP_FLOW_FIELDS
 from .errors import AgentChatError, NotFoundError
 from .types.conversation import AgentConversationContext, DirectConversationLookup
 from .types.inbox import INBOX_WAIT_MAX_MS
 from .types.message import SendableMessageType
-from .types.signup import SignupFlow
 
 DEFAULT_BASE_URL = "https://api.agentchat.me"
 
@@ -162,50 +161,75 @@ class SyncPage:
 _ClientT = TypeVar("_ClientT")
 
 
-def _flow_message(data: Any) -> str | None:
-    message = data.get("message") if isinstance(data, dict) else None
-    return message if isinstance(message, str) else None
+class _SignupFlowFields:
+    """The sign-up flow fields and ``message`` of a 2xx sign-up answer, as
+    attributes with their wire names, as sent (contract v1, "Sign-up
+    flows"). A server older than the contract sends none of them: each is
+    then ``None``. :func:`agentchatme.integration.account.flow_of` reads
+    them as a flow object."""
+
+    version: int | None
+    flow: str | None
+    """Which family of calls: ``register`` / ``recover``."""
+    next_step: str | None
+    """``done`` on a success."""
+    status: str | None
+    """``approved`` on a success."""
+    param: str | None
+    expires_at: str | None
+    expires_in_s: int | None
+    code_length: int | None
+    attempts: int | None
+    max_attempts: int | None
+    resend_after_s: int | None
+    retry_after_s: int | None
+    message: str | None
+    """The server's sentence, to show as is (``Email verified. Logged in as @handle.``)."""
+
+    def _set_signup_fields(self, data: Any) -> None:
+        body: dict[str, Any] = data if isinstance(data, dict) else {}
+        fields = {name: body[name] for name in SIGNUP_FLOW_FIELDS if body.get(name) is not None}
+        for name in SIGNUP_FLOW_FIELDS:
+            setattr(self, name, fields.get(name))
+        # Only the fields sent, for ``flow_of(result)``.
+        self._signup_fields = fields
 
 
-class RegisterVerifyResult(tuple[dict[str, Any], str, _ClientT], Generic[_ClientT]):
+class RegisterVerifyResult(
+    tuple[dict[str, Any], str, _ClientT], _SignupFlowFields, Generic[_ClientT]
+):
     """``(agent, api_key, client)`` from :meth:`AgentChatClient.verify`.
 
     Unpacks and compares like the 3-tuple it has always been. The answer's
-    sign-up flow fields (contract v1, "Sign-up flows") are attributes: a
-    server with the contract says ``next_step: "done"`` and a ``message`` to
-    show as is; an older one sends neither (both ``None``).
+    sign-up flow fields and ``message`` sit beside it as attributes with
+    their wire names (``result.message``, ``result.next_step``,
+    ``result.status`` ...); ``None`` from a server older than the contract.
     """
 
-    flow: SignupFlow | None
-    """The answer's flow object (:func:`agentchatme.integration.account.flow_of`)."""
-    message: str | None
-    """The server's sentence (``Email verified. Logged in as @handle.``)."""
+    _signup_fields: dict[str, Any]
 
     def __new__(
         cls, agent: dict[str, Any], api_key: str, client: _ClientT, *, data: Any = None
     ) -> RegisterVerifyResult[_ClientT]:
         self = super().__new__(cls, (agent, api_key, client))
-        self.flow = flow_of(data)
-        self.message = _flow_message(data)
+        self._set_signup_fields(data)
         return self
 
 
-class RecoverVerifyResult(tuple[str, str, _ClientT], Generic[_ClientT]):
+class RecoverVerifyResult(tuple[str, str, _ClientT], _SignupFlowFields, Generic[_ClientT]):
     """``(handle, api_key, client)`` from :meth:`AgentChatClient.recover_verify`.
 
-    Unpacks and compares like the 3-tuple it has always been; ``flow`` and
-    ``message`` as on :class:`RegisterVerifyResult`.
+    Unpacks and compares like the 3-tuple it has always been; the flow
+    fields and ``message`` as on :class:`RegisterVerifyResult`.
     """
 
-    flow: SignupFlow | None
-    message: str | None
+    _signup_fields: dict[str, Any]
 
     def __new__(
         cls, handle: str, api_key: str, client: _ClientT, *, data: Any = None
     ) -> RecoverVerifyResult[_ClientT]:
         self = super().__new__(cls, (handle, api_key, client))
-        self.flow = flow_of(data)
-        self.message = _flow_message(data)
+        self._set_signup_fields(data)
         return self
 
 
@@ -476,8 +500,9 @@ class AgentChatClient:
 
         **The API key is shown only once — store it securely.**
 
-        The result is a :class:`RegisterVerifyResult`: the same 3-tuple, plus
-        the answer's sign-up ``flow`` and ``message`` as attributes.
+        The result is a :class:`RegisterVerifyResult`: the same 3-tuple, with
+        the answer's sign-up flow fields and ``message`` as attributes
+        (``result.message``, ``result.next_step`` ...).
         """
         transport = HttpTransport(
             _static_options(base_url, client_identity, timeout_ms), client=http_client
@@ -557,8 +582,8 @@ class AgentChatClient:
         """Complete recovery. Returns ``(handle, api_key, client)``.
 
         **The new API key is shown only once — store it securely.** The
-        result is a :class:`RecoverVerifyResult`: the same 3-tuple, plus the
-        answer's sign-up ``flow`` and ``message`` as attributes.
+        result is a :class:`RecoverVerifyResult`: the same 3-tuple, with the
+        answer's sign-up flow fields and ``message`` as attributes.
 
         Raises :class:`~agentchatme.HandleRequiredError` when
         :meth:`recover` was called without ``handle`` for an email that
