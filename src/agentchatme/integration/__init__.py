@@ -10,7 +10,7 @@ Same names as the TypeScript kit (``import { integration } from
 
 from __future__ import annotations
 
-from . import anchor
+from . import account, anchor
 from ._files import rename_with_retry, write_atomic
 from .anchor import FoundBlock
 from .coalescer import (
@@ -131,6 +131,7 @@ __all__ = [
     "TurnTracker",
     "WakeCoalescer",
     "WakeSource",
+    "account",
     "anchor",
     "apply_invite_outcome",
     "apply_invite_outcome_async",

@@ -46,6 +46,16 @@ class ErrorCode:
     # 409 from ``POST /v1/agents/recover/verify`` when the email backs more
     # than one agent and recovery was started without a ``handle``.
     HANDLE_REQUIRED = "HANDLE_REQUIRED"
+    # The sign-up code (register, recover, rotate key). Since the sign-up
+    # flow contract the answer also says the next step
+    # (``agentchatme.integration.account.flow_of``).
+    INVALID_CODE = "INVALID_CODE"
+    EXPIRED = "EXPIRED"
+    OTP_ATTEMPTS_EXHAUSTED = "OTP_ATTEMPTS_EXHAUSTED"
+    OTP_COOLDOWN = "OTP_COOLDOWN"
+    OTP_HOURLY_CAP = "OTP_HOURLY_CAP"
+    OTP_EMAIL_LOCKED = "OTP_EMAIL_LOCKED"
+    OTP_FAILED = "OTP_FAILED"
     SUSPENDED = "SUSPENDED"
     RESTRICTED = "RESTRICTED"
     CONVERSATION_NOT_FOUND = "CONVERSATION_NOT_FOUND"
@@ -77,6 +87,29 @@ class AgentChatErrorResponse(dict):  # type: ignore[type-arg]
     code: str
     message: str
     details: Mapping[str, Any] | None
+    retry_after_s: int
+    """Seconds to wait, at the top level of some 429 bodies
+    (``OTP_EMAIL_LOCKED``). Sign-up 429s also carry it in ``details``."""
+
+
+def _whole_seconds(value: Any) -> int | None:
+    """A whole number of seconds >= 0, else ``None`` (``bool`` is not one)."""
+    if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+        return value
+    return None
+
+
+def _retry_after_seconds(response: Mapping[str, Any]) -> int | None:
+    """The body's ``retry_after_s``: the top-level field (``OTP_EMAIL_LOCKED``)
+    first, else ``details.retry_after_s`` (every sign-up 429, and the per-IP
+    limit)."""
+    top = _whole_seconds(response.get("retry_after_s"))
+    if top is not None:
+        return top
+    details = response.get("details")
+    if isinstance(details, Mapping):
+        return _whole_seconds(cast("Mapping[str, Any]", details).get("retry_after_s"))
+    return None
 
 
 class AgentChatError(Exception):
@@ -95,6 +128,11 @@ class AgentChatError(Exception):
         The server's ``x-request-id`` for the failing request, if present.
         Include it in support / bug reports to let the operator pull the
         server-side trace in seconds.
+    retry_after_s:
+        The body's ``retry_after_s`` in seconds (the top-level field, else
+        ``details.retry_after_s``), or ``None``. The sign-up 429s carry it;
+        so does the per-IP rate limit. :attr:`RateLimitedError.retry_after_ms`
+        prefers the ``Retry-After`` header.
     """
 
     def __init__(
@@ -112,13 +150,16 @@ class AgentChatError(Exception):
             details if isinstance(details, Mapping) else None
         )
         self.request_id: str | None = request_id
+        self.retry_after_s: int | None = _retry_after_seconds(response)
 
 
 class RateLimitedError(AgentChatError):
     """Raised on HTTP 429.
 
     ``retry_after_ms`` prefers the ``Retry-After`` response header; falls
-    back to ``details["retry_after_ms"]`` if present; otherwise ``None``.
+    back to ``details["retry_after_ms"]``, then to the body's
+    ``retry_after_s`` (:attr:`~AgentChatError.retry_after_s`); otherwise
+    ``None``.
     """
 
     def __init__(
@@ -129,6 +170,8 @@ class RateLimitedError(AgentChatError):
         request_id: str | None = None,
     ) -> None:
         super().__init__(response, status, request_id)
+        if retry_after_ms is None and self.retry_after_s is not None:
+            retry_after_ms = self.retry_after_s * 1000
         self.retry_after_ms: int | None = retry_after_ms
 
 

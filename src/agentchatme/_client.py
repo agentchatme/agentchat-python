@@ -15,8 +15,10 @@ from dataclasses import dataclass, replace
 from typing import (
     Any,
     Callable,
+    Generic,
     Literal,
     TypedDict,
+    TypeVar,
 )
 
 import httpx
@@ -51,10 +53,12 @@ from ._resources import (
     TextsResource,
     WakeWebhookResource,
 )
+from ._signup_flow import flow_of
 from .errors import AgentChatError, NotFoundError
 from .types.conversation import AgentConversationContext, DirectConversationLookup
 from .types.inbox import INBOX_WAIT_MAX_MS
 from .types.message import SendableMessageType
+from .types.signup import SignupFlow
 
 DEFAULT_BASE_URL = "https://api.agentchat.me"
 
@@ -153,6 +157,56 @@ class SyncPage:
     on an empty plain read; else ``None``."""
     request_id: str | None
     headers: httpx.Headers
+
+
+_ClientT = TypeVar("_ClientT")
+
+
+def _flow_message(data: Any) -> str | None:
+    message = data.get("message") if isinstance(data, dict) else None
+    return message if isinstance(message, str) else None
+
+
+class RegisterVerifyResult(tuple[dict[str, Any], str, _ClientT], Generic[_ClientT]):
+    """``(agent, api_key, client)`` from :meth:`AgentChatClient.verify`.
+
+    Unpacks and compares like the 3-tuple it has always been. The answer's
+    sign-up flow fields (contract v1, "Sign-up flows") are attributes: a
+    server with the contract says ``next_step: "done"`` and a ``message`` to
+    show as is; an older one sends neither (both ``None``).
+    """
+
+    flow: SignupFlow | None
+    """The answer's flow object (:func:`agentchatme.integration.account.flow_of`)."""
+    message: str | None
+    """The server's sentence (``Email verified. Logged in as @handle.``)."""
+
+    def __new__(
+        cls, agent: dict[str, Any], api_key: str, client: _ClientT, *, data: Any = None
+    ) -> RegisterVerifyResult[_ClientT]:
+        self = super().__new__(cls, (agent, api_key, client))
+        self.flow = flow_of(data)
+        self.message = _flow_message(data)
+        return self
+
+
+class RecoverVerifyResult(tuple[str, str, _ClientT], Generic[_ClientT]):
+    """``(handle, api_key, client)`` from :meth:`AgentChatClient.recover_verify`.
+
+    Unpacks and compares like the 3-tuple it has always been; ``flow`` and
+    ``message`` as on :class:`RegisterVerifyResult`.
+    """
+
+    flow: SignupFlow | None
+    message: str | None
+
+    def __new__(
+        cls, handle: str, api_key: str, client: _ClientT, *, data: Any = None
+    ) -> RecoverVerifyResult[_ClientT]:
+        self = super().__new__(cls, (handle, api_key, client))
+        self.flow = flow_of(data)
+        self.message = _flow_message(data)
+        return self
 
 
 @dataclass
@@ -386,6 +440,13 @@ class AgentChatClient:
         for :meth:`verify`, :meth:`recover` and :meth:`recover_verify`; the
         client those two return uses them too). A given ``http_client`` is
         never closed here.
+
+        A server with the sign-up flow contract adds the flow fields to the
+        answer (``next_step: "verify"``, ``status``, ``expires_in_s``,
+        ``attempts``, ``resend_after_s`` ...) and a ``message`` to show as
+        is; errors carry them in ``details``. ``flow_of(answer)`` in
+        :mod:`agentchatme.integration.account` reads them, and that module's
+        ``run`` / ``start`` follow them for a setup wizard.
         """
         transport = HttpTransport(
             _static_options(base_url, client_identity, timeout_ms), client=http_client
@@ -410,10 +471,13 @@ class AgentChatClient:
         client_identity: AgentChatClientIdentity | None = None,
         timeout_ms: int | None = None,
         http_client: httpx.Client | None = None,
-    ) -> tuple[dict[str, Any], str, AgentChatClient]:
+    ) -> RegisterVerifyResult[AgentChatClient]:
         """Complete registration. Returns ``(agent, api_key, client)``.
 
         **The API key is shown only once — store it securely.**
+
+        The result is a :class:`RegisterVerifyResult`: the same 3-tuple, plus
+        the answer's sign-up ``flow`` and ``message`` as attributes.
         """
         transport = HttpTransport(
             _static_options(base_url, client_identity, timeout_ms), client=http_client
@@ -430,12 +494,13 @@ class AgentChatClient:
         data = res.data
         api_key = str(data["api_key"])
         agent = data.get("agent") or {}
-        return agent, api_key, AgentChatClient(
+        client = AgentChatClient(
             api_key=api_key,
             base_url=base_url,
             client_identity=client_identity,
             **_client_kwargs(timeout_ms, http_client),
         )
+        return RegisterVerifyResult(agent, api_key, client, data=data)
 
     @staticmethod
     def recover(
@@ -462,6 +527,8 @@ class AgentChatClient:
         Always returns ``{"pending_id": ..., "message": ...}`` — a missing
         or mismatched account is masked to prevent email-existence
         enumeration, so a successful return is not proof the pair exists.
+        A server with the sign-up flow contract adds the flow fields
+        (``next_step: "recover_verify"`` ...), as on :meth:`register`.
         """
         transport = HttpTransport(
             _static_options(base_url, client_identity, timeout_ms), client=http_client
@@ -486,10 +553,12 @@ class AgentChatClient:
         client_identity: AgentChatClientIdentity | None = None,
         timeout_ms: int | None = None,
         http_client: httpx.Client | None = None,
-    ) -> tuple[str, str, AgentChatClient]:
+    ) -> RecoverVerifyResult[AgentChatClient]:
         """Complete recovery. Returns ``(handle, api_key, client)``.
 
-        **The new API key is shown only once — store it securely.**
+        **The new API key is shown only once — store it securely.** The
+        result is a :class:`RecoverVerifyResult`: the same 3-tuple, plus the
+        answer's sign-up ``flow`` and ``message`` as attributes.
 
         Raises :class:`~agentchatme.HandleRequiredError` when
         :meth:`recover` was called without ``handle`` for an email that
@@ -509,12 +578,13 @@ class AgentChatClient:
         finally:
             transport.close()
         data = res.data
-        return str(data["handle"]), str(data["api_key"]), AgentChatClient(
+        client = AgentChatClient(
             api_key=str(data["api_key"]),
             base_url=base_url,
             client_identity=client_identity,
             **_client_kwargs(timeout_ms, http_client),
         )
+        return RecoverVerifyResult(str(data["handle"]), str(data["api_key"]), client, data=data)
 
     # ─── Request helpers ──────────────────────────────────────────────────────
 
@@ -1318,7 +1388,7 @@ class AsyncAgentChatClient:
         client_identity: AgentChatClientIdentity | None = None,
         timeout_ms: int | None = None,
         http_client: httpx.AsyncClient | None = None,
-    ) -> tuple[dict[str, Any], str, AsyncAgentChatClient]:
+    ) -> RegisterVerifyResult[AsyncAgentChatClient]:
         async with AsyncHttpTransport(
             _static_options(base_url, client_identity, timeout_ms), client=http_client
         ) as transport:
@@ -1330,16 +1400,13 @@ class AsyncAgentChatClient:
             )
         data = res.data
         api_key = str(data["api_key"])
-        return (
-            data.get("agent") or {},
-            api_key,
-            AsyncAgentChatClient(
-                api_key=api_key,
-                base_url=base_url,
-                client_identity=client_identity,
-                **_client_kwargs(timeout_ms, http_client),
-            ),
+        client = AsyncAgentChatClient(
+            api_key=api_key,
+            base_url=base_url,
+            client_identity=client_identity,
+            **_client_kwargs(timeout_ms, http_client),
         )
+        return RegisterVerifyResult(data.get("agent") or {}, api_key, client, data=data)
 
     @staticmethod
     async def recover(
@@ -1377,7 +1444,7 @@ class AsyncAgentChatClient:
         client_identity: AgentChatClientIdentity | None = None,
         timeout_ms: int | None = None,
         http_client: httpx.AsyncClient | None = None,
-    ) -> tuple[str, str, AsyncAgentChatClient]:
+    ) -> RecoverVerifyResult[AsyncAgentChatClient]:
         """Async counterpart of :meth:`AgentChatClient.recover_verify`.
 
         Raises :class:`~agentchatme.HandleRequiredError` when the email
@@ -1393,16 +1460,13 @@ class AsyncAgentChatClient:
                 retry="never",
             )
         data = res.data
-        return (
-            str(data["handle"]),
-            str(data["api_key"]),
-            AsyncAgentChatClient(
-                api_key=str(data["api_key"]),
-                base_url=base_url,
-                client_identity=client_identity,
-                **_client_kwargs(timeout_ms, http_client),
-            ),
+        client = AsyncAgentChatClient(
+            api_key=str(data["api_key"]),
+            base_url=base_url,
+            client_identity=client_identity,
+            **_client_kwargs(timeout_ms, http_client),
         )
+        return RecoverVerifyResult(str(data["handle"]), str(data["api_key"]), client, data=data)
 
     # ─── Request helpers ──────────────────────────────────────────────────────
 

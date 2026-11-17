@@ -22,6 +22,8 @@ from ._call import CallOptions
 from ._client import (
     AgentChatClient,
     AsyncAgentChatClient,
+    RecoverVerifyResult,
+    RegisterVerifyResult,
     SyncPage,
     SyncRow,
     last_sync_delivery_id,
@@ -139,6 +141,8 @@ __all__ = [
     "RealtimeOptions",
     "RealtimeState",
     "RecipientBackloggedError",
+    "RecoverVerifyResult",
+    "RegisterVerifyResult",
     "RequestHooks",
     "RequestInfo",
     "ResponseInfo",

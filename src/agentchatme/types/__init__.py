@@ -106,6 +106,16 @@ from .presence import (
     PresenceStatus,
     PresenceUpdate,
 )
+from .signup import (
+    SIGNUP_FLOW_VERSION,
+    SignupCodeStatus,
+    SignupFlow,
+    SignupFlowKind,
+    SignupNextStep,
+    SignupParam,
+    SignupStartStep,
+    SignupVerifyStep,
+)
 from .texts import Texts, TextsManual, TextsRuntime
 from .wake_webhook import (
     ClearWakeWebhookResult,
@@ -139,6 +149,8 @@ __all__ = [
     "INBOX_TRAY_MAX_LIMIT",
     "INBOX_WAIT_MAX_MS",
     "MAX_ATTACHMENT_SIZE",
+    # signup
+    "SIGNUP_FLOW_VERSION",
     # ws
     "AckFrame",
     # contact
@@ -226,6 +238,13 @@ __all__ = [
     "SendMessageRequest",
     "SendableMessageType",
     "ServerEvent",
+    "SignupCodeStatus",
+    "SignupFlow",
+    "SignupFlowKind",
+    "SignupNextStep",
+    "SignupParam",
+    "SignupStartStep",
+    "SignupVerifyStep",
     "SocketCapability",
     "TestWakeResult",
     # texts
