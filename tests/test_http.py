@@ -380,3 +380,57 @@ def test_surfaces_request_id_on_error_instances() -> None:
             http.request("GET", "/ping")
         assert exc_info.value.request_id == "req_xyz"
         http.close()
+
+
+def test_a_429_asking_for_longer_than_one_retry_may_wait_is_not_retried() -> None:
+    # Sleeping the cap and asking again before the server's time is up only
+    # fails again: fail fast.
+    with respx.mock(base_url="https://api.test") as mock:
+        route = mock.get("/ping").mock(
+            return_value=httpx.Response(
+                429, json={"code": "RATE_LIMITED", "message": "slow down"}, headers={"Retry-After": "120"}
+            )
+        )
+        http = _make(retry=RetryPolicy(max_retries=3, base_delay_ms=1, max_delay_ms=8_000))
+        with pytest.raises(RateLimitedError) as exc_info:
+            http.request("GET", "/ping")
+        assert route.call_count == 1
+        assert exc_info.value.retry_after_ms == 120_000
+        http.close()
+
+
+def test_a_429_within_the_cap_is_still_retried() -> None:
+    with respx.mock(base_url="https://api.test") as mock:
+        route = mock.get("/ping").mock(
+            side_effect=[
+                httpx.Response(429, json={"code": "RATE_LIMITED", "message": "slow down"}, headers={"Retry-After": "0"}),
+                httpx.Response(200, json={"ok": True}),
+            ]
+        )
+        http = _make(retry=RetryPolicy(max_retries=2, base_delay_ms=1, max_delay_ms=8_000))
+        assert http.request("GET", "/ping").data == {"ok": True}
+        assert route.call_count == 2
+        http.close()
+
+
+def test_otp_attempts_exhausted_is_not_rate_limited_and_never_retried() -> None:
+    from agentchatme import OtpAttemptsExhaustedError
+
+    with respx.mock(base_url="https://api.test") as mock:
+        route = mock.post("/v1/register/verify").mock(
+            return_value=httpx.Response(
+                429,
+                json={
+                    "code": "OTP_ATTEMPTS_EXHAUSTED",
+                    "message": "You entered the wrong code too many times. Request a new code.",
+                    "details": {"version": 1, "flow": "register", "next_step": "register", "resend_after_s": 30},
+                },
+            )
+        )
+        http = _make(retry=RetryPolicy(max_retries=3, base_delay_ms=1, max_delay_ms=8))
+        with pytest.raises(OtpAttemptsExhaustedError) as exc_info:
+            http.request("POST", "/v1/register/verify", body={"pending_id": "p", "code": "1"}, retry="auto")
+        assert not isinstance(exc_info.value, RateLimitedError)
+        assert exc_info.value.details is not None and exc_info.value.details["resend_after_s"] == 30
+        assert route.call_count == 1
+        http.close()

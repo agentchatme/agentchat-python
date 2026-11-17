@@ -31,6 +31,7 @@ from ._runtime import default_user_agent
 from .errors import (
     AgentChatError,
     ConnectionError,
+    OtpAttemptsExhaustedError,
     create_agentchat_error,
 )
 
@@ -192,6 +193,19 @@ def _compute_delay_ms(
     capped = min(exp, policy.max_delay_ms)
     jitter = 1 - 0.25 + random.random() * 0.5  # ±25%
     return max(0, int(capped * jitter))
+
+
+def _worth_retrying(
+    status: int, retry_after_ms: int | None, policy: RetryPolicy, error: AgentChatError
+) -> bool:
+    """A retriable status, except a 429 that asks for longer than one retry
+    may wait (``max_delay_ms``): sleeping the cap and asking again before
+    the server's time is up only fails again, so it fails fast instead.
+    ``OTP_ATTEMPTS_EXHAUSTED`` is not retried either: repeating it never
+    succeeds."""
+    if status not in _RETRIABLE_STATUSES or isinstance(error, OtpAttemptsExhaustedError):
+        return False
+    return not (status == 429 and retry_after_ms is not None and retry_after_ms > policy.max_delay_ms)
 
 
 def _build_headers_and_body(
@@ -502,13 +516,13 @@ class HttpTransport:
                 ),
             )
 
+            retry_after = parse_retry_after(response.headers.get("retry-after"))
             retriable = (
                 can_retry
                 and attempt < max_attempts
-                and response.status_code in _RETRIABLE_STATUSES
+                and _worth_retrying(response.status_code, retry_after, policy, error)
             )
             if retriable:
-                retry_after = parse_retry_after(response.headers.get("retry-after"))
                 delay_ms = _compute_delay_ms(policy, attempt, retry_after)
                 _safe_invoke_sync(
                     opts.hooks.on_retry,
@@ -686,13 +700,13 @@ class AsyncHttpTransport:
                 ),
             )
 
+            retry_after = parse_retry_after(response.headers.get("retry-after"))
             retriable = (
                 can_retry
                 and attempt < max_attempts
-                and response.status_code in _RETRIABLE_STATUSES
+                and _worth_retrying(response.status_code, retry_after, policy, error)
             )
             if retriable:
-                retry_after = parse_retry_after(response.headers.get("retry-after"))
                 delay_ms = _compute_delay_ms(policy, attempt, retry_after)
                 await _safe_invoke_async(
                     opts.hooks.on_retry,
