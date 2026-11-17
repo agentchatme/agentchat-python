@@ -9,6 +9,8 @@ API is versioned separately under `/v1/...`.
 
 ## [Unreleased]
 
+## [1.4.0] — 2026-11-17
+
 ### Added
 
 - `agentchatme.integration.account`: sign-up for an integration's setup
