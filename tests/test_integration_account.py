@@ -428,6 +428,16 @@ def test_the_held_code_keeps_its_expiry_through_an_answer_that_does_not_repeat_i
     assert server.bodies()[3] == {"pending_id": "pnd_1", "code": "123456"}
 
 
+def test_the_held_code_expiry_counts_expires_in_s_from_receipt_not_the_wall_clock(clock: Clock) -> None:
+    # This machine's clock is an hour fast: expires_at already looks past,
+    # expires_in_s from the answer's receipt says the code still works.
+    clock.wall_start += 3600
+    server = Server([sent("register", "pnd_1", resend_after_s=0), hourly_cap(), registered()])
+    person = Person([NEW_CODE, value("123456")], clock=clock)
+    assert run_with(server, person).outcome == "done"
+    assert server.bodies()[2] == {"pending_id": "pnd_1", "code": "123456"}
+
+
 def test_a_held_code_with_no_known_expiry_stops(clock: Clock) -> None:
     server = Server(
         [
@@ -439,7 +449,7 @@ def test_a_held_code_with_no_known_expiry_stops(clock: Clock) -> None:
     assert (result.outcome, result.code) == ("stopped", "OTP_HOURLY_CAP")
 
 
-def test_another_code_refused_for_long_still_stops(clock: Clock) -> None:
+def test_any_429_refusing_a_new_code_goes_back_to_the_held_code(clock: Clock) -> None:
     server = Server(
         [
             sent("register", "pnd_1", resend_after_s=0),
@@ -449,9 +459,27 @@ def test_another_code_refused_for_long_still_stops(clock: Clock) -> None:
                 "Too many attempts. Try again in 25 minutes.",
                 {"flow": "register", "next_step": "register", "retry_after_s": 1500},
             ),
+            registered(),
         ]
     )
-    result = run_with(server, Person([NEW_CODE], clock=clock))
+    person = Person([NEW_CODE, value("123456")], clock=clock)
+    assert run_with(server, person).outcome == "done"
+    assert person.shown[1] == "Too many attempts. Try again in 25 minutes."
+    assert server.bodies()[2] == {"pending_id": "pnd_1", "code": "123456"}
+
+
+def test_a_long_refusal_of_the_first_start_still_stops(clock: Clock) -> None:
+    server = Server(
+        [
+            error(
+                429,
+                "RATE_LIMITED",
+                "Too many attempts. Try again in 25 minutes.",
+                {"flow": "register", "next_step": "register", "retry_after_s": 1500},
+            )
+        ]
+    )
+    result = run_with(server, Person([], clock=clock))
     assert (result.outcome, result.code) == ("stopped", "RATE_LIMITED")
 
 
@@ -641,10 +669,12 @@ def test_the_last_wrong_code_asks_before_a_new_code_and_never_resends_unasked(cl
     assert len(server.seen) == 2
 
 
-def test_a_yes_to_a_new_code_first_waits_out_retry_after_s(clock: Clock) -> None:
+def test_a_yes_to_a_new_code_first_waits_out_the_resend_window(clock: Clock) -> None:
+    # The last wrong code: no retry_after_s (repeating it never succeeds),
+    # resend_after_s says when a new code may be requested.
     server = Server(
         [
-            sent("recover"),
+            sent("recover", resend_after_s=0),
             error(
                 429,
                 "OTP_ATTEMPTS_EXHAUSTED",
@@ -655,19 +685,120 @@ def test_a_yes_to_a_new_code_first_waits_out_retry_after_s(clock: Clock) -> None
                     "status": "max_attempts_reached",
                     "attempts": 5,
                     "max_attempts": 5,
-                    "retry_after_s": 30,
+                    "resend_after_s": 30,
                 },
-                {"Retry-After": "30"},
             ),
             sent("recover", "pnd_2"),
             recovered(),
         ]
     )
-    person = Person([value("999999"), NEW_CODE, value("123456")])
+    person = Person([value("999999"), NEW_CODE, value("123456")], clock=clock)
     result = run_with(server, person, kind="recover", input={"email": "a@example.com", "handle": "alice"})
     assert result.outcome == "done"
     assert person.slept == [30.0]
     assert server.paths()[2] == "/v1/agents/recover"
+
+
+def test_a_yes_to_a_new_code_waits_out_retry_after_s(clock: Clock) -> None:
+    server = Server(
+        [
+            sent(resend_after_s=0),
+            error(
+                400,
+                "EXPIRED",
+                "That code has expired. Request a new code.",
+                {"flow": "register", "next_step": "register", "status": "expired", "retry_after_s": 20},
+            ),
+            sent("register", "pnd_2"),
+            registered(),
+        ]
+    )
+    person = Person([value("123456"), NEW_CODE, value("222222")], clock=clock)
+    assert run_with(server, person).outcome == "done"
+    assert person.slept == [20.0]
+
+
+def test_a_start_after_a_send_waits_out_the_resend_window(clock: Clock) -> None:
+    # HANDLE_REQUIRED after the code: recovering again with the chosen handle
+    # is a new send, inside the minute of the one before.
+    server = Server(
+        [
+            sent("recover", "pnd_1", "If an agent is registered with a@example.com, we sent a 6-digit code there."),
+            error(
+                409,
+                "HANDLE_REQUIRED",
+                "More than one agent uses this email address. Choose the handle to recover.",
+                {"handles": ["alice", "alice-2"], "flow": "recover", "next_step": "recover", "param": "handle"},
+            ),
+            sent("recover", "pnd_2"),
+            recovered("alice-2"),
+        ]
+    )
+    person = Person([value("123456"), value("alice-2"), value("654321")], clock=clock, think_s=10)
+    result = run_with(server, person, kind="recover", input={"email": "a@example.com"})
+    assert result.outcome == "done"
+    assert person.slept == [40.0]  # 60 s from the first send, 20 s of answering spent
+
+
+def test_automatic_waits_are_at_least_one_second(clock: Clock) -> None:
+    server = Server([cooldown(0), sent(), registered()])
+    person = Person([value("123456")], clock=clock)
+    assert run_with(server, person).outcome == "done"
+    assert person.slept == [1.0]
+
+
+def test_after_three_automatic_waits_in_a_row_the_person_is_asked(clock: Clock) -> None:
+    server = Server([cooldown(5), cooldown(5), cooldown(5), cooldown(5)])
+    person = Person([CANCEL], clock=clock)
+    assert run_with(server, person) == account.RunResult(outcome="cancelled")
+    assert person.slept == [5.0, 5.0, 5.0]
+    assert [q.field for q in person.asked] == ["new_code"]
+    assert len(server.seen) == 4
+
+
+def test_after_three_automatic_waits_a_yes_waits_and_sends_again(clock: Clock) -> None:
+    server = Server([cooldown(5), cooldown(5), cooldown(5), cooldown(5), sent(), registered()])
+    person = Person([NEW_CODE, value("123456")], clock=clock)
+    assert run_with(server, person).outcome == "done"
+    assert person.slept == [5.0, 5.0, 5.0, 5.0]
+
+
+def test_after_three_automatic_waits_on_a_code_the_code_is_asked_again(clock: Clock) -> None:
+    limited = error(
+        429,
+        "RATE_LIMITED",
+        "Too many attempts. Try again in 30 seconds.",
+        {"flow": "register", "next_step": "verify", "retry_after_s": 30},
+        {"Retry-After": "30"},
+    )
+    server = Server([sent(), limited, limited, limited, limited, registered()])
+    person = Person([value("123456"), value("654321")], clock=clock)
+    assert run_with(server, person).outcome == "done"
+    assert [q.field for q in person.asked] == ["code", "code"]
+    assert person.asked[1].answers == ("value", "new_code", "cancel")
+    held = person.asked[1].flow
+    assert held is not None and held.get("pending_id") == "pnd_1"
+    assert person.slept == [30.0, 30.0, 30.0]
+    assert server.bodies()[-1] == {"pending_id": "pnd_1", "code": "654321"}
+
+
+def test_a_new_email_has_its_own_resend_window(clock: Clock) -> None:
+    server = Server(
+        [
+            sent(),
+            error(
+                409,
+                "EMAIL_LIMIT_REACHED",
+                "This email address already has 10 active agents, the most allowed. Use a different email address.",
+                {"limit": 10, "flow": "register", "next_step": "register", "param": "email"},
+            ),
+            sent(),
+            registered(),
+        ]
+    )
+    person = Person([value("123456"), value("b@example.com"), value("123456")], clock=clock)
+    assert run_with(server, person).outcome == "done"
+    assert person.slept == []
 
 
 def test_a_per_ip_429_on_a_code_waits_and_submits_the_same_code_again(clock: Clock) -> None:
@@ -698,7 +829,7 @@ def test_a_wait_that_points_to_the_start_step_after_a_code_asks_first(clock: Clo
     # it would send a new code nobody asked for.
     server = Server(
         [
-            sent(),
+            sent(resend_after_s=0),
             error(
                 429,
                 "RATE_LIMITED",
@@ -977,13 +1108,16 @@ def test_legacy_email_lock_long_stops(clock: Clock) -> None:
     assert (result.outcome, result.code) == ("stopped", "OTP_EMAIL_LOCKED")
 
 
-def test_legacy_429_with_no_wait_named_stops_on_a_start_or_a_code(clock: Clock) -> None:
+def test_legacy_429_with_no_wait_named_stops_on_a_start_and_offers_a_new_code_on_a_code(clock: Clock) -> None:
     server = Server([respond(429, {"code": "RATE_LIMITED", "message": "Too many requests"})])
     result = run_with(server, Person([]))
     assert (result.outcome, result.code) == ("stopped", "RATE_LIMITED")
+    # On a code it names the start step: the call was a code, so the person
+    # is asked before a new one (never a silent resend).
     on_code = Server([legacy_sent(), respond(429, {"code": "RATE_LIMITED", "message": "Too many requests"})])
-    result = run_with(on_code, Person([value("123456")]))
-    assert (result.outcome, result.code) == ("stopped", "RATE_LIMITED")
+    person = Person([value("123456"), CANCEL])
+    assert run_with(on_code, person) == account.RunResult(outcome="cancelled")
+    assert [q.field for q in person.asked] == ["code", "new_code"]
 
 
 def test_legacy_email_exhausted_re_asks_the_email(clock: Clock) -> None:
@@ -1239,7 +1373,9 @@ def test_flow_of_reads_an_sdk_errors_details() -> None:
         httpx.Headers({"Retry-After": "42"}),
     )
     assert account.flow_of(err) == {"version": 1, "flow": "register", "next_step": "register", "retry_after_s": 42}
-    assert account.action_of(account.flow_of(err), 429) == "wait_then_retry"
+    assert account.action_of(account.flow_of(err), 429, "register") == "wait_then_retry"
+    # The same wait after a code would send a code nobody asked for: ask first.
+    assert account.action_of(account.flow_of(err), 429, "verify") == "offer_new_code"
 
 
 def test_flow_of_none_without_a_next_step_unknown_fields_dropped() -> None:
@@ -1261,13 +1397,13 @@ def test_flow_of_none_without_a_next_step_unknown_fields_dropped() -> None:
         }
     )
     assert flow == {"version": 1, "flow": "register", "next_step": "verify", "pending_id": "pnd_1", "expires_in_s": 600}
-    assert account.action_of(None, 200) == "legacy"
+    assert account.action_of(None, 200, "register") == "legacy"
 
 
 def test_a_5xx_stops_even_on_a_verify_step() -> None:
     flow: Any = {"version": 1, "flow": "register", "next_step": "verify", "pending_id": "pnd_1"}
-    assert account.action_of(flow, 503) == "stop"
-    assert account.action_of(flow, 400) == "ask_code"
+    assert account.action_of(flow, 503, "verify") == "stop"
+    assert account.action_of(flow, 400, "verify") == "ask_code"
 
 
 # ─────────────── the client's static sign-up calls: flow fields (additive) ───────────────

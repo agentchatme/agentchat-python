@@ -76,6 +76,7 @@ from .errors import (
     GroupDeletedError,
     HandleRequiredError,
     NotFoundError,
+    OtpAttemptsExhaustedError,
     RateLimitedError,
     RecipientBackloggedError,
     RestrictedError,
@@ -135,6 +136,7 @@ __all__ = [
     "HttpTransportOptions",
     "MessageHandler",
     "NotFoundError",
+    "OtpAttemptsExhaustedError",
     "RateLimitedError",
     # Realtime
     "RealtimeClient",

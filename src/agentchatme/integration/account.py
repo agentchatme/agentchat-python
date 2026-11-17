@@ -10,8 +10,8 @@ is. The integration asks the person, shows the message, and saves the key;
 the rules stay on the server.
 
 - ``flow_of(answer)``: the flow object of a body or SDK error, or ``None``.
-- ``action_of(flow, http_status)``: what the client does next (the
-  conformance vocabulary).
+- ``action_of(flow, http_status, called_step)``: what the client does next
+  (the conformance vocabulary).
 - ``start(kind, input, ...)``: one start call (sends a code).
 - ``submit_code(flow, code, ...)``: one verify call.
 - ``run(kind=, input=, ask=, show=, ...)``: the whole conversation, for a wizard.
@@ -73,20 +73,21 @@ SignupAction = Literal[
     "legacy",
 ]
 """What the client does next, derived only from ``next_step``, ``status``,
-``param``, ``retry_after_s`` and the HTTP status (conformance
-``signup-flow.cases.json``):
+``param``, ``retry_after_s``, the HTTP status and the step that was called
+(conformance ``signup-flow.cases.json``; :func:`action_of` has the order):
 
 - ``done``: ``next_step: "done"`` (the key is in the body).
 - ``ask_code``: a verify step, no ``retry_after_s``.
 - ``ask_param``: a start step with ``param``: re-ask that field, call the
   start step again.
-- ``offer_new_code``: a start step, no ``param``, ``status`` ``expired`` /
-  ``max_attempts_reached``: ask before sending a new code (wait
+- ``offer_new_code``: a start step, no ``param``, the code is gone
+  (``status`` ``expired`` / ``max_attempts_reached``, or the call was a
+  code), no wait over 60 s: ask before sending a new code (wait
   ``retry_after_s`` first when set).
-- ``wait_then_retry``: 429 with ``retry_after_s`` <= 60: wait, then repeat
-  ``next_step``.
-- ``stop``: 429 with ``retry_after_s`` > 60, a 5xx, an unknown
-  ``next_step``, anything else: show ``message``, end.
+- ``wait_then_retry``: 429 with ``retry_after_s`` <= 60 naming the step
+  that was called: wait, then repeat it.
+- ``stop``: a longer wait, a 5xx, an unknown ``next_step``, anything else:
+  show ``message``, end.
 - ``legacy``: no flow object (a server older than the flow contract).
 """
 
@@ -179,6 +180,9 @@ class StepResult:
     """What to do next. Never ``legacy``: a legacy answer is read into a flow first."""
     http_status: int
     """HTTP status of the answer."""
+    called_step: str
+    """The step that was called (``register``, ``verify``, ``recover``,
+    ``recover_verify``): :func:`action_of` reads it."""
     legacy: bool
     """True when the server sent no flow object and the answer was read from its code."""
     code: str | None = None
@@ -226,13 +230,25 @@ _VERIFY_STEPS = frozenset({"verify", "recover_verify", "rotate_key_verify"})
 _KNOWN_STEPS = _START_STEPS | _VERIFY_STEPS | {"done"}
 
 
-def action_of(flow: SignupFlow | None, http_status: int) -> SignupAction:
+def action_of(flow: SignupFlow | None, http_status: int, called_step: str) -> SignupAction:
     """What the client does next (the table on :data:`SignupAction`), from
-    the flow object and the answer's HTTP status. Pure. Order: an unknown
-    step stops; ``done``; a 5xx stops; a verify step asks for the code unless
-    it carries a wait; a start step re-asks its ``param``, or offers a new
-    code when the old one is gone; a 429 with a short wait waits; everything
-    else stops."""
+    the flow object, the answer's HTTP status and the step that was called
+    (``register``, ``verify``, ``recover``, ``recover_verify``, ...). Pure;
+    first match wins:
+
+    - ``legacy``: no flow object.
+    - ``done``: ``next_step`` is ``done``.
+    - ``stop``: a ``next_step`` this release does not know, or a 5xx.
+    - ``ask_code``: a verify step, no ``retry_after_s``.
+    - ``ask_param``: a start step with ``param``.
+    - ``offer_new_code``: a start step, no ``param``, the code is gone
+      (``status`` ``expired`` / ``max_attempts_reached``, or the call was a
+      code), and no ``retry_after_s`` or one of at most 60 s (waited out
+      only if the person says yes).
+    - ``wait_then_retry``: a 429 with ``retry_after_s`` <= 60 that names the
+      step that was called (repeating it sends nothing new).
+    - ``stop``: anything else.
+    """
     if flow is None:
         return "legacy"
     step = flow.get("next_step")
@@ -248,9 +264,10 @@ def action_of(flow: SignupFlow | None, http_status: int) -> SignupAction:
     if step in _START_STEPS:
         if flow.get("param") is not None:
             return "ask_param"
-        if flow.get("status") in ("expired", "max_attempts_reached"):
+        code_gone = flow.get("status") in ("expired", "max_attempts_reached")
+        if (code_gone or called_step in _VERIFY_STEPS) and (wait is None or wait <= MAX_WAIT_S):
             return "offer_new_code"
-    if http_status == 429 and wait is not None and wait <= MAX_WAIT_S:
+    if http_status == 429 and wait is not None and wait <= MAX_WAIT_S and step == called_step:
         return "wait_then_retry"
     return "stop"
 
@@ -420,7 +437,9 @@ def _read(
         and flow.get("next_step") == submitted.get("next_step")
     ):
         flow = cast("SignupFlow", {**flow, "pending_id": submitted["pending_id"]})
-    action = action_of(flow, answer.http_status)
+    steps = _STEPS[kind]
+    called_step = steps.start if called == "start" else steps.verify
+    action = action_of(flow, answer.http_status, called_step)
     api_key, handle = _key_and_handle(body) if error is None else (None, None)
     # ``done`` means the key is in the body; without one there is nothing to save.
     if action == "done" and (api_key is None or handle is None):
@@ -439,6 +458,7 @@ def _read(
         message=message,
         action=action,
         http_status=answer.http_status,
+        called_step=called_step,
         legacy=legacy,
         code=error.code if error is not None else None,
         api_key=api_key if is_done else None,
@@ -702,21 +722,31 @@ def _wall_now() -> float:
     return time.time()
 
 
-def _expiry_of(flow: SignupFlow) -> float | None:
-    """When the flow's code stops working (epoch seconds): ``expires_at``,
-    else ``expires_in_s`` from now; ``None`` when neither."""
+MIN_WAIT_S = 1
+"""The shortest automatic wait :func:`run` makes (no tight retry loop on a
+zero wait)."""
+
+MAX_AUTO_WAITS = 3
+"""Automatic waits :func:`run` makes in a row before it asks the person."""
+
+
+def _expiry_of(flow: SignupFlow, received_at: float) -> float | None:
+    """When the flow's code stops working, on the monotonic clock:
+    ``expires_in_s`` from the answer's receipt (no clock skew), else
+    ``expires_at`` against this machine's wall clock; ``None`` when neither."""
+    seconds = whole_seconds(flow.get("expires_in_s"))
+    if seconds is not None:
+        return received_at + seconds
     text = flow.get("expires_at")
     if isinstance(text, str):
         try:
             moment = datetime.fromisoformat(text.replace("Z", "+00:00"))
         except ValueError:
-            moment = None
-        if moment is not None:
-            if moment.tzinfo is None:
-                moment = moment.replace(tzinfo=timezone.utc)
-            return moment.timestamp()
-    seconds = whole_seconds(flow.get("expires_in_s"))
-    return _wall_now() + seconds if seconds is not None else None
+            return None
+        if moment.tzinfo is None:
+            moment = moment.replace(tzinfo=timezone.utc)
+        return received_at + (moment.timestamp() - _wall_now())
+    return None
 
 
 @dataclass(frozen=True)
@@ -724,6 +754,7 @@ class _Held:
     flow: SignupFlow
     received_at: float
     expires_at: float | None
+    """Monotonic seconds; ``None`` when the answers did not say."""
 
 
 class _Stop:
@@ -757,6 +788,28 @@ def _machine(
     (a :class:`StepResult` for a call, an :class:`AccountAnswer` for a
     question, ``None`` otherwise)."""
     values: dict[str, Any] = dict(input or {})
+    # The code the person holds (the flow of the last code question).
+    held: _Held | None = None
+    # When the email may next get a new code: the email, and the monotonic
+    # time from the latest answer that said (resend_after_s from its receipt).
+    resend_at: tuple[str, float] | None = None
+    # Automatic waits since the person last answered.
+    auto_waits = 0
+
+    def holds_a_working_code() -> bool:
+        return held is not None and held.expires_at is not None and held.expires_at > _now()
+
+    def asked(question: AccountQuestion) -> Generator[_Effect, Any, AccountAnswer]:
+        nonlocal auto_waits
+        answer = _checked(question, (yield _Ask(question)))
+        auto_waits = 0
+        return answer
+
+    def pause(seconds: float) -> Generator[_Effect, Any, None]:
+        """One automatic wait, floored at :data:`MIN_WAIT_S`."""
+        nonlocal auto_waits
+        auto_waits += 1
+        yield _Sleep(max(float(MIN_WAIT_S), seconds))
 
     def ask_field(
         name: Literal["email", "handle"],
@@ -765,31 +818,12 @@ def _machine(
     ) -> Generator[_Effect, Any, bool]:
         """Ask for a field; False when the person cancelled."""
         question = AccountQuestion(
-            field=name,
-            label=labels[name],
-            answers=_FIELD_ANSWERS,
-            flow=flow,
-            handles=handles or None,
+            field=name, label=labels[name], answers=_FIELD_ANSWERS, flow=flow, handles=handles or None
         )
-        answer = _checked(question, (yield _Ask(question)))
+        answer = yield from asked(question)
         if answer.answer != "value":
             return False
         values[name] = str(answer.value).strip()
-        return True
-
-    def offer_new_code(flow: SignupFlow) -> Generator[_Effect, Any, bool]:
-        """Ask before a new code; on a yes, sit out the flow's
-        ``retry_after_s`` first (the time until a new code may be sent), so
-        the new code is not turned away. A wait over the limit is left to
-        the server's answer."""
-        question = AccountQuestion(
-            field="new_code", label=None, answers=_NEW_CODE_ANSWERS, flow=flow
-        )
-        if _checked(question, (yield _Ask(question))).answer != "new_code":
-            return False
-        wait = whole_seconds(flow.get("retry_after_s"))
-        if wait is not None and 0 < wait <= MAX_WAIT_S:
-            yield _Sleep(float(wait))
         return True
 
     def start_call() -> _Start:
@@ -803,6 +837,62 @@ def _machine(
                 call[name] = values[name]
         return _Start(kind, call)
 
+    def start_when_allowed() -> Generator[_Effect, Any, _Next]:
+        """A start call no sooner than the email may get a new code: after
+        what is left of the last answer's ``resend_after_s`` for this email
+        (a start inside that window is turned away or, for recover, answered
+        like any other with no email sent: the decoy design). Up to 60 s is
+        waited out; longer is :data:`_STOP`."""
+        if resend_at is not None and resend_at[0] == (values.get("email") or ""):
+            left = resend_at[1] - _now()
+            if left > MAX_WAIT_S:
+                return _STOP
+            if left > 0:
+                yield from pause(left)
+        return start_call()
+
+    def offer_new_code(flow: SignupFlow) -> Generator[_Effect, Any, _Next]:
+        """Ask before a new code; on a yes, sit out the answer's
+        ``retry_after_s`` and what is left of the resend window."""
+        question = AccountQuestion(field="new_code", label=None, answers=_NEW_CODE_ANSWERS, flow=flow)
+        if (yield from asked(question)).answer != "new_code":
+            return None
+        retry = whole_seconds(flow.get("retry_after_s"))
+        if retry is not None and 0 < retry <= MAX_WAIT_S:
+            yield from pause(float(retry))
+        return (yield from start_when_allowed())
+
+    def ask_code(flow: SignupFlow) -> Generator[_Effect, Any, _Next]:
+        """Ask for the code of ``flow``: the next call, ``None`` when the
+        person cancelled, or :data:`_STOP`. A new code waits for the resend
+        window; when that is over 60 s the person is asked for the code they
+        hold again while it still works."""
+        while True:
+            question = AccountQuestion(field="code", label=labels["code"], answers=_CODE_ANSWERS, flow=flow)
+            answer = yield from asked(question)
+            if answer.answer == "cancel":
+                return None
+            if answer.answer == "value":
+                return _Submit(flow, str(answer.value).strip())
+            following = yield from start_when_allowed()
+            if isinstance(following, _Stop) and holds_a_working_code():
+                continue
+            return following
+
+    def after_waits(flow: SignupFlow, repeat: _Start | _Submit) -> Generator[_Effect, Any, _Next]:
+        """``wait_then_retry``: wait ``retry_after_s``, then repeat the call
+        that was turned away. After :data:`MAX_AUTO_WAITS` automatic waits in
+        a row the person is asked first: the code again (after a code), or
+        whether to send a new code (after a start)."""
+        if auto_waits >= MAX_AUTO_WAITS:
+            if isinstance(repeat, _Submit):
+                return (yield from ask_code(held.flow if held is not None else flow))
+            question = AccountQuestion(field="new_code", label=None, answers=_NEW_CODE_ANSWERS, flow=flow)
+            if (yield from asked(question)).answer != "new_code":
+                return None
+        yield from pause(float(whole_seconds(flow.get("retry_after_s")) or 0))
+        return repeat
+
     required: tuple[Literal["email", "handle"], ...] = (
         ("email", "handle") if kind == "register" else ("email",)
     )
@@ -814,43 +904,12 @@ def _machine(
             return RunResult(outcome="cancelled")
 
     repeat: _Start | _Submit = start_call()
-    # The code the person holds: the flow of the last code question, when it
-    # was answered (monotonic), and when the code stops working (wall-clock
-    # seconds; None when the answer did not say).
-    held: _Held | None = None
-
-    def holds_a_working_code() -> bool:
-        return held is not None and held.expires_at is not None and held.expires_at > _wall_now()
-
-    def ask_code(flow: SignupFlow, received_at: float) -> Generator[_Effect, Any, _Next]:
-        """Ask for the code of ``flow``: the next call, ``None`` when the
-        person cancelled, or :data:`_STOP`."""
-        while True:
-            question = AccountQuestion(
-                field="code", label=labels["code"], answers=_CODE_ANSWERS, flow=flow
-            )
-            answer = _checked(question, (yield _Ask(question)))
-            if answer.answer == "cancel":
-                return None
-            if answer.answer == "value":
-                return _Submit(flow, str(answer.value).strip())
-            # Not before the server allows a new code (resend_after_s): a
-            # recover asked too soon is answered like any other (the decoy
-            # design) and sends nothing, so asking the server is no way to
-            # learn the wait.
-            resend = whole_seconds(flow.get("resend_after_s")) or 0
-            wait = max(0.0, resend - (_now() - received_at))
-            if wait > MAX_WAIT_S:
-                if holds_a_working_code():
-                    continue  # the code the person holds still works: ask for it again
-                return _STOP
-            if wait > 0:
-                yield _Sleep(wait)
-            return start_call()
-
     result: StepResult = yield repeat
     received_at = _now()
     while True:
+        resend = whole_seconds(result.flow.get("resend_after_s"))
+        if resend is not None:
+            resend_at = (values.get("email") or "", received_at + resend)
         if result.message:
             yield _Show(result.message)
         flow = result.flow
@@ -861,51 +920,42 @@ def _machine(
             return RunResult(outcome="done", api_key=result.api_key, handle=result.handle)
 
         if action == "ask_code":
-            same_code = held is not None and held.flow.get("pending_id") == flow.get("pending_id")
-            expires_at = _expiry_of(flow)
-            if expires_at is None and same_code and held is not None:
+            expires_at = _expiry_of(flow, received_at)
+            if (
+                expires_at is None
+                and held is not None
+                and held.flow.get("pending_id") == flow.get("pending_id")
+            ):
                 expires_at = held.expires_at
             held = _Held(flow, received_at, expires_at)
-            next_call = yield from ask_code(flow, received_at)
+            next_call = yield from ask_code(flow)
 
         elif action == "ask_param":
             held = None
             param = flow.get("param")
             if param in ("email", "handle"):
-                asked: Literal["email", "handle"] = "email" if param == "email" else "handle"
-                if not (yield from ask_field(asked, flow, result.handles)):
+                field_name: Literal["email", "handle"] = "email" if param == "email" else "handle"
+                if not (yield from ask_field(field_name, flow, result.handles)):
                     return RunResult(outcome="cancelled")
-                next_call = start_call()
+                next_call = yield from start_when_allowed()
 
         elif action == "offer_new_code":
             held = None
-            if not (yield from offer_new_code(flow)):
-                return RunResult(outcome="cancelled")
-            next_call = start_call()
+            next_call = yield from offer_new_code(flow)
 
         elif action == "wait_then_retry":
-            # Repeat the call that was turned away, unless that would send a
-            # new code nobody asked for (the wait names a start step, but the
-            # call was a code): then the person is asked first.
-            if isinstance(repeat, _Submit) and flow.get("next_step") in _START_STEPS:
-                held = None
-                if not (yield from offer_new_code(flow)):
-                    return RunResult(outcome="cancelled")
-                next_call = start_call()
-            else:
-                yield _Sleep(float(whole_seconds(flow.get("retry_after_s")) or 0))
-                next_call = repeat
+            next_call = yield from after_waits(flow, repeat)
 
         elif (
             isinstance(repeat, _Start)
             and held is not None
-            and result.code in ("OTP_HOURLY_CAP", "OTP_COOLDOWN")
+            and result.http_status == 429
             and holds_a_working_code()
         ):
             # A new code asked for and refused for longer than run waits
             # ("Enter the last code you received, or try again in ..."):
             # while the code the person holds still works, go back to it.
-            next_call = yield from ask_code(held.flow, held.received_at)
+            next_call = yield from ask_code(held.flow)
 
         if next_call is None:
             return RunResult(outcome="cancelled")
@@ -956,15 +1006,18 @@ def run(
     It follows ``next_step``: shows every server ``message`` (through
     ``show``), asks only for what the server names (``param``, or the code),
     and lets the person enter the code, ask for a new code, or cancel. It
-    never sends a new code unasked, nor before the server allows one: a new
-    code asked for at the code prompt waits out what is left of the flow's
-    ``resend_after_s``, and after a yes to a new code it first waits out the
-    flow's ``retry_after_s``. It waits out a ``retry_after_s`` of up to
-    :data:`MAX_WAIT_S` seconds (the message says how long), and stops on a
+    never sends a new code unasked, nor before the server allows one: every
+    start call after a send in the same run waits out what is left of that
+    send's ``resend_after_s`` (a recover asked too soon is answered like any
+    other and sends nothing), and after a yes to a new code it also waits
+    out the flow's ``retry_after_s``. It waits out a ``retry_after_s`` of up
+    to :data:`MAX_WAIT_S` seconds (the message says how long) and stops on a
     longer one, except that when a new code the person asked for is refused
-    for longer (``OTP_HOURLY_CAP``, or ``OTP_COOLDOWN`` over 60 s; or a
-    ``resend_after_s`` over 60 s) and the code they hold has not expired
-    (``expires_at``), it shows the message and asks for that code again. No
+    (any 429, or a resend wait over 60 s) while the code they hold still
+    works (``expires_in_s`` from its answer), it shows the message and asks
+    for that code again. Every automatic wait is at least
+    :data:`MIN_WAIT_S`; after :data:`MAX_AUTO_WAITS` in a row the person is
+    asked before the next (the code again, or "send a new code?"). No
     attempt caps of its own: the server's are the only ones.
 
     ``input`` is what is known up front (:class:`RegisterInput` /
@@ -1059,7 +1112,9 @@ async def run_async(
 
 __all__ = [
     "DEFAULT_LABELS",
+    "MAX_AUTO_WAITS",
     "MAX_WAIT_S",
+    "MIN_WAIT_S",
     "AccountAnswer",
     "AccountKind",
     "AccountLabels",

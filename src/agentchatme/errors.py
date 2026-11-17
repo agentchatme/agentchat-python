@@ -357,6 +357,17 @@ class EmailExhaustedError(AgentChatError):
         )
 
 
+class OtpAttemptsExhaustedError(AgentChatError):
+    """Raised on HTTP 429 OTP_ATTEMPTS_EXHAUSTED from a sign-up verify call:
+    the wrong code that used the last attempt, or any later try with the
+    same pending id.
+
+    Not a :class:`RateLimitedError`: repeating the request never succeeds,
+    so nothing retries it. The way on is a new code (the start step);
+    ``details.resend_after_s`` says when one may be requested.
+    """
+
+
 class HandleRequiredError(AgentChatError):
     """Raised on HTTP 409 HANDLE_REQUIRED from ``POST /v1/agents/recover/verify``.
 
@@ -463,6 +474,8 @@ def create_agentchat_error(
         return EmailExhaustedError(body, status, request_id)
     if code == ErrorCode.HANDLE_REQUIRED:
         return HandleRequiredError(body, status, request_id)
+    if code == ErrorCode.OTP_ATTEMPTS_EXHAUSTED:
+        return OtpAttemptsExhaustedError(body, status, request_id)
     if code == ErrorCode.INTERNAL_ERROR:
         return ServerError(body, status, request_id)
 

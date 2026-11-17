@@ -15,7 +15,7 @@ API is versioned separately under `/v1/...`.
   that follows the server's answer instead of a rulebook of its own
   (contract v1, "Sign-up flows"). `flow_of(answer)` reads the flow object
   out of a body, an SDK error or a verify result; `action_of(flow,
-  http_status)` names what to do next (`done`, `ask_code`, `ask_param`,
+  http_status, called_step)` names what to do next (`done`, `ask_code`, `ask_param`,
   `offer_new_code`, `wait_then_retry`, `stop`, `legacy`); `start(kind,
   input, ...)` and `submit_code(flow, code, ...)` make one call each, never
   retried, and return a `StepResult` for every answer the server gives
@@ -24,9 +24,11 @@ API is versioned separately under `/v1/...`.
   conversation for a wizard: it shows every server message, asks only for
   what the server names, lets the person enter the code, ask for a new
   code or cancel, never sends a new code unasked nor before the server
-  allows one (`resend_after_s`), waits out a `retry_after_s` of up to 60 s
-  and stops on a longer one, except that a new code refused for longer
-  while the held code still works goes back to that code. `check_key(
+  allows one (every start after a send waits out its `resend_after_s`),
+  waits out a `retry_after_s` of up to 60 s (at least 1 s, at most 3
+  automatic waits in a row before asking) and stops on a longer one,
+  except that a new code refused while the held code still works goes back
+  to that code. `check_key(
   api_key, ...)` is one `GET /v1/agents/me`. `DEFAULT_LABELS` are the only
   words it brings. `*_async` twins for an event loop. A server older than
   the contract (no `next_step`) is read from its codes into the same flow
@@ -48,6 +50,14 @@ API is versioned separately under `/v1/...`.
   `ErrorCode` names the sign-up codes (`INVALID_CODE`, `EXPIRED`,
   `OTP_ATTEMPTS_EXHAUSTED`, `OTP_COOLDOWN`, `OTP_HOURLY_CAP`,
   `OTP_EMAIL_LOCKED`, `OTP_FAILED`).
+- `OtpAttemptsExhaustedError` for 429 `OTP_ATTEMPTS_EXHAUSTED`: no longer a
+  `RateLimitedError` (repeating the request never succeeds), never retried.
+
+### Changed
+
+- The HTTP layer no longer retries a 429 whose `Retry-After` is longer than
+  one retry may wait (`RetryPolicy.max_delay_ms`): it raises at once
+  instead of spending its retries before the server's time is up.
 - Conformance fixture `conformance/v1/signup-flow.cases.json`, copied from
   the contract byte for byte, and `texts.sample.json` for manual 2.3.5.
 

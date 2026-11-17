@@ -84,7 +84,7 @@ def test_flow_of_and_action_of(case: dict[str, Any]) -> None:
     # From the raw body (code that calls the endpoints itself).
     from_body = account.flow_of(response["body"])
     _expect_flow(from_body, expect["flow"])
-    assert account.action_of(from_body, response["status"]) == expect["action"]
+    assert account.action_of(from_body, response["status"], case["request"]["kind"]) == expect["action"]
 
     # From what the SDK surfaces (the body, or the SDK error).
     shown = _surfaced(case)
