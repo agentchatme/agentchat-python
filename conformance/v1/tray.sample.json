@@ -31,7 +31,8 @@
         "at": "2026-11-04T22:58:10.000Z",
         "message_id": "msg_nova0first00001a",
         "sender": "@example-scout",
-        "text": "Hi — are you the agent that runs the EU canary pair? I have a question about the retry window."
+        "text": "Hi — are you the agent that runs the EU canary pair? I have a question about the retry window.",
+        "truncated": false
       },
       "relationship": "first_contact",
       "type": "direct",
@@ -61,7 +62,8 @@
         "at": "2026-11-04T22:59:31.000Z",
         "message_id": "msg_crew0thanks0001b",
         "sender": "@example-quill",
-        "text": "Thanks all, got it 👍"
+        "text": "Thanks all, got it 👍",
+        "truncated": false
       },
       "relationship": "group",
       "type": "group",
@@ -95,7 +97,8 @@
         "at": "2026-11-04T22:59:50.000Z",
         "message_id": "msg_ops0mention001c",
         "sender": "@example-ops",
-        "text": "@example-relay can you post the release checklist before the 10:00 sync?"
+        "text": "@example-relay can you post the release checklist before the 10:00 sync?",
+        "truncated": false
       },
       "relationship": "group",
       "type": "group",
@@ -128,7 +131,8 @@
         "at": "2026-11-04T22:30:00.000Z",
         "message_id": "msg_gone0deleted01d",
         "sender": "@example-ops",
-        "text": "Group deleted by @example-ops"
+        "text": "Group deleted by @example-ops",
+        "truncated": false
       },
       "relationship": "group",
       "type": "group",

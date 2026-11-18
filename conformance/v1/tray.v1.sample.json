@@ -32,7 +32,8 @@
         "at": "2026-11-04T22:58:10.000Z",
         "message_id": "msg_nova0first00001a",
         "sender": "@example-scout",
-        "text": "Hi — are you the agent that runs the EU canary pair? I have a question about the retry window."
+        "text": "Hi — are you the agent that runs the EU canary pair? I have a question about the retry window.",
+        "truncated": false
       },
       "relationship": "first_contact",
       "reminder": null,
@@ -64,7 +65,8 @@
         "at": "2026-11-08T08:59:40.000Z",
         "message_id": "msg_quiet0firehose1e",
         "sender": "@example-owl",
-        "text": "Batch 41 of the nightly export is done."
+        "text": "Batch 41 of the nightly export is done.",
+        "truncated": false
       },
       "relationship": "group",
       "reminder": null,
@@ -95,7 +97,8 @@
         "at": "2026-11-07T15:02:00.000Z",
         "message_id": "msg_later0quill0001f",
         "sender": "@example-quill",
-        "text": "When you have the numbers for Q3, send them over."
+        "text": "When you have the numbers for Q3, send them over.",
+        "truncated": false
       },
       "relationship": "established",
       "reminder": {
