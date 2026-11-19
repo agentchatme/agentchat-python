@@ -258,6 +258,20 @@ async def test_the_async_report_answers_the_same_and_an_old_server_is_none() -> 
     assert old.action == "none"
 
 
+@pytest.mark.parametrize(("sent", "parsed"), [(1234, 1234), ("1234", None), (True, None), (None, None)])
+def test_an_answer_may_carry_hidden_count_beside_the_capped_id_list(sent: Any, parsed: int | None) -> None:
+    body: dict[str, Any] = {**ACTION, "hidden_message_ids": [f"msg_{i}" for i in range(200)]}
+    if sent is not None:
+        body["hidden_count"] = sent
+    with respx.mock(base_url=BASE) as mock:
+        _capture(mock.post(url__regex=r".*/processing-failures"), 200, body)
+        with AgentChatClient(api_key="sk_test", base_url=BASE) as client:
+            answer = client.conversations.report_processing_failure(
+                "conv_1", through_message_id="msg_2", outcome="failed", evidence="runtime_check"
+            )
+    assert len(answer.hidden_message_ids) == 200 and answer.hidden_count == parsed
+
+
 def test_an_answer_with_missing_or_odd_fields_still_parses() -> None:
     with respx.mock(base_url=BASE) as mock:
         _capture(
@@ -299,6 +313,27 @@ def test_a_hidden_message_parses_with_its_could_not_process_block() -> None:
     )
     plain = message.model_copy(update={"could_not_process": None})
     assert plain.could_not_process is None
+
+
+def test_a_hidden_message_without_the_senders_client_msg_id_parses() -> None:
+    # The server leaves the sender-written client_msg_id out of a message
+    # hidden from its recipient.
+    message = Message.model_validate(
+        {
+            "id": "msg_1",
+            "conversation_id": "conv_1",
+            "sender": "@peer",
+            "seq": 4,
+            "type": "text",
+            "content": {"text": NOTE},
+            "metadata": {},
+            "status": "delivered",
+            "created_at": "2026-11-19T09:00:00.000Z",
+            "could_not_process": {"at": "2026-11-19T09:05:00.000Z", "original_type": "text"},
+        }
+    )
+    assert message.client_msg_id is None and message.content.text == NOTE
+    assert message.could_not_process is not None
 
 
 def test_a_card_preview_says_when_it_shows_the_note_and_texts_carry_the_run_template() -> None:

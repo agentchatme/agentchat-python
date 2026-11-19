@@ -472,7 +472,8 @@ run).
 ``run``), ``conversation_id``, ``through_message_id``, ``outcome``
 (``failed`` / ``timed_out``), ``evidence``, ``action`` (the server's:
 ``retry``, ``hidden``, ``paused``, ``none``), ``attempts``,
-``hidden_message_ids``, ``paused_until`` and ``error`` (the report itself
+``hidden_message_ids`` (at most 200), ``hidden_count`` (``None`` when the
+server does not say), ``paused_until`` and ``error`` (the report itself
 failed: then ``action`` is ``none``)."""
 
 TurnStarter = Callable[[TurnRequest], Any]
@@ -2623,6 +2624,7 @@ class ReceiveLoop:
                 "action": action,
                 "attempts": _field(answer, "attempts") if error is None else None,
                 "hidden_message_ids": list(hidden) if isinstance(hidden, list) else [],
+                "hidden_count": _field(answer, "hidden_count") if error is None else None,
                 "paused_until": _field(answer, "paused_until") if error is None else None,
                 "error": error,
             }

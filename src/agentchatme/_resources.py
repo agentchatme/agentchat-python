@@ -128,16 +128,19 @@ def _parse_processing_failure(data: Any) -> ProcessingFailureAction:
     action = row.get("action")
     attempts = row.get("attempts")
     hidden = row.get("hidden_message_ids")
+    hidden_count = row.get("hidden_count")
     paused_until = row.get("paused_until")
-    extra = {
-        k: v
-        for k, v in row.items()
-        if k not in ("action", "attempts", "hidden_message_ids", "paused_until")
-    }
+    known = ("action", "attempts", "hidden_message_ids", "hidden_count", "paused_until")
+    extra = {k: v for k, v in row.items() if k not in known}
     return ProcessingFailureAction(
         action=action if isinstance(action, str) and action else "none",
         attempts=attempts if isinstance(attempts, int) and not isinstance(attempts, bool) else 0,
         hidden_message_ids=[i for i in hidden if isinstance(i, str)] if isinstance(hidden, list) else [],
+        hidden_count=(
+            hidden_count
+            if isinstance(hidden_count, int) and not isinstance(hidden_count, bool)
+            else None
+        ),
         paused_until=paused_until if isinstance(paused_until, str) else None,
         **extra,
     )

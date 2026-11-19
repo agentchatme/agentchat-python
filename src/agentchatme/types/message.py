@@ -79,7 +79,9 @@ class Message(_BaseModel):
     id: str
     conversation_id: str
     sender: str
-    client_msg_id: str
+    client_msg_id: str | None = None
+    """The sender's idempotency key. ``None`` on a message hidden from you
+    (could not process): the server leaves out what the sender wrote."""
     seq: int
     type: MessageType
     content: MessageContent

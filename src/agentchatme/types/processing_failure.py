@@ -57,7 +57,12 @@ class ProcessingFailureAction(_BaseModel):
     older server's plain 404 becomes."""
     hidden_message_ids: list[str] = []
     """The messages hidden from you by this report (``hidden``, and a
-    ``paused`` that hid a third span); empty otherwise."""
+    ``paused`` that hid a third span); empty otherwise. At most 200 are
+    listed: :attr:`hidden_count` is the full number."""
+    hidden_count: int | None = None
+    """How many messages this report hid, when the server says (it lists
+    at most 200 in :attr:`hidden_message_ids`). ``None`` from servers that
+    do not send it."""
     paused_until: str | None = None
     """``paused``: when the 24 h mute ends (ISO 8601); ``None`` otherwise."""
 

@@ -19,7 +19,8 @@ API is versioned separately under `/v1/...`.
   `timed_out`), only while the runtime otherwise works (`evidence`:
   `other_run_completed` / `runtime_check`). It returns the server's
   `ProcessingFailureAction` (`action`: `retry`, `hidden`, `paused` or
-  `none`; `attempts`, `hidden_message_ids`, `paused_until`). An
+  `none`; `attempts`, `hidden_message_ids` (at most 200), `hidden_count`
+  (optional), `paused_until`). An
   `Idempotency-Key` is sent, so a retried report counts once. A server that
   predates the route answers a plain 404: that is `none`, never an error;
   only the route's own `CONVERSATION_NOT_FOUND` / `MESSAGE_NOT_FOUND` raise.
@@ -81,6 +82,9 @@ API is versioned separately under `/v1/...`.
 
 ### Changed
 
+- `Message.client_msg_id` is optional (`None`): the server leaves it out on
+  a message hidden from its recipient (it is the sender's own field), and
+  parsing such a message never raises. Sends still carry one.
 - `integration.ReceiveLoop`, gate-call mode: a failed gate chunk of several
   cards is gated again one card per call in the same cycle, before any turn
   starts (muted cards excepted), so one card the model cannot process
