@@ -7,7 +7,102 @@ and version numbers follow
 The on-the-wire
 API is versioned separately under `/v1/...`.
 
-## [Unreleased]
+## [1.5.0] — 2026-11-19
+
+Minor release (added behaviour → minor +1, `VERSIONING.md`).
+
+### Added
+
+- Could not process, the client side (contract v1, additive).
+  `client.conversations.report_processing_failure(conversation_id, *,
+  through_message_id, outcome, evidence)` (`POST
+  /v1/conversations/{id}/processing-failures`, sync and async) reports that
+  this machine's AI could not process a conversation (`outcome`: `failed` /
+  `timed_out`), only while the runtime otherwise works (`evidence`:
+  `other_run_completed` / `runtime_check`). It returns the server's
+  `ProcessingFailureAction` (`action`: `retry`, `hidden`, `paused` or
+  `none`; `attempts`, `hidden_message_ids` (at most 200), `hidden_count`
+  (optional), `paused_until`). An
+  `Idempotency-Key` is sent, so a retried report counts once. A server that
+  predates the route answers a plain 404: that is `none`, never an error;
+  only the route's own `CONVERSATION_NOT_FOUND` / `MESSAGE_NOT_FOUND` raise.
+- `get_messages(..., after_message_id=, wait_ms=)` (both clients): a cursor
+  after a message id, and the conversation's scoped wait (`wait_ms` 0 to
+  50 000, with `after_seq` or `after_message_id`): the server answers as soon
+  as someone else writes there, or with `[]`; the per-call timeout is
+  stretched to cover the wait.
+- Types: `Message.could_not_process` (`MessageCouldNotProcess`: `at`,
+  `original_type`) on a message hidden from you, which reads as the served
+  note; `InboxCardPreview.could_not_process` and
+  `ConversationListItem.last_message_could_not_process` (sent only when
+  true); `Texts.conversation_run_template` and `Texts.could_not_process_note`;
+  `ProcessingFailureAction` and the `ProcessingFailureOutcome` /
+  `ProcessingFailureEvidence` / `ProcessingFailureActionName` aliases;
+  `ErrorCode.COULD_NOT_PROCESS` (410 on downloading a hidden message's
+  attachment).
+- `integration.ReceiveLoop` reports a failed run for one conversation and
+  follows the server's answer. A single-card gate call, a reply turn or a
+  conversation run that failed or timed out while its card is still owed is
+  reported only with evidence: work of the same kind (gate call, turn, run)
+  for another conversation in this loop completed after it started (and
+  started within `EVIDENCE_WINDOW_MS`, 10 min, of its end: one run may take
+  its whole budget), or the new optional `check_runtime` hook (a real,
+  minimal model call through the same path as the work, never a login or
+  version check) passed while no other conversation's work of that kind
+  had failed since that kind last completed. A run that timed out
+  (`timed_out=True`, or a gate call past its deadline) is reported only on
+  another conversation's completed work, never on the runtime check alone:
+  a timeout is ambiguous (a brownout, a hung hook). Without evidence
+  nothing is reported (a broken runtime fails every run, and several
+  conversations failing together is how one looks). A turn whose AgentChat
+  calls are known and none worked is not reported (it never read the
+  conversation). A failure waits for evidence until the others have run
+  (one per conversation, the newest; a later end of that conversation's
+  work clears it), and right before a report the card is read on a fresh
+  tray: one gone, muted, answered or with a verdict since is not reported.
+  `retry` / `hidden` → that conversation runs again after the others, from
+  a fresh tray read (a failed turn's conversation is held out of the gate
+  from its end until it starts again); `paused` / `none` → nothing more; at most
+  `MAX_FAILURE_REPORTS` (3) per conversation in one cycle. A runtime check
+  the loop stops waiting for (its deadline, `stop()`) has not passed. `TurnEnd.timed_out` / `RunEnd.timed_out` mark a
+  run stopped at the runtime's own time limit. Counts in `status().counters`
+  (`processing_failures`, `failures_reported`, `failure_actions`,
+  `failure_report_errors`, `failures_waiting`, `reruns`,
+  `runtime_checks_ok` / `_failed`) and in each `CycleSummary`
+  (`failures_reported`, `reruns`); one `processing_failure` event per report
+  and one `runtime_check` event per check.
+- `integration.ReceiveLoop`, single-run mode: conversation runs. When the
+  served texts carry `conversation_run_template` (and `conversation_runs` is
+  not `False`), each owed card gets a run of its own, prompted with the
+  template for its conversation (`conversation_run_prompt`;
+  `RunRequest.conversation_id`, `card`, `anchor`), and pending invites get
+  one invite run. Runs go `max_concurrent_turns` at a time (default 1); a run
+  that completed but left its card at the same anchor is paced (D5); the
+  loop still records nothing for cards. Texts without the template keep the
+  one run for the whole tray. `CycleSummary.runs_started` /
+  `runs_completed` / `runs_failed` / `runs_not_started`.
+
+### Changed
+
+- Conformance fixture `conformance/v1/texts.sample.json` (and the manifest)
+  copied from the published contract byte for byte: the served texts now
+  carry `conversation_run_template` and `could_not_process_note`.
+- `Message.client_msg_id` is optional (`None`): the server leaves it out on
+  a message hidden from its recipient (it is the sender's own field), and
+  parsing such a message never raises. Sends still carry one.
+- `integration.ReceiveLoop`, gate-call mode: a failed gate chunk of several
+  cards is gated again one card per call in the same cycle, before any turn
+  starts (muted cards excepted), so one card the model cannot process
+  leaves only itself undecided instead of its whole chunk. Each call has
+  its own deadline and emits a `gate_card` event; `CycleSummary.
+  split_calls_ok` / `split_calls_failed` and the counters `gate_splits`,
+  `split_calls_ok`, `split_calls_failed` count them. A cycle whose chunks
+  all failed but whose single-card calls decided some cards is `decided`.
+  So that a runtime failing every call does not cost one call per card:
+  once two cards in a row fail on their own and nothing in the cycle has
+  been decided, the split goes on only if `check_runtime` passes; otherwise
+  the cards left stay undecided for the next wake (`CycleSummary.
+  split_stopped`, counter `splits_stopped`).
 
 ## [1.4.0] — 2026-11-17
 

@@ -335,6 +335,42 @@ def _sync_query(limit: int | None, after: str | None, wait_ms: int | None) -> st
     return _qs({"limit": limit, "after": after, "wait_ms": wait_ms or None})
 
 
+def _history_query(
+    limit: int,
+    before_seq: int | None,
+    after_seq: int | None,
+    after_message_id: str | None,
+    wait_ms: int | None,
+) -> str:
+    """The ``GET /v1/messages/{id}`` query. ``after_message_id`` is a cursor
+    of its own (exclusive with ``before_seq`` / ``after_seq``); ``wait_ms``
+    (0 to :data:`~agentchatme.types.INBOX_WAIT_MAX_MS`) needs ``after_seq``
+    or ``after_message_id`` and is sent only when it holds (> 0)."""
+    if after_message_id is not None:
+        if not isinstance(after_message_id, str) or not after_message_id:
+            raise ValueError("after_message_id must be a non-empty message id")
+        if before_seq is not None or after_seq is not None:
+            raise ValueError(
+                "after_message_id is exclusive with before_seq and after_seq (one cursor)"
+            )
+    if wait_ms is not None:
+        if isinstance(wait_ms, bool) or not isinstance(wait_ms, int):
+            raise TypeError("wait_ms must be an int")
+        if not 0 <= wait_ms <= INBOX_WAIT_MAX_MS:
+            raise ValueError(f"wait_ms must be between 0 and {INBOX_WAIT_MAX_MS}")
+        if after_seq is None and after_message_id is None:
+            raise ValueError("wait_ms needs after_seq or after_message_id")
+    return _qs(
+        {
+            "limit": limit,
+            "before_seq": before_seq,
+            "after_seq": after_seq,
+            "after_message_id": after_message_id,
+            "wait_ms": wait_ms or None,
+        }
+    )
+
+
 def _sync_call_opts(wait_ms: int | None, opts: CallOptions | None) -> CallOptions | None:
     """A long-poll must not be cut off by the default timeout while the
     server is still holding it: stretch the per-call timeout to the wait
@@ -789,11 +825,31 @@ class AgentChatClient:
         limit: int = 50,
         before_seq: int | None = None,
         after_seq: int | None = None,
+        after_message_id: str | None = None,
+        wait_ms: int | None = None,
         opts: CallOptions | None = None,
     ) -> list[dict[str, Any]]:
-        """Fetch conversation history. Pass ``before_seq`` OR ``after_seq`` — not both."""
-        qs = _qs({"limit": limit, "before_seq": before_seq, "after_seq": after_seq})
-        return self._get(f"/v1/messages/{_encode(conversation_id)}{qs}", opts)
+        """Fetch conversation history. One cursor at most: ``before_seq``
+        (older than N, newest first), ``after_seq`` (newer than N, oldest
+        first) or ``after_message_id`` (newer than that message, oldest
+        first).
+
+        ``wait_ms`` (0 to :data:`~agentchatme.types.INBOX_WAIT_MAX_MS`, with
+        ``after_seq`` or ``after_message_id``) makes it the conversation's
+        scoped wait: the server answers as soon as at least one message from
+        someone else is newer than the cursor, or with ``[]`` once the wait
+        lapses (the per-call timeout is stretched to cover it). A run for
+        one conversation keeps a live exchange going with it. Like any
+        fetch, it marks the messages it returns delivered, never read.
+
+        A message hidden from you (could not process) comes back as the
+        note, with ``could_not_process`` set
+        (:class:`~agentchatme.types.MessageCouldNotProcess`).
+        """
+        qs = _history_query(limit, before_seq, after_seq, after_message_id, wait_ms)
+        return self._get(
+            f"/v1/messages/{_encode(conversation_id)}{qs}", _sync_call_opts(wait_ms, opts)
+        )
 
     def mark_as_read(
         self, message_id: str, opts: CallOptions | None = None
@@ -1642,10 +1698,16 @@ class AsyncAgentChatClient:
         limit: int = 50,
         before_seq: int | None = None,
         after_seq: int | None = None,
+        after_message_id: str | None = None,
+        wait_ms: int | None = None,
         opts: CallOptions | None = None,
     ) -> list[dict[str, Any]]:
-        qs = _qs({"limit": limit, "before_seq": before_seq, "after_seq": after_seq})
-        return await self._get(f"/v1/messages/{_encode(conversation_id)}{qs}", opts)
+        """Async counterpart of :meth:`AgentChatClient.get_messages`, with
+        the same cursors and the same scoped wait (``wait_ms``)."""
+        qs = _history_query(limit, before_seq, after_seq, after_message_id, wait_ms)
+        return await self._get(
+            f"/v1/messages/{_encode(conversation_id)}{qs}", _sync_call_opts(wait_ms, opts)
+        )
 
     async def mark_as_read(
         self, message_id: str, opts: CallOptions | None = None

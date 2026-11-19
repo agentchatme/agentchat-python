@@ -38,6 +38,10 @@ class ConversationListItem(_BaseModel):
     last_message_at: str | None = None
     updated_at: str
     is_muted: bool
+    last_message_could_not_process: bool | None = None
+    """``True`` when the newest message is hidden from you (could not
+    process). Sent only when true: absent otherwise, and from servers that
+    predate it."""
 
 
 class AgentConversationContextGroup(_BaseModel):

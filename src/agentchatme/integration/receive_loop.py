@@ -22,6 +22,22 @@ Two modes (contract v1, D5):
   ignored invite does not cost a run on every wake; the count is in memory
   only (``dismiss_ignored_invites=False`` turns this off).
 
+  Conversation runs: when the served texts carry
+  ``conversation_run_template`` (and ``conversation_runs`` is not
+  ``False``), single-run mode starts one run per owed card instead, each
+  prompted with that template for its one conversation
+  (:func:`conversation_run_prompt`; ``RunRequest.conversation_id`` names
+  it), and pending invites get one invite run of their own (the invite
+  prompt; the ignored-invite rule above applies to it). One conversation's
+  run never sees another's messages, so a message its AI cannot process
+  stops only its own conversation. Runs go one at a time by default
+  (``max_concurrent_turns``), the cycle waits for them, and a run that
+  completed but left its card on the tray at the same anchor (it looked and
+  did nothing) is paced like a silent turn (D5). The loop still records
+  nothing for cards: each run records its own verdict. A tray that could
+  not be read starts no run (``tray_failed``: the server re-wakes). Texts
+  without the template keep the one run for the whole tray.
+
 Wakes: a ``message.new`` frame that is not the echo of the agent's own send,
 a ``wake`` frame (a reminder, or unanswered cards), every accepted HELLO (a
 reconnect after a heartbeat gap included), a ``group.invite.received``
@@ -39,7 +55,49 @@ burst still wakes.
 There is no retry ladder here. A cycle that could not finish (the tray could
 not be read, the model failed, a turn was refused or failed) leaves the
 cards on the tray and does nothing more: the server re-wakes unanswered
-cards on its own durable ladder (D3).
+cards on its own durable ladder (D3). The one exception is a conversation
+the server tells this machine to run again after a reported failure (below).
+
+Could not process: only this machine sees its AI fail on one conversation
+(a safety refusal, a crash on an attachment, a run past its time limit).
+A single-card gate call, a reply turn or a conversation run that failed or
+timed out while its card is still owed is reported
+(``client.conversations.report_processing_failure``) only with evidence that
+the runtime otherwise works: work of the same kind (a gate call for a gate
+call, a turn for a turn, a run for a run: each kind takes its own path
+through the runtime) for another conversation in this loop completed after
+the failed one started (``other_run_completed``; the completed work must
+have started within :data:`EVIDENCE_WINDOW_MS` of the failure's end), or
+the integration's ``check_runtime`` hook (a real, minimal model call
+through the same path as the work), run right after it, passed while no
+other conversation's work of that kind had failed since that kind last
+completed (``runtime_check``: several conversations failing together is how
+a broken runtime looks). A run that timed out (``timed_out``, or a gate call
+past its deadline) is reported only on ``other_run_completed``, never on
+the runtime check: a timeout is ambiguous (a brownout, a hung hook), and
+the check does not go through those paths.
+Without evidence nothing is reported: a broken runtime fails every run, and
+that is the ``runs_failing`` path. A turn whose AgentChat calls are known
+and none worked never read the conversation and is not reported. A failure
+waits in memory for evidence (one per conversation, the newest; a later
+end of that conversation's work clears it) until the others have run: a
+failed gate call is decided once the cycle's single-card calls are done, a
+failed conversation run once its round of runs is done, a failed turn once
+no other turn is running or waiting; only then, and once for all of them,
+does the runtime check run. Right before a report the card is read on a
+fresh tray: one gone, muted, answered or with a verdict since is not
+reported (a report then could hide what was handled, or find an empty span
+and pause the chat). ``through_message_id`` is the anchor of the card the failed work
+started from. The server keeps the count and answers the action, which the
+loop follows: ``retry`` or ``hidden`` → that conversation runs again (a
+gate call for its card alone, a reply turn, a conversation run), after the
+others queued in this cycle, from a fresh read of the tray (a hidden
+message shows as the served note; a turn's conversation is held out of the
+gate from its report until it starts again); ``paused`` or ``none`` →
+nothing more for it. At most :data:`MAX_FAILURE_REPORTS` (3) reports per conversation in
+one cycle. A server that predates the route answers ``none``. The counts
+are in ``status().counters`` and each report is a ``processing_failure``
+event.
 
 Pacing (D5): after a silent turn (it looked and did nothing) the same
 conversation at the same anchor is not gated again for ``pace_ms`` (60 s)
@@ -67,6 +125,18 @@ is ``decided`` when any chunk answered and ``fail_closed`` when none did;
 ``chunks_ok`` / ``chunks_failed``, the ``failure`` and one ``gate_chunk``
 event per chunk say which.
 
+A failed chunk of several cards is gated again one card per call in the
+same cycle, before any turn starts (its muted cards excepted: they are owed
+nothing): one card the model cannot process then leaves only itself
+undecided. Each such call has its own deadline and is one ``gate_card``
+event; ``split_calls_ok`` / ``split_calls_failed`` count them. A
+single-card call that fails (a chunk of one, or one of these) is a failed
+run for its conversation (above). A runtime that fails every call would
+cost one call per card: once two cards in a row have failed on their own
+and no gate call of the cycle has decided anything, the split goes on only
+if ``check_runtime`` passes (asked once per cycle); otherwise the cards
+left stay undecided for the next wake (``split_stopped``).
+
 Deadlines: each gate call (one per chunk) may take ``gate_call_timeout_ms``
 (60 s); past it that chunk fails closed for its cards (nothing recorded for
 them; the next wake asks again), its cancel handle is set, and the next
@@ -89,9 +159,10 @@ is longer than ``cycle_timeout_ms`` is not cut by the watchdog: time inside
 a deadline-bound gate call is not counted.
 
 Turns: at most ``max_concurrent_turns`` (default 1) reply and invite turns
-run at once; the rest wait for a slot, held out of the gate meanwhile (their
-cards stay on the tray; nothing is recorded for them). A turn that ends
-after :meth:`ReceiveLoop.stop` still has its outcome recorded.
+(in single-run mode: conversation runs) run at once; the rest wait for a
+slot, held out of the gate meanwhile (their cards stay on the tray; nothing
+is recorded for them). A turn that ends after :meth:`ReceiveLoop.stop`
+still has its outcome recorded.
 
 The runtime's callbacks may be coroutine functions or plain functions. A
 plain ``call_model``, ``start_turn``, ``start_run`` or ``readiness`` runs in
@@ -120,12 +191,26 @@ from typing import Any, Callable, Literal
 from .. import gate as _gate
 from .._client_identity import AgentChatClientIdentity
 from .._realtime import RealtimeClient
+from ..errors import NotFoundError
 from ..types.texts import Texts
+from ._processing_failures import (
+    EVIDENCE_WINDOW_MS,
+    MAX_FAILURE_REPORTS,
+    Failure,
+    FailureKind,
+    Ledger,
+    Work,
+    newest_per_conversation,
+    runtime_ok,
+)
 from .anchor import normalize_handle
 from .coalescer import SetTimer, TimerHandle, WakeCoalescer, _loop_timer, _monotonic_ms
 from .outcome import (
+    AgentChatCallCount,
     InviteOutcome,
     TurnEnd,
+    _answer_went_out,
+    _verdict_recorded_since,
     apply_invite_outcome_async,
     apply_outcome_async,
     invite_outcome,
@@ -212,23 +297,39 @@ class TurnAdmission:
 
 @dataclass(frozen=True)
 class RunRequest:
-    """The one run the loop asks for (single-run mode)."""
+    """A run the loop asks for (single-run mode): the one run for the whole
+    tray, or, with conversation runs, one run for one conversation or the
+    invite run."""
 
     prompt: str
     """The served wake instruction (and the invite prompt when invites
-    wait), or the invite prompt alone."""
+    wait), or the invite prompt alone; a conversation run: the served
+    ``conversation_run_template`` for its conversation
+    (:func:`conversation_run_prompt`)."""
     texts: Texts
     cards: int | None
-    """Owed cards on the tray that started it; ``None`` when the tray could
-    not be read."""
+    """Owed cards on the tray that started it (a conversation run: 1);
+    ``None`` when the tray could not be read."""
     invites: int | None
     stopping: asyncio.Event = field(repr=False)
+    conversation_id: str | None = None
+    """A conversation run: the one conversation it is for. ``None`` for the
+    one run for the whole tray and for the invite run."""
+    card: dict[str, Any] | None = None
+    """A conversation run: its card, as served."""
+    anchor: str | None = None
+    """A conversation run: the newest message on its card (the verdict
+    anchor)."""
 
 
 @dataclass(frozen=True)
 class RunEnd:
     status: Literal["completed", "failed", "not_started"]
     detail: str | None = None
+    timed_out: bool = False
+    """A ``failed`` run the runtime stopped at its own time limit: reported,
+    when reported, as ``timed_out``, and only when another conversation's
+    run completed since (a runtime check is no evidence for a timeout)."""
 
 
 @dataclass(frozen=True)
@@ -287,6 +388,28 @@ class CycleSummary:
     deadline, or its answer held no usable verdict); only their own cards
     stay undecided. A call the cycle's end cut short (:meth:`ReceiveLoop.stop`,
     the watchdog) is neither: the cycle is ``abandoned``."""
+    split_calls_ok: int = 0
+    """Gate-call mode: single-card gate calls that gave a verdict, made for
+    the cards of a failed chunk, or for a card the server said to run
+    again."""
+    split_calls_failed: int = 0
+    """Single-card gate calls (as above) that failed closed."""
+    split_stopped: bool = False
+    """The single-card calls stopped early: two cards in a row failed, no
+    gate call of the cycle had decided anything, and ``check_runtime`` was
+    absent or did not pass (the runtime looks broken). The cards left are
+    undecided; the next wake asks again."""
+    failures_reported: int = 0
+    """Processing failures this cycle reported (could not process)."""
+    reruns: int = 0
+    """Conversations this cycle ran again after the server answered
+    ``retry`` or ``hidden``."""
+    runs_started: int = 0
+    """Single-run mode: runs this cycle started (conversation runs: one per
+    owed card, the invite run, and the runs started again)."""
+    runs_completed: int = 0
+    runs_failed: int = 0
+    runs_not_started: int = 0
 
 
 @dataclass(frozen=True)
@@ -305,12 +428,21 @@ class ReceiveLoopStatus:
     ``abandoned``."""
     turns: list[RunningTurn]
     counters: dict[str, Any]
+    """Running totals. Could not process: ``processing_failures`` (failed
+    runs for one conversation whose card was still owed),
+    ``failures_reported``, ``failure_actions`` (the server's answers by
+    action), ``failure_report_errors``, ``failures_waiting`` (failures
+    waiting for evidence now), ``reruns``, ``runtime_checks_ok`` /
+    ``runtime_checks_failed``; the gate's split: ``gate_splits`` (failed
+    chunks gated again card by card) and ``split_calls_ok`` /
+    ``split_calls_failed``."""
     last_error: str | None
 
 
 ReceiveLoopEvent = dict[str, Any]
 """``{"type": "wake" | "echo" | "notice" | "cycle" | "gate_chunk" |
-"turn_started" | "turn_refused" | "turn_outcome" | "invite_outcome" | "run" |
+"gate_card" | "turn_started" | "turn_refused" | "turn_outcome" |
+"invite_outcome" | "run" | "runtime_check" | "processing_failure" |
 "error", ...}``.
 
 ``notice`` (a system notice frame: acked on receipt, no wake):
@@ -322,11 +454,44 @@ cycle share it), ``index`` (1-based, in tray order), ``of`` (how many chunks
 the cycle's cards were split into), ``cards`` (the N of its prompt),
 ``outcome`` (``decided`` or ``fail_closed``), ``undecided`` (its cards left
 without a usable verdict) and ``failure``; a partial failure shows here
-chunk by chunk. A cycle the watchdog abandoned emits no further one."""
+chunk by chunk. A cycle the watchdog abandoned emits no further one.
+
+``gate_card`` (one per single-card gate call after a failed chunk, or for a
+card the server said to run again): ``cycle``, ``conversation_id``,
+``attempt`` (0 for the first, then one more per report), ``outcome``
+(``decided`` or ``fail_closed``) and ``failure``.
+
+``run`` (single-run mode, one per run): ``end`` (:class:`RunEnd`); a
+conversation run also carries ``conversation_id`` (``None`` for the invite
+run).
+
+``runtime_check``: ``ok`` and ``detail``: the integration's
+``check_runtime`` ran for a failure that had no other evidence.
+
+``processing_failure`` (one per report): ``kind`` (``gate``, ``turn`` or
+``run``), ``conversation_id``, ``through_message_id``, ``outcome``
+(``failed`` / ``timed_out``), ``evidence``, ``action`` (the server's:
+``retry``, ``hidden``, ``paused``, ``none``), ``attempts``,
+``hidden_message_ids`` (at most 200), ``hidden_count`` (``None`` when the
+server does not say), ``paused_until`` and ``error`` (the report itself
+failed: then ``action`` is ``none``)."""
 
 TurnStarter = Callable[[TurnRequest], Any]
 RunStarter = Callable[[RunRequest], Any]
 ReadinessCheck = Callable[[], Any]
+RuntimeCheck = Callable[[], Any]
+"""``check_runtime``: whether the runtime works right now. It must be a real,
+minimal model call through the same path as the work (the same model, and
+for turns or runs the same launcher), with no AgentChat content in it;
+never a login or version check, which can pass while the work cannot run.
+A coroutine or a plain function (run in a worker thread); ``True``, or a
+:class:`Readiness` (or anything) whose ``ready`` / ``ok`` is true, means it
+works. Bounded by ``gate_call_timeout_ms`` and by :meth:`ReceiveLoop.stop`;
+raising or running past it means it does not. It speaks for a failure only
+when that conversation is the only one of its kind failing since that kind
+last completed: with one active conversation (no other run to compare
+with), it is the only evidence there is. It never speaks for a run that
+timed out: that one needs another conversation's run to complete."""
 
 
 class _StaticTexts:
@@ -371,6 +536,26 @@ def reply_prompt(texts: Any, conversation_id: str) -> str:
         # leads, and the conversation is named after it.
         return f"{body}\n\nconversation_id: {conversation_id}"
     return f"{str(instruction).strip()}\n\nconversation_id: {conversation_id}"
+
+
+def conversation_run_prompt(texts: Any, conversation_id: str) -> str | None:
+    """The prompt a conversation run starts with: the served
+    ``conversation_run_template`` with every ``<conversation_id>`` replaced
+    by the conversation's id. A served template without the placeholder is
+    used as it is, with a final ``conversation_id:`` line. ``None`` when the
+    texts carry no template (an older server, a copy cached before it; or a
+    value that is empty, blank or not a string): single-run mode then keeps
+    one run for the whole tray."""
+    if isinstance(texts, Mapping):
+        template = texts.get("conversation_run_template")
+    else:
+        template = getattr(texts, "conversation_run_template", None)
+    if not (isinstance(template, str) and template.strip()):
+        return None
+    body = template.strip()
+    if _CONVERSATION_PLACEHOLDER in body:
+        return body.replace(_CONVERSATION_PLACEHOLDER, conversation_id)
+    return f"{body}\n\nconversation_id: {conversation_id}"
 
 
 def _iso(epoch_ms: float) -> str:
@@ -473,21 +658,56 @@ def _chunked(cards: list[dict[str, Any]], size: int) -> list[list[dict[str, Any]
 class _ChunkedGate:
     """What the gate's chunks of one cycle came to, together."""
 
-    gated: int = 0
-    """Cards sent to the model in a chunk whose call was not cut short; each
-    counts once, so it is ``reply`` + ``dismiss`` + ``defer`` +
-    ``undecided``."""
+    gated_ids: set[str] = field(default_factory=set)
+    """Cards sent to the model in a call that was not cut short; each counts
+    once (also when it is gated again on its own), so their number is
+    ``reply`` + ``dismiss`` + ``defer`` + ``undecided``."""
     held: int = 0
     """Cards left out of their chunk: a turn took them while earlier chunks
     were gated."""
-    reply: list[_gate.AsyncGateReply] = field(default_factory=list)
-    """The replies, chunk by chunk, each chunk's in the model's order."""
+    reply: list[Any] = field(default_factory=list)
+    """The replies, chunk by chunk, each chunk's in the model's order, then
+    those of the single-card calls."""
     verdicts: dict[str, int] = field(default_factory=lambda: {"reply": 0, "dismiss": 0, "defer": 0})
-    undecided: int = 0
+    undecided_ids: set[str] = field(default_factory=set)
+    """Cards whose last call gave them no usable verdict."""
     recorded: int = 0
     record_failures: int = 0
     chunks: list[dict[str, Any]] = field(default_factory=list)
     """The ``gate_chunk`` reports, in order."""
+    split_ok: int = 0
+    split_failed: int = 0
+    split_stopped: bool = False
+    failures_reported: int = 0
+    reruns: int = 0
+
+    @property
+    def gated(self) -> int:
+        return len(self.gated_ids)
+
+    @property
+    def undecided(self) -> int:
+        return len(self.undecided_ids)
+
+
+@dataclass
+class _CallNote:
+    """What one gate call's model call did: whether the model was asked at
+    all (a prompt that cannot be built asks nothing), and whether it ran
+    past its deadline."""
+
+    called: bool = False
+    timed_out: bool = False
+
+
+@dataclass
+class _RunItem:
+    """One run a conversation-runs cycle starts: a conversation's (``card``)
+    or the invite run (``invites``)."""
+
+    card: dict[str, Any] | None = None
+    invites: list[dict[str, Any]] | None = None
+    chain: int = 0
 
 
 def _chunk_failure(chunks: list[dict[str, Any]]) -> str | None:
@@ -517,6 +737,64 @@ def _chunk_size_option(value: object) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= TRAY_LIMIT:
         raise ValueError(f"ReceiveLoop: gate_chunk_size must be an int from 1 to {TRAY_LIMIT}")
     return value
+
+
+def _owed_card(tray: Mapping[str, Any] | None, conversation_id: str) -> dict[str, Any] | None:
+    """The conversation's card on a tray, unless it is muted (a pause is a
+    mute) or the tray could not be read."""
+    if tray is None:
+        return None
+    for card in _gate.cards_of(tray):
+        if card["conversation_id"] == conversation_id:
+            return card if card.get("muted") is not True else None
+    return None
+
+
+def _field(answer: Any, name: str) -> Any:
+    """A field of a server answer: a typed model's attribute, or a
+    mapping's key."""
+    if isinstance(answer, Mapping):
+        return answer.get(name)
+    return getattr(answer, name, None)
+
+
+def _runs_failure(failed: list[tuple[str, str | None]], runs: int) -> str | None:
+    """A conversation-runs cycle's failure: the one run's detail, or how
+    many of the runs failed and the first one's."""
+    if not failed:
+        return None
+    name, detail = failed[0]
+    reason = detail or "the run failed"
+    if runs == 1:
+        return reason
+    return f"{len(failed)} of {runs} runs failed; {name}: {reason}"
+
+
+def _gate_progressed(out: _ChunkedGate) -> bool:
+    """A gate call of this cycle decided something."""
+    return out.split_ok > 0 or any(chunk["outcome"] == "decided" for chunk in out.chunks)
+
+
+def _never_looked(calls: AgentChatCallCount | None) -> bool:
+    """A turn's AgentChat calls are known and none of them worked."""
+    return calls is not None and (calls.made <= 0 or calls.failed >= calls.made)
+
+
+def _still_owed(failure: Failure, fresh: Mapping[str, Any] | None) -> bool:
+    """The card the failed run started from is still owed on a fresh tray:
+    present, not muted, no answer sent and no verdict recorded since. A
+    report about anything else could hide what was already handled (or,
+    with the agent's own message newer than the anchor, pause it)."""
+    card = _owed_card(fresh, failure.conversation_id)
+    if card is None:
+        return False
+    return not (_verdict_recorded_since(failure.card, card) or _answer_went_out(failure.card, card))
+
+
+def _runs_again(failure: Failure, action: str) -> bool:
+    """The server said to run the conversation again, and its chain of
+    reports in this cycle has room for one more."""
+    return action in ("retry", "hidden") and failure.chain + 1 < MAX_FAILURE_REPORTS
 
 
 def _tray_invites(tray: Mapping[str, Any]) -> list[dict[str, Any]]:
@@ -598,6 +876,16 @@ class ReceiveLoop:
     clock; a ``now`` that is given is the watchdog's clock too, so a
     wall-clock ``now`` makes the watchdog wall-clock (a clock step then
     counts against, or for, the running cycle).
+
+    ``check_runtime`` (optional, :data:`RuntimeCheck`) answers whether the
+    runtime works right now: a real, minimal model call through the same
+    path as the work, with no AgentChat content in it. It is the evidence
+    for reporting a failed run when no other conversation's run completed
+    since (see the module docstring); without it such a failure waits for
+    one, and an agent with one active conversation never reports. ``conversation_runs`` (single-run mode, default
+    ``True``): one run per owed card when the served texts carry
+    ``conversation_run_template``; ``False`` keeps one run for the whole
+    tray.
     """
 
     def __init__(
@@ -626,6 +914,8 @@ class ReceiveLoop:
         gate_chunk_size: int | None = None,
         now: Callable[[], float] | None = None,
         set_timer: SetTimer | None = None,
+        check_runtime: RuntimeCheck | None = None,
+        conversation_runs: bool = True,
     ) -> None:
         if mode not in ("gate_call", "single_run"):
             raise ValueError("ReceiveLoop: mode is gate_call or single_run")
@@ -645,6 +935,8 @@ class ReceiveLoop:
         self._start_run = start_run
         self._tool_namer = tool_namer
         self._readiness = readiness
+        self._check_runtime = check_runtime
+        self._conversation_runs = conversation_runs is not False
         self._on_event = on_event
         self._now = now or (lambda: time.time() * 1000.0)
         # Durations the watchdog measures: the given clock (a test's), else
@@ -652,6 +944,9 @@ class ReceiveLoop:
         self._clock: Callable[[], float] = now or _monotonic_ms
         self._handle = normalize_handle(handle) if handle else None
         self._tracker = turn_tracker if turn_tracker is not None else TurnTracker(now=self._now)
+        # Could not process: work started and completed, and the failures
+        # waiting for evidence that the runtime otherwise works.
+        self._ledger = Ledger(self._now)
         self._pace_ms = pace_ms
         self._pacer = _Pacer(pace_ms, self._now)
         self._max_turns = max_concurrent_turns
@@ -687,6 +982,9 @@ class ReceiveLoop:
         # Conversations whose verdict a gate call is recording right now (an
         # abandoned cycle's included): held out of the next gate.
         self._records_in_flight: set[str] = set()
+        # Conversations whose failed turn is being reported, or started
+        # again, outside a cycle: held out of the gate meanwhile.
+        self._settling: set[str] = set()
         # The event loop the loop runs on (set by start()): a release from
         # another thread is handed over to it.
         self._event_loop: asyncio.AbstractEventLoop | None = None
@@ -731,8 +1029,19 @@ class ReceiveLoop:
             "outcome_record_failures": 0,
             "chunks_ok": 0,
             "chunks_failed": 0,
+            "gate_splits": 0,
+            "split_calls_ok": 0,
+            "split_calls_failed": 0,
+            "splits_stopped": 0,
+            "processing_failures": 0,
+            "failures_reported": 0,
+            "failure_report_errors": 0,
+            "reruns": 0,
+            "runtime_checks_ok": 0,
+            "runtime_checks_failed": 0,
         }
         self._outcomes: dict[str, int] = {}
+        self._failure_actions: dict[str, int] = {}
         self._realtime = self._build_socket(socket)
 
     def _build_socket(self, socket: Any) -> RealtimeClient | None:
@@ -888,6 +1197,8 @@ class ReceiveLoop:
                 "turns_active": len(self._active),
                 "turns_waiting": len(self._waiting),
                 "outcomes": dict(self._outcomes),
+                "failures_waiting": self._ledger.parked,
+                "failure_actions": dict(self._failure_actions),
             },
             last_error=self._last_error,
         )
@@ -1103,12 +1414,14 @@ class ReceiveLoop:
     def _held(self, card: Mapping[str, Any]) -> bool:
         """Held out of the gate: a running or waiting turn holds the card's
         conversation, or a verdict for it is still being recorded (an
-        abandoned cycle's last call). Gating it again could record the same
-        verdict twice (a second defer climbs the ladder)."""
+        abandoned cycle's last call), or its failed turn is being reported
+        and started again. Gating it again could record the same verdict
+        twice (a second defer climbs the ladder), or race the turn."""
         conversation_id = card["conversation_id"]
         return (
             self._tracker.conversation_running(conversation_id)
             or conversation_id in self._records_in_flight
+            or conversation_id in self._settling
         )
 
     async def _gate_call_cycle(self, token: int, cancel: _CallCancel) -> CycleSummary:
@@ -1167,6 +1480,11 @@ class ReceiveLoop:
             "turns_queued": 0,
             "chunks_ok": 0,
             "chunks_failed": 0,
+            "split_calls_ok": 0,
+            "split_calls_failed": 0,
+            "split_stopped": False,
+            "failures_reported": 0,
+            "reruns": 0,
         }
         held_during_gate = 0
         outcome: CycleOutcome = "invites_only"
@@ -1183,8 +1501,13 @@ class ReceiveLoop:
             tally["record_failures"] = gate.record_failures
             tally["chunks_ok"] = sum(1 for chunk in gate.chunks if chunk["outcome"] == "decided")
             tally["chunks_failed"] = len(gate.chunks) - tally["chunks_ok"]
+            tally["split_calls_ok"] = gate.split_ok
+            tally["split_calls_failed"] = gate.split_failed
+            tally["split_stopped"] = gate.split_stopped
+            tally["failures_reported"] = gate.failures_reported
+            tally["reruns"] = gate.reruns
             failure = _chunk_failure(gate.chunks)
-            if tally["chunks_ok"] > 0:
+            if tally["chunks_ok"] > 0 or gate.split_ok > 0:
                 outcome = "decided"
                 # Every chunk has answered and its dismiss / defer verdicts
                 # are recorded: only then do the turns start, so a turn never
@@ -1193,7 +1516,7 @@ class ReceiveLoop:
                     if self._stale(token):
                         break
                     tally[f"turns_{await self._start_reply_turn(reply, texts)}"] += 1
-            elif tally["chunks_failed"] > 0:
+            elif tally["chunks_failed"] > 0 or gate.split_failed > 0:
                 outcome = "fail_closed"
             elif not owed_invites and not self._stale(token):
                 # Every card was taken by a turn while the gate ran: no call
@@ -1229,7 +1552,9 @@ class ReceiveLoop:
         prompt for its own cards (N = the cards in that chunk), each call has
         its own deadline and the cycle's cancellation, and each chunk's
         ``dismiss`` / ``defer`` verdicts are recorded as soon as it answers.
-        A chunk that fails closed leaves only its own cards undecided.
+        A chunk that fails closed leaves only its own cards undecided, and
+        when it held several cards they are gated again one per call
+        (:meth:`_gate_singly`) before this returns.
         Before each call the chunk is checked again for cards a turn has
         taken since the tray was read (a shared tracker), so a longer gate
         never decides a card a turn holds; a chunk left with muted cards
@@ -1242,6 +1567,8 @@ class ReceiveLoop:
         call_model = self._model_call(cancel)
         recording = self._recording_client(token)
         stale = _StaleFlag(lambda: self._stale(token))
+        split: list[dict[str, Any]] = []
+        failures: list[Failure] = []
         for index, planned in enumerate(chunks, start=1):
             if self._stale(token):
                 break
@@ -1254,31 +1581,12 @@ class ReceiveLoop:
                 # call, the cycle's own rule applied per chunk. Its muted
                 # cards are left as in a nothing_owed cycle.
                 continue
-            result = await _gate.run_async(
-                {**tray, "conversations": chunk},
-                call_model,
-                recording,
-                tool_namer=self._tool_namer,
-                texts=texts,
-                cancel=stale,
-            )
+            result, note, work = await self._gate_call(tray, chunk, call_model, recording, texts, stale)
             if token != self._cycle_token:
                 break  # abandoned by the watchdog: this cycle reports nothing more
             if self._stopped and result.outcome != "decided":
                 break  # cut short by stop(): not this chunk's failure
-            out.gated += len(chunk)
-            # A stop part-way through the recording leaves the rest undecided
-            # (the gate moves them there): each card counts once, as a
-            # verdict or as undecided.
-            left = set(result.undecided)
-            for verdict in result.verdicts:
-                if verdict.conversation_id not in left:
-                    out.verdicts[verdict.decision] += 1
-            out.reply.extend(result.reply)
-            out.undecided += len(result.undecided)
-            out.recorded += result.recorded
-            out.record_failures += len(result.record_failures)
-            decided = result.outcome == "decided"
+            decided = self._count_gate_call(out, chunk, result, work)
             report: dict[str, Any] = {
                 "cycle": token,
                 "index": index,
@@ -1291,7 +1599,202 @@ class ReceiveLoop:
             out.chunks.append(report)
             self._counts["chunks_ok" if decided else "chunks_failed"] += 1
             self._emit({"type": "gate_chunk", **report})
+            if decided:
+                continue
+            if len(chunk) == 1:
+                # A call for one card: a failed run for its conversation.
+                failure = self._gate_failure(chunk[0], note, work, result.failure, chain=0)
+                if failure is not None:
+                    failures.append(failure)
+            else:
+                # One card the model cannot process fails its whole chunk:
+                # its cards are gated again one per call, before any turn.
+                self._counts["gate_splits"] += 1
+                split.extend(card for card in chunk if card.get("muted") is not True)
+        if not self._stale(token):
+            await self._gate_singly(token, tray, split, failures, out, call_model, recording, texts, stale)
         return out
+
+    async def _gate_singly(
+        self,
+        token: int,
+        tray: dict[str, Any],
+        split: list[dict[str, Any]],
+        failures: list[Failure],
+        out: _ChunkedGate,
+        call_model: Callable[[str], Any],
+        recording: Any,
+        texts: Texts,
+        stale: _StaleFlag,
+    ) -> None:
+        """The cards of failed chunks, one gate call each, in tray order;
+        then the failed single-card calls (these and the chunks of one card)
+        are reported where there is evidence (:meth:`_settle`), and each
+        card the server says to run again (``retry`` / ``hidden``) is gated
+        again on its own, from a fresh read of the tray, after the others,
+        until no card is left to gate (at most :data:`MAX_FAILURE_REPORTS`
+        reports per conversation). Failed gate calls of earlier cycles that
+        were waiting for evidence are settled here too.
+
+        A runtime that fails every call would cost one call per card: once
+        two cards in a row have failed on their own and no gate call of this
+        cycle has decided anything, the split goes on only if ``check_runtime``
+        passes (asked once per cycle); without it, or when it does not pass,
+        the remaining cards stay undecided for the next wake
+        (``split_stopped``)."""
+        queue: deque[tuple[dict[str, Any], int]] = deque((card, 0) for card in split)
+        in_a_row = 0
+        asked = False
+        while not self._stale(token):
+            while queue and not self._stale(token):
+                card, chain = queue.popleft()
+                if self._held(card):
+                    # A turn took it meanwhile: read again once it ends.
+                    self._held_while_running = True
+                    continue
+                result, note, work = await self._gate_call(tray, [card], call_model, recording, texts, stale)
+                if token != self._cycle_token:
+                    return  # abandoned by the watchdog
+                if self._stopped and result.outcome != "decided":
+                    return  # cut short by stop()
+                decided = self._count_gate_call(out, [card], result, work)
+                if decided:
+                    in_a_row = 0
+                    out.split_ok += 1
+                    self._counts["split_calls_ok"] += 1
+                else:
+                    in_a_row += 1
+                    out.split_failed += 1
+                    self._counts["split_calls_failed"] += 1
+                    failure = self._gate_failure(card, note, work, result.failure, chain=chain)
+                    if failure is not None:
+                        failures.append(failure)
+                if in_a_row >= 2 and queue and not asked and not _gate_progressed(out):
+                    # Two cards in a row failed and nothing decided: the
+                    # runtime may be broken. Ask it once before going on.
+                    asked = True
+                    if not await self._runtime_check(in_cycle=True):
+                        out.split_stopped = True
+                        self._counts["splits_stopped"] += 1
+                        queue.clear()
+                self._emit(
+                    {
+                        "type": "gate_card",
+                        "cycle": token,
+                        "conversation_id": card["conversation_id"],
+                        "attempt": chain,
+                        "outcome": "decided" if decided else "fail_closed",
+                        "failure": result.failure,
+                    }
+                )
+            if self._stale(token) or (not failures and not self._ledger.parked):
+                return
+            reported = await self._settle(failures, ("gate",), runtime_check=True, in_cycle=True)
+            failures = []
+            out.failures_reported += len(reported)
+            again = [failure for failure, action in reported if _runs_again(failure, action)]
+            if not again or self._stale(token):
+                return
+            fresh = await self._read_tray()
+            if self._stale(token):
+                return
+            for failure in again:
+                owed = _owed_card(fresh, failure.conversation_id)
+                if owed is None or self._held(owed):
+                    continue
+                queue.append((owed, failure.chain + 1))
+                out.reruns += 1
+                self._counts["reruns"] += 1
+            if not queue:
+                return
+
+    async def _gate_call(
+        self,
+        tray: dict[str, Any],
+        cards: list[dict[str, Any]],
+        call_model: Callable[[str], Any],
+        recording: Any,
+        texts: Texts,
+        stale: _StaleFlag,
+    ) -> tuple[_gate.GateResult[Any], _CallNote, Work]:
+        """One gate call for these cards, and what its model call did."""
+        note = _CallNote()
+
+        async def noted(prompt: str) -> Any:
+            note.called = True
+            try:
+                return await call_model(prompt)
+            except (asyncio.TimeoutError, TimeoutError):
+                note.timed_out = True
+                raise
+
+        work = self._ledger.begin()
+        result = await _gate.run_async(
+            {**tray, "conversations": cards},
+            noted,
+            recording,
+            tool_namer=self._tool_namer,
+            texts=texts,
+            cancel=stale,
+        )
+        return result, note, work
+
+    def _count_gate_call(
+        self, out: _ChunkedGate, cards: list[dict[str, Any]], result: Any, work: Work
+    ) -> bool:
+        """Count one gate call that was not cut short into the cycle's gate
+        (each card once: a verdict, or undecided); ``True`` when it
+        decided. A call that decided is completed work for its
+        conversations (evidence for another's failure) and settles their
+        earlier failed gate calls."""
+        ids = [str(card["conversation_id"]) for card in cards]
+        out.gated_ids.update(ids)
+        # A stop part-way through the recording leaves the rest undecided
+        # (the gate moves them there): each card counts once, as a verdict
+        # or as undecided.
+        left = set(result.undecided)
+        for verdict in result.verdicts:
+            if verdict.conversation_id not in left:
+                out.verdicts[verdict.decision] += 1
+                out.undecided_ids.discard(verdict.conversation_id)
+        out.undecided_ids.update(left)
+        out.reply.extend(result.reply)
+        out.recorded += result.recorded
+        out.record_failures += len(result.record_failures)
+        decided = bool(result.outcome == "decided")
+        if decided:
+            self._ledger.completed(work, "gate", ids)
+            for conversation_id in ids:
+                self._ledger.clear(conversation_id, ("gate",))
+        return decided
+
+    def _gate_failure(
+        self,
+        card: dict[str, Any],
+        note: _CallNote,
+        work: Work,
+        detail: str | None,
+        *,
+        chain: int,
+    ) -> Failure | None:
+        """A failed single-card gate call as a failed run for its
+        conversation, when the model was asked at all (a prompt that could
+        not be built is no failure of the model) and the card has an
+        anchor."""
+        anchor = _gate.anchor_of(card)
+        if not note.called or not anchor:
+            return None
+        return self._failed(
+            kind="gate",
+            conversation_id=str(card["conversation_id"]),
+            through_message_id=anchor,
+            outcome="timed_out" if note.timed_out else "failed",
+            work=work,
+            ended_at=self._now(),
+            card=card,
+            chain=chain,
+            detail=detail,
+        )
 
     async def _single_run_cycle(self, token: int) -> CycleSummary:
         tray = await self._read_tray()
@@ -1315,17 +1818,26 @@ class ReceiveLoop:
             if cards == 0 and invites == 0:
                 return self._summary("nothing_owed", **base)
         # A tray that could not be read is not an empty tray, and the wake was
-        # real: the run starts anyway.
+        # real: the run starts anyway (one run for the whole tray).
         texts = await self._texts.ensure()
         if self._stale(token):
             return self._summary("abandoned", **base)
         if texts is None:
             return self._summary("texts_missing", failure="the served texts are not available", **base)
+        per_conversation = (
+            self._conversation_runs and conversation_run_prompt(texts, "") is not None
+        )
+        if per_conversation and tray is None:
+            # Conversation runs need the cards: nothing starts; the server
+            # re-wakes.
+            return self._summary("tray_failed", failure=self._last_error, **base)
         unready = await self._check_ready()
         if self._stale(token):
             return self._summary("abandoned", **base)
         if unready is not None:
             return self._summary("tools_unavailable", failure=unready, **base)
+        if per_conversation and tray is not None:
+            return await self._conversation_runs_cycle(token, tray, texts, base)
 
         wake = texts.wake_instruction.strip()
         invite = texts.invite_prompt.strip()
@@ -1364,13 +1876,221 @@ class ReceiveLoop:
             if end.status == "failed"
             else "run_not_started"
         )
-        return self._summary(outcome, failure=None if end.status == "completed" else end.detail, **base)
+        return self._summary(
+            outcome,
+            failure=None if end.status == "completed" else end.detail,
+            runs_started=1,
+            **{key: 1},
+            **base,
+        )
+
+    # ─── conversation runs (single-run mode) ─────────────────────────────
+
+    async def _conversation_runs_cycle(
+        self, token: int, tray: dict[str, Any], texts: Texts, base: dict[str, Any]
+    ) -> CycleSummary:
+        """One run per owed card (muted cards and cards paced after a silent
+        run left out), in tray order, then one invite run when invites
+        wait; the cycle waits for them. After each round the tray is read
+        once: a run that completed but left its card at the same anchor is
+        paced (D5); a run that failed while its card is still owed is a
+        failed run for its conversation, settled once the round is over
+        (:meth:`_settle`), and run again after the others when the server
+        says ``retry`` or ``hidden``."""
+        cards = [card for card in _gate.cards_of(tray) if card.get("muted") is not True]
+        owed = [
+            card
+            for card in cards
+            if not self._pacer.held(f"conversation:{card['conversation_id']}", _gate.anchor_of(card))
+        ]
+        invites = _tray_invites(tray)
+        parts: dict[str, Any] = {**base, "paced": len(cards) - len(owed)}
+        if not owed and not invites:
+            return self._summary("nothing_owed", **parts)
+        queue: deque[_RunItem] = deque(_RunItem(card=card) for card in owed)
+        if invites:
+            queue.append(_RunItem(invites=invites))
+        tally = {
+            "runs_started": 0,
+            "runs_completed": 0,
+            "runs_failed": 0,
+            "runs_not_started": 0,
+            "failures_reported": 0,
+            "reruns": 0,
+        }
+        failed: list[tuple[str, str | None]] = []
+        while queue and not self._stale(token):
+            batch = list(queue)
+            queue.clear()
+            ran = await self._run_batch(token, batch, texts)
+            for item, end, _work in ran:
+                tally["runs_started"] += 1
+                key = {"completed": "runs_completed", "failed": "runs_failed"}.get(end.status, "runs_not_started")
+                tally[key] += 1
+                if end.status != "completed":
+                    name = str(item.card["conversation_id"]) if item.card is not None else "invites"
+                    failed.append((name, end.detail))
+            if self._stale(token):
+                break
+            fresh = (
+                await self._read_tray() if any(item.card is not None for item, _e, _w in ran) else None
+            )
+            failures: list[Failure] = []
+            for item, end, work in ran:
+                if item.card is not None:
+                    failure = self._after_conversation_run(item, end, work, fresh)
+                    if failure is not None:
+                        failures.append(failure)
+            if self._stale(token):
+                break
+            reported = await self._settle(
+                failures, ("run",), runtime_check=True, in_cycle=True, fresh=fresh
+            )
+            tally["failures_reported"] += len(reported)
+            again = [failure for failure, action in reported if _runs_again(failure, action)]
+            if again and fresh is None:
+                fresh = await self._read_tray()
+            for failure in again:
+                card = _owed_card(fresh, failure.conversation_id)
+                if card is None:
+                    continue
+                queue.append(_RunItem(card=card, chain=failure.chain + 1))
+                tally["reruns"] += 1
+                self._counts["reruns"] += 1
+        parts.update(tally)
+        if self._stale(token):
+            return self._summary("abandoned", **parts)
+        outcome: CycleOutcome = (
+            "run_completed"
+            if tally["runs_completed"] > 0
+            else "run_failed"
+            if tally["runs_failed"] > 0
+            else "run_not_started"
+        )
+        return self._summary(outcome, failure=_runs_failure(failed, tally["runs_started"]), **parts)
+
+    async def _run_batch(
+        self, token: int, items: list[_RunItem], texts: Texts
+    ) -> list[tuple[_RunItem, RunEnd, Work]]:
+        """The runs of one round, at most ``max_concurrent_turns`` at once,
+        in order; none starts once the cycle is stale."""
+        if self._max_turns == 1:
+            done: list[tuple[_RunItem, RunEnd, Work]] = []
+            for item in items:
+                if self._stale(token):
+                    break
+                done.append(await self._run_one(item, texts))
+            return done
+        slots = asyncio.Semaphore(self._max_turns)
+
+        async def one(item: _RunItem) -> tuple[_RunItem, RunEnd, Work] | None:
+            async with slots:
+                if self._stale(token):
+                    return None
+                return await self._run_one(item, texts)
+
+        results = await asyncio.gather(*(one(item) for item in items))
+        return [result for result in results if result is not None]
+
+    async def _run_one(self, item: _RunItem, texts: Texts) -> tuple[_RunItem, RunEnd, Work]:
+        """Start one run and wait for its end. The invite run then has the
+        ignored-invite rule applied to its invites."""
+        card = item.card
+        if card is not None:
+            conversation_id = str(card["conversation_id"])
+            request = RunRequest(
+                prompt=conversation_run_prompt(texts, conversation_id) or texts.wake_instruction.strip(),
+                texts=texts,
+                cards=1,
+                invites=0,
+                stopping=self._stopping,
+                conversation_id=conversation_id,
+                card=card,
+                anchor=_gate.anchor_of(card),
+            )
+            keys: tuple[str, ...] = (conversation_id,)
+        else:
+            invites = item.invites or []
+            request = RunRequest(
+                prompt=texts.invite_prompt.strip(),
+                texts=texts,
+                cards=0,
+                invites=len(invites),
+                stopping=self._stopping,
+            )
+            keys = tuple(f"invite:{invite['invite_id']}" for invite in invites)
+        self._counts["runs_started"] += 1
+        work = self._ledger.begin()
+        try:
+            assert self._start_run is not None
+            with self._uncounted():
+                raw = await self._call(self._start_run, request)
+            end = raw if isinstance(raw, RunEnd) else RunEnd(status="failed", detail=f"start_run returned {type(raw).__name__}")
+        except Exception as err:
+            end = RunEnd(status="not_started", detail=str(err) or type(err).__name__)
+        key = {"completed": "runs_completed", "failed": "runs_failed"}.get(end.status, "runs_not_started")
+        self._counts[key] += 1
+        if end.status == "completed":
+            self._ledger.completed(work, "run", keys)
+        self._emit({"type": "run", "end": end, "conversation_id": request.conversation_id})
+        if card is None and item.invites and self._dismiss_ignored_invites:
+            # Recorded also after stop(): what the run did is a fact.
+            await self._track(self._after_run_invites(item.invites, end))
+        return item, end, work
+
+    def _after_conversation_run(
+        self, item: _RunItem, end: RunEnd, work: Work, fresh: dict[str, Any] | None
+    ) -> Failure | None:
+        """What a conversation run left on the tray (read after its round):
+        a completed run that left its card at the same anchor is paced; a
+        failed run whose card is still owed (not answered, no verdict) is a
+        failed run for its conversation. Nothing is recorded: the run
+        records its own verdict."""
+        card = item.card
+        assert card is not None
+        conversation_id = str(card["conversation_id"])
+        anchor = _gate.anchor_of(card)
+        if end.status != "not_started":
+            # A later run of the conversation ended: its earlier failures say
+            # nothing any more (this one, if it failed, is the newest).
+            self._ledger.clear(conversation_id, ("run",))
+        if end.status == "not_started" or fresh is None:
+            return None
+        # Runs report no call counts: the reply rule's reading of the card,
+        # never its recording.
+        outcome = turn_outcome(
+            turn=TurnEnd(status="completed" if end.status == "completed" else "failed"),
+            turn_started_at=work.at,
+            gate_card=card,
+            fresh_tray=fresh,
+        )
+        self._count(f"run_{outcome.reason}")
+        if outcome.reason == "silent_first":
+            self._pacer.hold(f"conversation:{conversation_id}", anchor)
+            return None
+        if outcome.reason != "turn_failed" or not anchor:
+            return None
+        return self._failed(
+            kind="run",
+            conversation_id=conversation_id,
+            through_message_id=anchor,
+            outcome="timed_out" if end.timed_out else "failed",
+            work=work,
+            ended_at=self._now(),
+            card=card,
+            chain=item.chain,
+            detail=end.detail,
+        )
 
     # ─── turns (gate-call mode) ──────────────────────────────────────────
 
     async def _start_reply_turn(
-        self, reply: Any, texts: Texts
+        self, reply: Any, texts: Texts, *, chain: int = 0, by_cycle: bool = True
     ) -> Literal["started", "refused", "queued"]:
+        """``chain``: reports already made for this conversation in this
+        cycle (a turn started again after ``retry`` / ``hidden``);
+        ``by_cycle``: started by the running cycle (its admission is not
+        counted by the watchdog), else by a turn's end."""
         card = reply.card if isinstance(reply.card, dict) else reply.card.model_dump(mode="json", exclude_unset=True)
         anchor = _gate.anchor_of(card)
         handle = self._tracker.begin(TrackedTurn.reply(reply.conversation_id, anchor))
@@ -1389,6 +2109,7 @@ class ReceiveLoop:
 
         async def admit() -> bool:
             assert self._start_turn is not None
+            work = self._ledger.begin()
             admission = await self._admit(self._start_turn, request)
             if not admission.started or admission.done is None:
                 self._tracker.end(handle)
@@ -1399,13 +2120,15 @@ class ReceiveLoop:
                 return False
             self._counts["turns_started"] += 1
             self._emit({"type": "turn_started", "request": request})
-            self._spawn_turn(self._after_reply_turn(handle, card, reply.category, admission.done))
+            self._spawn_turn(
+                self._after_reply_turn(handle, card, reply.category, admission.done, work, chain)
+            )
             return True
 
-        return await self._launch(handle, admit)
+        return await self._launch(handle, admit, by_cycle=by_cycle)
 
     async def _launch(
-        self, handle: TurnHandle, admit: Callable[[], Awaitable[bool]]
+        self, handle: TurnHandle, admit: Callable[[], Awaitable[bool]], *, by_cycle: bool = True
     ) -> Literal["started", "refused", "queued"]:
         """Start a turn now when a slot is free, else let it wait for one
         (held out of the gate by its tracker entry meanwhile).
@@ -1414,13 +2137,17 @@ class ReceiveLoop:
         :meth:`_pump`, which runs as its own task, so a turn gated before it
         runs queues behind them instead of taking the slot. (After a turn
         ends, the TypeScript kit's pump takes the slot synchronously.) A
-        refused admission hands its slot on the same way."""
+        refused admission hands its slot on the same way. Only the cycle's
+        own admission (``by_cycle``) is left out by its watchdog."""
         if self._waiting or len(self._active) >= self._max_turns:
             self._waiting.append((handle, admit))
             self._counts["turns_queued"] += 1
             return "queued"
         self._active.add(handle)
-        with self._uncounted():  # the cycle's own admission
+        uncounted: contextlib.AbstractContextManager[None] = (
+            self._uncounted() if by_cycle else contextlib.nullcontext()
+        )
+        with uncounted:  # the cycle's own admission
             started = await admit()
         if started:
             return "started"
@@ -1473,26 +2200,66 @@ class ReceiveLoop:
             self._spawn_turn(self._pump())
 
     async def _after_reply_turn(
-        self, handle: TurnHandle, card: dict[str, Any], category: str | None, done: Awaitable[TurnEnd]
+        self,
+        handle: TurnHandle,
+        card: dict[str, Any],
+        category: str | None,
+        done: Awaitable[TurnEnd],
+        work: Work,
+        chain: int,
     ) -> None:
+        failure: Failure | None = None
+        fresh: dict[str, Any] | None = None
+        conversation_id = str(card.get("conversation_id"))
         try:
             end = await self._tracker.confirmed_end(handle, done)
             if end is None or not self._tracker.holds(handle):
                 return  # released: nothing recorded
+            # A later turn of the conversation ended: its earlier failures
+            # say nothing any more (this one, if it failed, is the newest).
+            self._ledger.clear(conversation_id, ("turn",))
+            if end.status == "completed":
+                # The runtime worked through it: evidence for another
+                # conversation's failed turn.
+                self._ledger.completed(work, "turn", (conversation_id,))
             # Recorded also when the turn ends after stop(): what it did is
             # a fact either way.
-            await self._track(self._record_reply_outcome(handle, card, category, end))
+            failure, fresh = await self._track(
+                self._record_reply_outcome(handle, card, category, end, work, chain)
+            )
+            if failure is not None:
+                # Held out of the gate from now until its failure is settled
+                # (a runtime check may take a while): a cycle woken by this
+                # end must not gate it meanwhile.
+                self._settling.add(conversation_id)
         finally:
             self._tracker.end(handle)
             self._slot_freed(handle)
             self._after_turn_ended()
+        try:
+            if not self._stopped:
+                await self._track(self._settle_turns(failure, fresh))
+        finally:
+            if failure is not None:
+                self._settling.discard(conversation_id)
+                self._after_turn_ended()
 
     async def _record_reply_outcome(
-        self, handle: TurnHandle, card: dict[str, Any], category: str | None, end: TurnEnd
-    ) -> None:
+        self,
+        handle: TurnHandle,
+        card: dict[str, Any],
+        category: str | None,
+        end: TurnEnd,
+        work: Work,
+        chain: int,
+    ) -> tuple[Failure | None, dict[str, Any] | None]:
+        """Record the D5 outcome of a reply turn. Returns the turn as a
+        failed run for its conversation when it failed and its card is
+        still owed on the fresh tray (not answered, no verdict) and it may
+        have read the conversation, else ``None``; and the fresh tray."""
         fresh = await self._read_tray()
         if not self._tracker.holds(handle):
-            return  # released while the tray was read: nothing recorded
+            return None, fresh  # released while the tray was read: nothing recorded
         conversation_id = str(card.get("conversation_id"))
         key = f"{conversation_id}|{_gate.anchor_of(card) or ''}"
         silent_before = self._silent.get(key, 0)
@@ -1520,6 +2287,29 @@ class ReceiveLoop:
                 self._counts["outcome_record_failures"] += 1
                 self._fail(err)
         self._emit({"type": "turn_outcome", "outcome": outcome, "recorded": recorded})
+        anchor = _gate.anchor_of(card)
+        if outcome.reason != "turn_failed" or fresh is None or not anchor:
+            # Only a failed turn read on a fresh tray, its card still owed:
+            # a turn that answered before it failed must never be reported
+            # (its span would be empty while the card waits).
+            return None, fresh
+        if _never_looked(end.agentchat_calls):
+            # Its prompt names the conversation only; with no AgentChat call
+            # that worked it never read the messages, so they cannot be why
+            # it failed.
+            return None, fresh
+        return self._failed(
+            kind="turn",
+            conversation_id=conversation_id,
+            through_message_id=anchor,
+            outcome="timed_out" if end.timed_out else "failed",
+            work=work,
+            ended_at=self._now(),
+            card=card,
+            category=category,
+            chain=chain,
+            detail=end.detail,
+        ), fresh
 
     async def _start_invite_turn_for(
         self, invite: dict[str, Any], texts: Texts
@@ -1537,6 +2327,7 @@ class ReceiveLoop:
 
         async def admit() -> bool:
             assert self._start_invite_turn is not None
+            work = self._ledger.begin()
             admission = await self._admit(self._start_invite_turn, request)
             if not admission.started or admission.done is None:
                 self._tracker.end(handle)
@@ -1547,18 +2338,20 @@ class ReceiveLoop:
                 return False
             self._counts["invite_turns_started"] += 1
             self._emit({"type": "turn_started", "request": request})
-            self._spawn_turn(self._after_invite_turn(handle, invite, admission.done))
+            self._spawn_turn(self._after_invite_turn(handle, invite, admission.done, work))
             return True
 
         return await self._launch(handle, admit)
 
     async def _after_invite_turn(
-        self, handle: TurnHandle, invite: dict[str, Any], done: Awaitable[TurnEnd]
+        self, handle: TurnHandle, invite: dict[str, Any], done: Awaitable[TurnEnd], work: Work
     ) -> None:
         try:
             end = await self._tracker.confirmed_end(handle, done)
             if end is None or not self._tracker.holds(handle):
                 return  # released: nothing recorded
+            if end.status == "completed":
+                self._ledger.completed(work, "turn", (f"invite:{invite['invite_id']}",))
             await self._track(self._record_invite_outcome(invite, end, handle))
             # D5 pacing: no second invite turn for it for a while (an
             # answered invite has left the tray anyway).
@@ -1567,6 +2360,8 @@ class ReceiveLoop:
             self._tracker.end(handle)
             self._slot_freed(handle)
             self._after_turn_ended()
+        if not self._stopped:
+            await self._track(self._settle_turns(None, None))
 
     async def _after_run_invites(self, invites: list[dict[str, Any]], end: RunEnd) -> None:
         completed = end.status == "completed"
@@ -1702,6 +2497,240 @@ class ReceiveLoop:
             self._held_while_running = False
             self._wake_from("more")
 
+    # ─── could not process ───────────────────────────────────────────────
+
+    def _failed(self, **fields: Any) -> Failure:
+        """A failed run for one conversation, as it happens: its
+        conversation counts as failing for its kind until work of that kind
+        completes again (see :meth:`Ledger.isolated`)."""
+        failure = Failure(**fields)
+        self._ledger.failed(failure)
+        return failure
+
+    def _reporter(self) -> Callable[..., Any] | None:
+        """The client's ``conversations.report_processing_failure``; ``None``
+        for a client without it (nothing is reported)."""
+        conversations = getattr(self._client, "conversations", None)
+        report = getattr(conversations, "report_processing_failure", None)
+        return report if callable(report) else None
+
+    async def _settle(
+        self,
+        new: list[Failure],
+        kinds: tuple[FailureKind, ...],
+        *,
+        runtime_check: bool,
+        in_cycle: bool,
+        fresh: dict[str, Any] | None = None,
+        hold: bool = False,
+    ) -> list[tuple[Failure, str]]:
+        """Report each failure that has evidence: the ``new`` ones and those
+        of ``kinds`` waiting from before, one per conversation (the newest).
+        Evidence is another conversation's work of the same kind that
+        completed after the failure started (``other_run_completed``), else,
+        when ``runtime_check`` is allowed (nothing else is left to run) and
+        the failure is the only conversation of its kind failing since that
+        kind last completed, the ``check_runtime`` hook passing (run once for
+        all of them; ``runtime_check``). A failure without evidence waits
+        for some. Before a report the card is read on a fresh tray
+        (``fresh``, else read once here): a card gone, muted, answered or
+        with a verdict since is not reported, and a tray that cannot be read
+        reports nothing now. ``hold``: each reported conversation is held out
+        of the gate until the caller releases it (it acts on the answer
+        outside a cycle). Returns each reported failure with the server's
+        action, in order."""
+        report = self._reporter()
+        if report is None:
+            return []
+        self._counts["processing_failures"] += len(new)
+        candidates = newest_per_conversation([*self._ledger.take(kinds), *new])
+        reported: list[tuple[Failure, str]] = []
+        works: bool | None = None
+        read = fresh is not None
+        held: list[str] = []
+        try:
+            for failure in candidates:
+                evidence: str | None = None
+                if self._ledger.has_evidence(failure):
+                    evidence = "other_run_completed"
+                elif (
+                    runtime_check
+                    and self._check_runtime is not None
+                    and self._ledger.fresh_for_check(failure)
+                    and not self._stopped
+                ):
+                    if works is None:
+                        works = await self._runtime_check(in_cycle)
+                        # The check took time: a tray read before it may be
+                        # stale by now.
+                        fresh, read = None, False
+                    if works:
+                        evidence = "runtime_check"
+                    else:
+                        failure.runtime_checked = True
+                if evidence is not None and not read and not self._stopped:
+                    fresh = await self._read_tray()
+                    read = True
+                if evidence is None or self._stopped or fresh is None:
+                    self._ledger.park(failure)
+                    continue
+                if not _still_owed(failure, fresh):
+                    continue  # handled since: nothing to report
+                if hold:
+                    self._settling.add(failure.conversation_id)
+                    held.append(failure.conversation_id)
+                reported.append((failure, await self._report(report, failure, evidence)))
+        except BaseException:
+            for conversation_id in held:
+                self._settling.discard(conversation_id)
+            raise
+        return reported
+
+    async def _report(self, report: Callable[..., Any], failure: Failure, evidence: str) -> str:
+        """One report; the server's action (``none`` when the report itself
+        failed, or for an action this release does not know)."""
+        answer: Any = None
+        error: str | None = None
+        try:
+            pending = report(
+                failure.conversation_id,
+                through_message_id=failure.through_message_id,
+                outcome=failure.outcome,
+                evidence=evidence,
+            )
+            answer = await pending if inspect.isawaitable(pending) else pending
+        except NotFoundError as err:
+            # The route's own 404: not a member, or the anchor is not in
+            # this conversation. Nothing to act on.
+            error = err.code
+        except Exception as err:
+            error = str(err) or type(err).__name__
+            self._counts["failure_report_errors"] += 1
+            self._fail(err)
+        raw = _field(answer, "action") if error is None else None
+        action = raw if isinstance(raw, str) and raw else "none"
+        if error is None:
+            self._counts["failures_reported"] += 1
+        self._failure_actions[action] = self._failure_actions.get(action, 0) + 1
+        hidden = _field(answer, "hidden_message_ids")
+        self._emit(
+            {
+                "type": "processing_failure",
+                "kind": failure.kind,
+                "conversation_id": failure.conversation_id,
+                "through_message_id": failure.through_message_id,
+                "outcome": failure.outcome,
+                "evidence": evidence,
+                "action": action,
+                "attempts": _field(answer, "attempts") if error is None else None,
+                "hidden_message_ids": list(hidden) if isinstance(hidden, list) else [],
+                "hidden_count": _field(answer, "hidden_count") if error is None else None,
+                "paused_until": _field(answer, "paused_until") if error is None else None,
+                "error": error,
+            }
+        )
+        return action
+
+    async def _runtime_check(self, in_cycle: bool) -> bool:
+        """The integration's ``check_runtime``, bounded by
+        ``gate_call_timeout_ms`` and by :meth:`stop` (a check the loop stops
+        waiting for has not passed). In a cycle, with that deadline on, its
+        time is not counted by the watchdog (as a gate call's)."""
+        check = self._check_runtime
+        if check is None:
+            return False
+        timeout_ms = self._gate_call_timeout_ms
+        uncounted: contextlib.AbstractContextManager[None] = (
+            self._uncounted() if in_cycle and timeout_ms > 0 else contextlib.nullcontext()
+        )
+        detail: str | None = None
+        works = False
+        task: asyncio.Future[Any] = asyncio.ensure_future(self._call(check))
+        stopping = asyncio.ensure_future(self._stopping.wait())
+        expired: asyncio.Future[None] = asyncio.get_running_loop().create_future()
+
+        def expire() -> None:
+            if not expired.done():
+                expired.set_result(None)
+
+        timer = self._set_timer(timeout_ms, expire) if timeout_ms > 0 else None
+        try:
+            with uncounted:
+                await asyncio.wait({task, stopping, expired}, return_when=asyncio.FIRST_COMPLETED)
+            if task.done():
+                try:
+                    answer = task.result()
+                except Exception as err:
+                    detail = str(err) or type(err).__name__
+                else:
+                    works = runtime_ok(answer)
+                    if not works and not isinstance(answer, bool):
+                        reason = _field(answer, "reason")
+                        detail = str(reason) if reason is not None else None
+            else:
+                detail = (
+                    "the loop stopped"
+                    if stopping.done()
+                    else f"no answer within {_number_text(timeout_ms)} ms"
+                )
+        finally:
+            if timer is not None:
+                timer.cancel()
+            stopping.cancel()
+            if not task.done():
+                task.cancel()
+                task.add_done_callback(_consume_outcome)
+        self._counts["runtime_checks_ok" if works else "runtime_checks_failed"] += 1
+        self._emit({"type": "runtime_check", "ok": works, "detail": detail})
+        return works
+
+    async def _settle_turns(self, failure: Failure | None, fresh: dict[str, Any] | None) -> None:
+        """After a reply or invite turn's end (gate-call mode): settle its
+        failure and the failed turns waiting (``fresh``: the tray read after
+        the turn). The runtime check runs only once no turn is running or
+        waiting: the others' ends come first. A turn the server says to run
+        again is started again (queued behind the waiting ones); until then
+        its conversation is held out of the gate, so a cycle cannot gate it
+        meanwhile."""
+        drained = not self._active and not self._waiting
+        reported = await self._settle(
+            [failure] if failure is not None else [],
+            ("turn",),
+            runtime_check=drained,
+            in_cycle=False,
+            fresh=fresh,
+            hold=True,
+        )
+        try:
+            for settled, action in reported:
+                if _runs_again(settled, action) and not self._stopped:
+                    await self._rerun_turn(settled)
+        finally:
+            for settled, _action in reported:
+                self._settling.discard(settled.conversation_id)
+            if reported:
+                self._after_turn_ended()  # a card a cycle left out meanwhile is read again
+
+    async def _rerun_turn(self, failure: Failure) -> None:
+        """Start a reply turn again for a conversation the server said to
+        run again: its card from a fresh read of the tray (gone, muted, or
+        already taken by a turn: nothing to do)."""
+        texts = self._texts.current() or await self._texts.ensure()
+        if texts is None or self._stopped:
+            return
+        card = _owed_card(await self._read_tray(), failure.conversation_id)
+        conversation_id = failure.conversation_id
+        if (
+            card is None
+            or self._stopped
+            or self._tracker.conversation_running(conversation_id)
+            or conversation_id in self._records_in_flight
+        ):
+            return
+        self._counts["reruns"] += 1
+        reply = SimpleNamespace(conversation_id=conversation_id, card=card, category=failure.category)
+        await self._start_reply_turn(reply, texts, chain=failure.chain + 1, by_cycle=False)
+
     # ─── small things ────────────────────────────────────────────────────
 
     def _recording_client(self, token: int) -> Any:
@@ -1812,13 +2841,13 @@ class ReceiveLoop:
         task.add_done_callback(self._turn_tasks.discard)
         task.add_done_callback(self._log_task_failure)
 
-    async def _track(self, coro: Any) -> None:
+    async def _track(self, coro: Any) -> Any:
         """Recording under way after a turn's confirmed end: :meth:`stop`
-        waits for it."""
+        waits for it. Returns what it returned."""
         task = asyncio.ensure_future(coro)
         self._pending_work.add(task)
         try:
-            await task
+            return await task
         finally:
             self._pending_work.discard(task)
 
@@ -1883,7 +2912,9 @@ def _resolved(value: TurnEnd) -> Awaitable[TurnEnd]:
 
 
 __all__ = [
+    "EVIDENCE_WINDOW_MS",
     "GATE_CHUNK_SIZE",
+    "MAX_FAILURE_REPORTS",
     "TRAY_LIMIT",
     "CycleOutcome",
     "CycleSummary",
@@ -1896,9 +2927,11 @@ __all__ = [
     "RunEnd",
     "RunRequest",
     "RunStarter",
+    "RuntimeCheck",
     "TurnAdmission",
     "TurnRequest",
     "TurnStarter",
     "WakeSource",
+    "conversation_run_prompt",
     "reply_prompt",
 ]

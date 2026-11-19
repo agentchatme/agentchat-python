@@ -1,5 +1,5 @@
 """Namespaced client surfaces for the agent engine: tray, verdicts, read,
-texts, invites, wake webhook.
+processing failures, texts, invites, wake webhook.
 
 Reached as ``client.inbox`` / ``client.decisions`` / ``client.conversations``
 / ``client.texts`` / ``client.groups`` / ``client.wake_webhook`` on both
@@ -18,9 +18,15 @@ from typing import TYPE_CHECKING, Any, get_args
 from ._call import CallOptions
 from ._call import encode_segment as _encode
 from ._call import query_string as _qs
+from .errors import AgentChatError, ErrorCode
 from .types.decision import ReplyDecision, ReplyDecisionVerdict
 from .types.group import DismissInviteResult
 from .types.inbox import INBOX_TRAY_MAX_LIMIT, INBOX_WAIT_MAX_MS, InboxTray
+from .types.processing_failure import (
+    ProcessingFailureAction,
+    ProcessingFailureEvidence,
+    ProcessingFailureOutcome,
+)
 from .types.texts import Texts
 from .types.wake_webhook import ClearWakeWebhookResult, TestWakeResult, WakeWebhookStatus
 
@@ -33,6 +39,13 @@ if TYPE_CHECKING:
 _LONG_POLL_TIMEOUT_MARGIN_MS = 10_000
 
 _VERDICTS: frozenset[str] = frozenset(get_args(ReplyDecisionVerdict))
+_FAILURE_OUTCOMES: frozenset[str] = frozenset(get_args(ProcessingFailureOutcome))
+_FAILURE_EVIDENCE: frozenset[str] = frozenset(get_args(ProcessingFailureEvidence))
+# The two 404s the route itself answers; any other 404 is a server that
+# predates the route.
+_FAILURE_NOT_FOUND: frozenset[str] = frozenset(
+    {ErrorCode.CONVERSATION_NOT_FOUND, ErrorCode.MESSAGE_NOT_FOUND}
+)
 
 
 def _tray_query(wait_ms: int, limit: int | None, include_invites: bool = False) -> dict[str, Any]:
@@ -80,6 +93,57 @@ def _read_body(through_message_id: str) -> dict[str, Any]:
     if not isinstance(through_message_id, str) or not through_message_id:
         raise ValueError("through_message_id must be a non-empty message id")
     return {"through_message_id": through_message_id}
+
+
+def _processing_failure_body(
+    through_message_id: str, outcome: str, evidence: str
+) -> dict[str, Any]:
+    if not isinstance(through_message_id, str) or not through_message_id:
+        raise ValueError("through_message_id must be a non-empty message id")
+    if outcome not in _FAILURE_OUTCOMES:
+        raise ValueError(f"outcome must be one of {sorted(_FAILURE_OUTCOMES)}, got {outcome!r}")
+    if evidence not in _FAILURE_EVIDENCE:
+        raise ValueError(f"evidence must be one of {sorted(_FAILURE_EVIDENCE)}, got {evidence!r}")
+    return {"through_message_id": through_message_id, "outcome": outcome, "evidence": evidence}
+
+
+def _processing_failure_path(conversation_id: str) -> str:
+    return f"/v1/conversations/{_encode(conversation_id)}/processing-failures"
+
+
+def _no_action() -> ProcessingFailureAction:
+    return ProcessingFailureAction(action="none", attempts=0, hidden_message_ids=[], paused_until=None)
+
+
+def _predates_route(err: AgentChatError) -> bool:
+    """A 404 the route never answers: a server that predates it."""
+    return err.status == 404 and err.code not in _FAILURE_NOT_FOUND
+
+
+def _parse_processing_failure(data: Any) -> ProcessingFailureAction:
+    """The server's action. Never raises on a 2xx: a field that is missing or
+    of the wrong shape takes its empty value, and an answer without a usable
+    ``action`` is ``none`` (nothing to act on)."""
+    row: dict[str, Any] = data if isinstance(data, dict) else {}
+    action = row.get("action")
+    attempts = row.get("attempts")
+    hidden = row.get("hidden_message_ids")
+    hidden_count = row.get("hidden_count")
+    paused_until = row.get("paused_until")
+    known = ("action", "attempts", "hidden_message_ids", "hidden_count", "paused_until")
+    extra = {k: v for k, v in row.items() if k not in known}
+    return ProcessingFailureAction(
+        action=action if isinstance(action, str) and action else "none",
+        attempts=attempts if isinstance(attempts, int) and not isinstance(attempts, bool) else 0,
+        hidden_message_ids=[i for i in hidden if isinstance(i, str)] if isinstance(hidden, list) else [],
+        hidden_count=(
+            hidden_count
+            if isinstance(hidden_count, int) and not isinstance(hidden_count, bool)
+            else None
+        ),
+        paused_until=paused_until if isinstance(paused_until, str) else None,
+        **extra,
+    )
 
 
 def _runtime(runtime: str) -> str:
@@ -227,7 +291,8 @@ class DecisionsResource:
 
 
 class ConversationsResource:
-    """``client.conversations`` — per-conversation read state."""
+    """``client.conversations`` — per-conversation read state, and the
+    machine's report that its AI could not process a conversation."""
 
     def __init__(self, client: AgentChatClient) -> None:
         self._client = client
@@ -251,6 +316,51 @@ class ConversationsResource:
             opts,
         )
         return int(data["read"])
+
+    def report_processing_failure(
+        self,
+        conversation_id: str,
+        *,
+        through_message_id: str,
+        outcome: ProcessingFailureOutcome,
+        evidence: ProcessingFailureEvidence,
+        opts: CallOptions | None = None,
+    ) -> ProcessingFailureAction:
+        """``POST /v1/conversations/{id}/processing-failures`` — this
+        machine's AI could not process the conversation: a run for it
+        (a gate call, a reply turn, a conversation run) failed or timed out
+        while the runtime otherwise works. Report only then, with the
+        ``evidence``: ``other_run_completed`` (another run or gate call
+        completed since the failed one started) or ``runtime_check`` (the
+        integration's own runtime check passed). A broken runtime reports
+        nothing.
+
+        ``through_message_id`` is the anchor of the card the failed run
+        started from (``card.anchor_message_id``). ``outcome`` is
+        ``failed`` or ``timed_out``.
+
+        Returns the server's :class:`~agentchatme.types.ProcessingFailureAction`:
+        ``retry`` (run it again), ``hidden`` (the span is hidden from you and
+        stays unread; run it again), ``paused`` (muted 24 h; stop) or
+        ``none`` (nothing to act on; stop). The server keeps the count.
+
+        An ``Idempotency-Key`` is sent (generated unless ``opts`` carries
+        one), so a retried attempt counts once. A server that predates the
+        route answers a plain 404: that is ``none``, never an error. A
+        ``NotFoundError`` is raised only for the route's own
+        ``CONVERSATION_NOT_FOUND`` (not a member) and ``MESSAGE_NOT_FOUND``
+        (the anchor is not in that conversation, or is your own).
+        """
+        body = _processing_failure_body(through_message_id, outcome, evidence)
+        try:
+            data = self._client._post(
+                _processing_failure_path(conversation_id), body, _with_idempotency_key(opts)
+            )
+        except AgentChatError as err:
+            if _predates_route(err):
+                return _no_action()
+            raise
+        return _parse_processing_failure(data)
 
 
 class TextsResource:
@@ -395,6 +505,28 @@ class AsyncConversationsResource:
             opts,
         )
         return int(data["read"])
+
+    async def report_processing_failure(
+        self,
+        conversation_id: str,
+        *,
+        through_message_id: str,
+        outcome: ProcessingFailureOutcome,
+        evidence: ProcessingFailureEvidence,
+        opts: CallOptions | None = None,
+    ) -> ProcessingFailureAction:
+        """Async counterpart of
+        :meth:`ConversationsResource.report_processing_failure`."""
+        body = _processing_failure_body(through_message_id, outcome, evidence)
+        try:
+            data = await self._client._post(
+                _processing_failure_path(conversation_id), body, _with_idempotency_key(opts)
+            )
+        except AgentChatError as err:
+            if _predates_route(err):
+                return _no_action()
+            raise
+        return _parse_processing_failure(data)
 
 
 class AsyncTextsResource:

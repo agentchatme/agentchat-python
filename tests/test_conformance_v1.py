@@ -103,6 +103,22 @@ def test_texts_sample_carries_the_reply_turn_template() -> None:
     assert template != load("texts.sample.json")["wake_instruction"]
 
 
+def test_texts_sample_carries_the_conversation_run_template_and_the_note() -> None:
+    # Could not process: a conversation run names its one conversation by
+    # <conversation_id> and opens with the words the tools key on; the note
+    # names the sender by <sender>.
+    from agentchatme.integration import conversation_run_prompt
+
+    texts = Texts.model_validate(load("texts.sample.json"))
+    template = texts.conversation_run_template
+    assert isinstance(template, str) and "<conversation_id>" in template
+    assert template.startswith("AgentChat started this run for ONE conversation")
+    prompt = conversation_run_prompt(texts, "conv_x")
+    assert prompt is not None and "conv_x" in prompt and "<conversation_id>" not in prompt
+    note = texts.could_not_process_note
+    assert isinstance(note, str) and "@<sender>" in note
+
+
 def test_tray_sample_with_texts_sample_renders_the_expected_prompt() -> None:
     tray = load("tray.sample.json")
     texts = load("texts.sample.json")

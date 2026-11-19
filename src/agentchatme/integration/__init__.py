@@ -2,7 +2,8 @@
 AgentChat integration needs, written once. Each part is usable alone;
 :class:`ReceiveLoop` puts them together. The runtime supplies only how to
 ask its model (``call_model``) and how to start a turn (``start_turn``) in
-gate-call mode, or how to start a run (``start_run``) in single-run mode.
+gate-call mode, or how to start a run (``start_run``) in single-run mode,
+and optionally how to tell that it works (``check_runtime``).
 
 Same names as the TypeScript kit (``import { integration } from
 'agentchatme'``), in Python casing.
@@ -56,6 +57,8 @@ from .probe import (
     probe_hosted_tools_async,
 )
 from .receive_loop import (
+    EVIDENCE_WINDOW_MS,
+    MAX_FAILURE_REPORTS,
     CycleOutcome,
     CycleSummary,
     Readiness,
@@ -66,9 +69,11 @@ from .receive_loop import (
     ReceiveLoopStatus,
     RunEnd,
     RunRequest,
+    RuntimeCheck,
     TurnAdmission,
     TurnRequest,
     WakeSource,
+    conversation_run_prompt,
     reply_prompt,
 )
 from .texts_cache import (
@@ -86,11 +91,13 @@ from .turns import RunningTurn, TrackedTurn, TurnHandle, TurnTracker
 __all__ = [
     "DEFAULT_MAX_MS",
     "DEFAULT_QUIET_MS",
+    "EVIDENCE_WINDOW_MS",
     "HOSTED_MCP_PATH",
     "MANUAL_FETCH_TIMEOUT_MS",
     "MANUAL_MAX_BYTES",
     "MANUAL_MAX_REDIRECTS",
     "MANUAL_SKILL_NAME",
+    "MAX_FAILURE_REPORTS",
     "REQUIRED_HOSTED_TOOLS",
     "TEXTS_FETCH_TIMEOUT_MS",
     "TEXTS_REFRESH_MS",
@@ -117,6 +124,7 @@ __all__ = [
     "RunEnd",
     "RunRequest",
     "RunningTurn",
+    "RuntimeCheck",
     "ServedManual",
     "TextsCache",
     "TextsCacheSource",
@@ -137,6 +145,7 @@ __all__ = [
     "apply_invite_outcome_async",
     "apply_outcome",
     "apply_outcome_async",
+    "conversation_run_prompt",
     "hosted_mcp_url",
     "invite_outcome",
     "is_texts",
