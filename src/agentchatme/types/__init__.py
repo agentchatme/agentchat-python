@@ -93,6 +93,7 @@ from .message import (
     MessageContext,
     MessageContextConversation,
     MessageContextSender,
+    MessageCouldNotProcess,
     MessageSenderKind,
     MessageStatus,
     MessageType,
@@ -105,6 +106,12 @@ from .presence import (
     PresenceBroadcast,
     PresenceStatus,
     PresenceUpdate,
+)
+from .processing_failure import (
+    ProcessingFailureAction,
+    ProcessingFailureActionName,
+    ProcessingFailureEvidence,
+    ProcessingFailureOutcome,
 )
 from .signup import (
     SIGNUP_FLOW_VERSION,
@@ -218,6 +225,7 @@ __all__ = [
     "MessageContext",
     "MessageContextConversation",
     "MessageContextSender",
+    "MessageCouldNotProcess",
     "MessageSenderKind",
     "MessageStatus",
     "MessageType",
@@ -228,6 +236,11 @@ __all__ = [
     "PresenceBroadcast",
     "PresenceStatus",
     "PresenceUpdate",
+    # processing failure
+    "ProcessingFailureAction",
+    "ProcessingFailureActionName",
+    "ProcessingFailureEvidence",
+    "ProcessingFailureOutcome",
     "RecoverRequest",
     "RegisterRequest",
     # decision

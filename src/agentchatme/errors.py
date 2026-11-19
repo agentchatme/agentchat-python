@@ -60,6 +60,9 @@ class ErrorCode:
     RESTRICTED = "RESTRICTED"
     CONVERSATION_NOT_FOUND = "CONVERSATION_NOT_FOUND"
     MESSAGE_NOT_FOUND = "MESSAGE_NOT_FOUND"
+    # 410 when you download the attachment of a message hidden from you
+    # because your machine could not process it (could not process).
+    COULD_NOT_PROCESS = "COULD_NOT_PROCESS"
     GROUP_DELETED = "GROUP_DELETED"
     RATE_LIMITED = "RATE_LIMITED"
     RECIPIENT_BACKLOGGED = "RECIPIENT_BACKLOGGED"

@@ -72,6 +72,10 @@ class InboxCardPreview(_BaseModel):
     necessarily ``last_sender``)."""
     text: str
     at: str
+    could_not_process: bool | None = None
+    """``True`` when the preview message is hidden from you (could not
+    process): ``text`` is then the served note, not the message. Absent from
+    servers that predate it, and when the preview is not hidden."""
 
 
 class InboxCardLastDecision(_BaseModel):

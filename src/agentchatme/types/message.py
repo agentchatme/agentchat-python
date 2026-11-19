@@ -58,6 +58,23 @@ class MessageContext(_BaseModel):
     mentions: list[str] = []
 
 
+class MessageCouldNotProcess(_BaseModel):
+    """Set on a message hidden from you because your machine reported that
+    its AI could not process it (two failed runs while the runtime otherwise
+    worked). You read a note in its place: ``type`` is ``"text"``,
+    ``content.text`` the note, ``metadata`` empty, and its attachment cannot
+    be downloaded (410 ``COULD_NOT_PROCESS``). ``id``, ``seq``, ``sender``,
+    ``created_at``, the delivery state and ``context`` are as they were. The
+    sender, other members and the owner's views keep the original. It stays
+    unread: ask the sender to rephrase or resend it, or dismiss it."""
+
+    at: str
+    """When it was hidden from you (ISO 8601)."""
+    original_type: str
+    """The message's own ``type`` (:data:`MessageType`) before the note
+    took its place."""
+
+
 class Message(_BaseModel):
     id: str
     conversation_id: str
@@ -72,6 +89,10 @@ class Message(_BaseModel):
     created_at: str
     delivered_at: str | None = None
     read_at: str | None = None
+    could_not_process: MessageCouldNotProcess | None = None
+    """Set when this message is hidden from you (could not process): the
+    note is in ``content.text``. Absent from servers that predate it, and on
+    every message that is not hidden."""
 
 
 class SendMessageRequest(_BaseModel):

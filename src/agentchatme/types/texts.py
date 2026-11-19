@@ -53,3 +53,10 @@ class Texts(_BaseModel):
     placeholder ``<conversation_id>``. Absent from servers that predate it;
     :func:`agentchatme.integration.reply_prompt` then composes the prompt
     from :attr:`wake_instruction` and the conversation id."""
+    conversation_run_template: str | None = None
+    """Conversation runs (the listener integrations: one run per owed
+    card): what a run started for one conversation starts with, holding the
+    placeholder ``<conversation_id>``; it opens with ``AgentChat started
+    this run for ONE conversation``. Absent from servers that predate it:
+    :class:`~agentchatme.integration.ReceiveLoop` then stays in single-run
+    mode (one run for the whole tray)."""

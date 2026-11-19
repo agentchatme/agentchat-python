@@ -138,7 +138,7 @@ def _fake_loop(client: _LoopClient, fake: _FakeTime, **kwargs: Any) -> ReceiveLo
 
 @pytest.mark.parametrize("kind", ["plain", "async"])
 @pytest.mark.asyncio
-async def test_a_50_card_tray_is_five_calls_of_10_and_a_cut_off_chunk_3_leaves_only_its_cards_undecided(
+async def test_a_50_card_tray_is_five_calls_of_10_and_a_cut_off_chunk_3_is_gated_again_card_by_card(
     kind: str,
 ) -> None:
     cards = _cards(50)
@@ -164,17 +164,22 @@ async def test_a_50_card_tray_is_five_calls_of_10_and_a_cut_off_chunk_3_leaves_o
     await loop.start()
     await _cycle(loop)
 
-    texts = texts_body()
-    assert len(prompts) == 5
-    for index, prompt in enumerate(prompts):
+    texts = Texts.model_validate(texts_body())
+    assert len(prompts) == 15
+    for index, prompt in enumerate(prompts[:5]):
         chunk = cards[index * 10 : index * 10 + 10]
         assert _ids(prompt) == [card["conversation_id"] for card in chunk]
-        assert prompt == _chunk_prompt(tray, chunk, Texts.model_validate(texts))
+        assert prompt == _chunk_prompt(tray, chunk, texts)
         assert "Your tray, as the server built it: 10 conversations." in prompt
         assert "Card 10 of 10" in prompt and "Card 11" not in prompt
-    # Chunks 1, 2, 4 and 5 are recorded; chunk 3's cards stay undecided.
-    undecided = {f"c{i:02d}" for i in range(21, 31)}
-    assert _recorded(client) == [c["conversation_id"] for c in cards if c["conversation_id"] not in undecided]
+    # The cut-off chunk 3, card by card, in tray order, before any turn.
+    split = cards[20:30]
+    for card, prompt in zip(split, prompts[5:]):
+        assert prompt == _chunk_prompt(tray, [card], texts)
+        assert "Card 1 of 1" in prompt
+    # Chunks 1, 2, 4 and 5 are recorded as they answer, then chunk 3's cards.
+    order = [*range(1, 21), *range(31, 51), *range(21, 31)]
+    assert _recorded(client) == [f"c{i:02d}" for i in order]
     for entry in client.decisions.recorded:
         cid = entry["conversation_id"]
         assert entry["decision"] == _decision(cid, frozenset())
@@ -182,8 +187,9 @@ async def test_a_50_card_tray_is_five_calls_of_10_and_a_cut_off_chunk_3_leaves_o
     summary = loop.status().last_cycle
     assert summary is not None
     assert summary.outcome == "decided"
-    assert (summary.gated, summary.chunks_ok, summary.chunks_failed, summary.undecided) == (50, 4, 1, 10)
-    assert (summary.dismiss, summary.defer, summary.reply) == (20, 20, 0)
+    assert (summary.gated, summary.chunks_ok, summary.chunks_failed, summary.undecided) == (50, 4, 1, 0)
+    assert (summary.split_calls_ok, summary.split_calls_failed) == (10, 0)
+    assert (summary.dismiss, summary.defer, summary.reply) == (25, 25, 0)
     assert summary.failure == "1 of 5 gate chunks failed; chunk 3: no usable verdicts in the answer"
     chunk_events = [e for e in events if e["type"] == "gate_chunk"]
     assert len({e["cycle"] for e in chunk_events}) == 1  # one cycle's chunks share its identifier
@@ -199,8 +205,13 @@ async def test_a_50_card_tray_is_five_calls_of_10_and_a_cut_off_chunk_3_leaves_o
         }
         for i in range(1, 6)
     ]
+    card_events = [e for e in events if e["type"] == "gate_card"]
+    assert [(e["conversation_id"], e["attempt"], e["outcome"]) for e in card_events] == [
+        (card["conversation_id"], 0, "decided") for card in split
+    ]
     counters = loop.status().counters
     assert (counters["chunks_ok"], counters["chunks_failed"]) == (4, 1)
+    assert (counters["gate_splits"], counters["split_calls_ok"], counters["split_calls_failed"]) == (1, 10, 0)
     await loop.stop()
 
 
@@ -256,7 +267,9 @@ async def test_the_sample_tray_through_the_loop_gives_gate_prompt_expected_byte_
     )
     await loop.start()
     await _cycle(loop)
-    assert len(prompts) == 1 and prompts[0] + "\n" == expected
+    assert prompts[0] + "\n" == expected
+    # The empty answer fails the chunk: each card is gated again on its own.
+    assert len(prompts) == 1 + len(tray["conversations"])
     await loop.stop()
 
 
@@ -322,10 +335,12 @@ async def test_every_chunk_failing_is_fail_closed_and_records_nothing() -> None:
     loop = _loop(client, call_model=lambda p: calls.append(p) or "", start_turn=_Turns())
     await loop.start()
     await _cycle(loop)
-    assert len(calls) == 3 and client.decisions.recorded == []
+    # Three chunk calls, then every card on its own: all fail.
+    assert len(calls) == 3 + 25 and client.decisions.recorded == []
     summary = loop.status().last_cycle
     assert summary is not None and summary.outcome == "fail_closed"
     assert (summary.chunks_ok, summary.chunks_failed, summary.undecided, summary.gated) == (0, 3, 25, 25)
+    assert (summary.split_calls_ok, summary.split_calls_failed) == (0, 25)
     assert summary.failure == "3 of 3 gate chunks failed; chunk 1: no usable verdicts in the answer"
     await loop.stop()
 
@@ -538,14 +553,16 @@ async def test_each_chunk_has_its_own_deadline_and_cancel_handle_async() -> None
     assert len(handles) == 2 and not handles[1][0].is_set()  # not yet past its deadline
     fake.advance(1)  # chunk 2's own 60 s are up
     await _eventually(lambda: loop.status().last_cycle is not None, "the cycle")
-    assert len(handles) == 3
-    assert [was_set for _h, was_set in handles] == [False, False, False]  # each call starts fresh
-    assert handles[1][0].is_set() and not handles[0][0].is_set() and not handles[2][0].is_set()
-    assert len({id(h) for h, _s in handles}) == 3
-    assert _recorded(client) == [f"c{i:02d}" for i in [*range(1, 11), *range(21, 31)]]
+    # Chunk 3, then chunk 2's ten cards one per call, each with a fresh handle.
+    assert len(handles) == 13
+    assert [was_set for _h, was_set in handles] == [False] * 13  # each call starts fresh
+    assert handles[1][0].is_set()
+    assert not any(h.is_set() for h, _s in handles[:1] + handles[2:])
+    assert len({id(h) for h, _s in handles}) == 13
+    assert _recorded(client) == [f"c{i:02d}" for i in [*range(1, 11), *range(21, 31), *range(11, 21)]]
     summary = loop.status().last_cycle
     assert summary is not None and summary.outcome == "decided"
-    assert (summary.chunks_ok, summary.chunks_failed, summary.undecided) == (2, 1, 10)
+    assert (summary.chunks_ok, summary.chunks_failed, summary.undecided, summary.split_calls_ok) == (2, 1, 0, 10)
     assert summary.failure == (
         "1 of 3 gate chunks failed; chunk 2: model call timed out: no answer within 60000 ms"
     )
@@ -575,10 +592,10 @@ async def test_each_chunk_has_its_own_deadline_and_cancel_handle_plain() -> None
     fake.advance(60_000)
     await _eventually(lambda: loop.status().last_cycle is not None, "the cycle")
     await loop.idle()
-    assert len(handles) == 3
-    assert [was_set for _h, was_set in handles] == [False, False, False]
-    assert handles[1][0].is_set() and not handles[2][0].is_set()
-    assert _recorded(client) == [f"c{i:02d}" for i in [*range(1, 11), *range(21, 31)]]
+    assert len(handles) == 13
+    assert [was_set for _h, was_set in handles] == [False] * 13
+    assert handles[1][0].is_set() and not any(h.is_set() for h, _s in handles[2:])
+    assert _recorded(client) == [f"c{i:02d}" for i in [*range(1, 11), *range(21, 31), *range(11, 21)]]
     summary = loop.status().last_cycle
     assert summary is not None and (summary.outcome, summary.chunks_failed) == ("decided", 1)
     assert "chunk 2: model call timed out" in (summary.failure or "")
@@ -644,12 +661,12 @@ async def test_a_deadline_does_not_wait_for_a_call_that_ignores_its_cancellation
     # the cycle until the call chose to end).
     fake = _FakeTime()
     client = _LoopClient([_tray(_cards(3))])
-    calling = asyncio.Event()
+    calls: list[str] = []
     release = asyncio.Event()
     swallowed: list[bool] = []
 
     async def call_model(prompt: str) -> str:
-        calling.set()
+        calls.append(prompt)
         while not release.is_set():
             try:
                 await release.wait()
@@ -661,13 +678,16 @@ async def test_a_deadline_does_not_wait_for_a_call_that_ignores_its_cancellation
     await loop.start()
     try:
         loop.wake()
-        await asyncio.wait_for(calling.wait(), 5.0)
-        fake.advance(60_000)
-        await _eventually(lambda: loop.status().last_cycle is not None, "the cycle to end at the deadline")
+        # The chunk's call, then each card's own: every one past its deadline.
+        for made in range(1, 5):
+            await _eventually(lambda made=made: len(calls) == made, f"gate call {made}")
+            fake.advance(60_000)
+        await _eventually(lambda: loop.status().last_cycle is not None, "the cycle to end at the deadlines")
         summary = loop.status().last_cycle
         assert summary is not None and summary.outcome == "fail_closed"
         assert summary.failure == "model call timed out: no answer within 60000 ms"
-        assert swallowed == [True]  # the call is still running, unheard
+        assert summary.split_calls_failed == 3
+        assert swallowed == [True] * 4  # the calls are still running, unheard
         release.set()  # its late answer is not acted on
         for _ in range(20):
             await asyncio.sleep(0)
@@ -691,8 +711,11 @@ async def test_a_large_deadline_is_printed_as_an_integer_in_the_failure() -> Non
     loop = _fake_loop(client, fake, call_model=call_model, start_turn=_Turns(), gate_call_timeout_ms=1_200_000)
     await loop.start()
     loop.wake()
-    await asyncio.wait_for(calling.wait(), 5.0)
-    fake.advance(1_200_000)
+    # The chunk's call, then each of its two cards on its own.
+    for _call in range(3):
+        await asyncio.wait_for(calling.wait(), 5.0)
+        calling.clear()
+        fake.advance(1_200_000)
     await _eventually(lambda: loop.status().last_cycle is not None, "the cycle")
     assert loop.status().last_cycle.failure == "model call timed out: no answer within 1200000 ms"  # type: ignore[union-attr]
     await loop.stop()
@@ -887,7 +910,7 @@ async def test_the_failure_counts_the_calls_made_and_names_the_chunk_by_its_plan
     loop = _loop(client, call_model=call_model, start_turn=_Turns(), on_event=events.append)
     await loop.start()
     await _cycle(loop)
-    assert len(calls) == 2
+    assert len(calls) == 2 + 5  # chunk 3's five cards gated again, one per call
     summary = loop.status().last_cycle
     assert summary is not None and summary.outcome == "decided"
     assert summary.failure == "1 of 2 gate chunks failed; chunk 3: no usable verdicts in the answer"

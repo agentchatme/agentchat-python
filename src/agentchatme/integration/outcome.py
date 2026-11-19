@@ -76,12 +76,17 @@ class TurnEnd:
     :class:`~agentchatme.integration.TurnTracker`). ``agentchat_calls`` is
     ``None`` when the runtime cannot count its AgentChat calls; that counts
     as "it looked".
+
+    ``timed_out`` marks a ``failed`` end that came from the runtime's own
+    time limit (it stopped the turn): the receive loop then reports the
+    failure, when it reports one, as ``timed_out``.
     """
 
     status: TurnStatus
     agentchat_calls: AgentChatCallCount | None = None
     detail: str | None = None
     next: Awaitable[TurnEnd] | None = field(default=None, compare=False, repr=False)
+    timed_out: bool = False
 
 
 TurnOutcomeReason = Literal[
