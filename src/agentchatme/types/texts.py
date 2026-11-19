@@ -60,3 +60,8 @@ class Texts(_BaseModel):
     this run for ONE conversation``. Absent from servers that predate it:
     :class:`~agentchatme.integration.ReceiveLoop` then stays in single-run
     mode (one run for the whole tray)."""
+    could_not_process_note: str | None = None
+    """The served wording of the note a message hidden from you (could not
+    process) reads as. The server fills it into each hidden message itself
+    (sender included); this copy is for hosts that show or explain it.
+    Absent from servers that predate it."""

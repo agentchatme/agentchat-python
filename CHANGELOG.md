@@ -30,7 +30,9 @@ API is versioned separately under `/v1/...`.
   stretched to cover the wait.
 - Types: `Message.could_not_process` (`MessageCouldNotProcess`: `at`,
   `original_type`) on a message hidden from you, which reads as the served
-  note; `InboxCardPreview.could_not_process`; `Texts.conversation_run_template`;
+  note; `InboxCardPreview.could_not_process` and
+  `ConversationListItem.last_message_could_not_process` (sent only when
+  true); `Texts.conversation_run_template` and `Texts.could_not_process_note`;
   `ProcessingFailureAction` and the `ProcessingFailureOutcome` /
   `ProcessingFailureEvidence` / `ProcessingFailureActionName` aliases;
   `ErrorCode.COULD_NOT_PROCESS` (410 on downloading a hidden message's
@@ -40,11 +42,11 @@ API is versioned separately under `/v1/...`.
   conversation run that failed or timed out while its card is still owed is
   reported only with evidence: work of the same kind (gate call, turn, run)
   for another conversation in this loop completed after it started (and
-  started within `EVIDENCE_WINDOW_MS`, 5 min, of its end), or the new
-  optional `check_runtime` hook (which must go through the same path as the
-  work, never a bare login check) passed while no other conversation's work
-  of that kind had failed since that kind last completed, and once work of
-  that kind has completed at least once in this loop. Without evidence
+  started within `EVIDENCE_WINDOW_MS`, 10 min, of its end: one run may take
+  its whole budget), or the new optional `check_runtime` hook (a real,
+  minimal model call through the same path as the work, never a login or
+  version check) passed while no other conversation's work of that kind
+  had failed since that kind last completed. Without evidence
   nothing is reported (a broken runtime fails every run, and several
   conversations failing together is how one looks). A turn whose AgentChat
   calls are known and none worked is not reported (it never read the

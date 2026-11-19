@@ -68,12 +68,11 @@ call, a turn for a turn, a run for a run: each kind takes its own path
 through the runtime) for another conversation in this loop completed after
 the failed one started (``other_run_completed``; the completed work must
 have started within :data:`EVIDENCE_WINDOW_MS` of the failure's end), or
-the integration's ``check_runtime`` hook, run right after it, passed while
-no other conversation's work of that kind had failed since that kind last
-completed, and once work of that kind has completed at least once in this
-loop (``runtime_check``: several conversations failing together is how a
-broken runtime looks, a check may be lighter than the work, and a path that
-never completed may never have worked).
+the integration's ``check_runtime`` hook (a real, minimal model call
+through the same path as the work), run right after it, passed while no
+other conversation's work of that kind had failed since that kind last
+completed (``runtime_check``: several conversations failing together is how
+a broken runtime looks).
 Without evidence nothing is reported: a broken runtime fails every run, and
 that is the ``runs_failing`` path. A turn whose AgentChat calls are known
 and none worked never read the conversation and is not reported. A failure
@@ -476,16 +475,17 @@ TurnStarter = Callable[[TurnRequest], Any]
 RunStarter = Callable[[RunRequest], Any]
 ReadinessCheck = Callable[[], Any]
 RuntimeCheck = Callable[[], Any]
-"""``check_runtime``: whether the runtime works right now, through the same
-path as its gate calls, turns or runs (the same model and launcher), with no
-AgentChat content in it. A login check or a bare ping that passes while the
-real work cannot run is the kind of check that must not be used. A
-coroutine or a plain function (run in a worker thread); ``True``, or a
+"""``check_runtime``: whether the runtime works right now. It must be a real,
+minimal model call through the same path as the work (the same model, and
+for turns or runs the same launcher), with no AgentChat content in it;
+never a login or version check, which can pass while the work cannot run.
+A coroutine or a plain function (run in a worker thread); ``True``, or a
 :class:`Readiness` (or anything) whose ``ready`` / ``ok`` is true, means it
 works. Bounded by ``gate_call_timeout_ms`` and by :meth:`ReceiveLoop.stop`;
 raising or running past it means it does not. It speaks for a failure only
-when that conversation is the only one of its kind failing and work of
-that kind has completed at least once in this loop."""
+when that conversation is the only one of its kind failing since that kind
+last completed: with one active conversation (no other run to compare
+with), it is the only evidence there is."""
 
 
 class _StaticTexts:
@@ -872,10 +872,11 @@ class ReceiveLoop:
     counts against, or for, the running cycle).
 
     ``check_runtime`` (optional, :data:`RuntimeCheck`) answers whether the
-    runtime works right now, with no AgentChat content in it: it is the
-    evidence for reporting a failed run when no other conversation's run
-    completed since (see the module docstring); without it such a failure
-    waits for one. ``conversation_runs`` (single-run mode, default
+    runtime works right now: a real, minimal model call through the same
+    path as the work, with no AgentChat content in it. It is the evidence
+    for reporting a failed run when no other conversation's run completed
+    since (see the module docstring); without it such a failure waits for
+    one, and an agent with one active conversation never reports. ``conversation_runs`` (single-run mode, default
     ``True``): one run per owed card when the served texts carry
     ``conversation_run_template``; ``False`` keeps one run for the whole
     tray.
