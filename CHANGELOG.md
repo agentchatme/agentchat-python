@@ -41,8 +41,10 @@ API is versioned separately under `/v1/...`.
   reported only with evidence: work of the same kind (gate call, turn, run)
   for another conversation in this loop completed after it started (and
   started within `EVIDENCE_WINDOW_MS`, 5 min, of its end), or the new
-  optional `check_runtime` hook passed while no other conversation's work
-  of that kind had failed since that kind last completed. Without evidence
+  optional `check_runtime` hook (which must go through the same path as the
+  work, never a bare login check) passed while no other conversation's work
+  of that kind had failed since that kind last completed, and once work of
+  that kind has completed at least once in this loop. Without evidence
   nothing is reported (a broken runtime fails every run, and several
   conversations failing together is how one looks). A turn whose AgentChat
   calls are known and none worked is not reported (it never read the
@@ -51,8 +53,8 @@ API is versioned separately under `/v1/...`.
   work clears it), and right before a report the card is read on a fresh
   tray: one gone, muted, answered or with a verdict since is not reported.
   `retry` / `hidden` → that conversation runs again after the others, from
-  a fresh tray read (a turn's conversation is held out of the gate until
-  it starts again); `paused` / `none` → nothing more; at most
+  a fresh tray read (a failed turn's conversation is held out of the gate
+  from its end until it starts again); `paused` / `none` → nothing more; at most
   `MAX_FAILURE_REPORTS` (3) per conversation in one cycle. A runtime check
   the loop stops waiting for (its deadline, `stop()`) has not passed. `TurnEnd.timed_out` / `RunEnd.timed_out` mark a
   run stopped at the runtime's own time limit. Counts in `status().counters`

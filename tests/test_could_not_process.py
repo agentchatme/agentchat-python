@@ -445,6 +445,19 @@ def _events(events: list[dict[str, Any]], kind: str) -> list[dict[str, Any]]:
     return [event for event in events if event["type"] == kind]
 
 
+async def _prove(loop: ReceiveLoop, server: _Server, model: _Model | None = None) -> None:
+    """One gate call completes before the test's own cards: the gate path
+    has worked in this loop, so a runtime check may speak for it."""
+    cards = server.cards
+    server.cards = {"c0": _card("c0", "m0")}
+    await _cycle(loop)
+    assert server.recorded and server.recorded[-1]["conversation_id"] == "c0"
+    server.cards = cards
+    server.recorded.clear()
+    if model is not None:
+        model.prompts.clear()
+
+
 # ─────────────── gate-call mode: the split and the report ───────────────
 
 
@@ -557,6 +570,7 @@ async def test_a_runtime_check_that_does_not_pass_reports_nothing(answer: Any) -
 
     loop = _gate_loop(server, _Model(), check_runtime=check_runtime, on_event=events.append)
     await loop.start()
+    await _prove(loop, server)
     await _cycle(loop)
     assert server.reports == []
     assert loop.status().counters["runtime_checks_failed"] == 1
@@ -571,6 +585,7 @@ async def test_a_runtime_check_that_passes_is_the_evidence(answer: Any) -> None:
     server = _Server([_flagged("c1", "m1")], actions=["none"])
     loop = _gate_loop(server, _Model(), check_runtime=lambda: answer)
     await loop.start()
+    await _prove(loop, server)
     await _cycle(loop)
     assert server.reported() == [("c1", "m1", "failed", "runtime_check")]
     await loop.stop()
@@ -583,6 +598,7 @@ async def test_paused_none_or_an_unknown_action_stops_for_that_conversation(acti
     model = _Model()
     loop = _gate_loop(server, model, check_runtime=lambda: True)
     await loop.start()
+    await _prove(loop, server, model)
     await _cycle(loop)
     assert model.cards() == [["c1"]] and len(server.reports) == 1
     assert loop.status().counters["failure_actions"] == {action: 1}
@@ -596,6 +612,7 @@ async def test_at_most_three_reports_per_conversation_in_one_cycle() -> None:
     model = _Model()
     loop = _gate_loop(server, model, check_runtime=lambda: True)
     await loop.start()
+    await _prove(loop, server, model)
     await _cycle(loop)
     assert MAX_FAILURE_REPORTS == 3
     assert len(server.reports) == 3 and model.cards() == [["c1"]] * 3
@@ -608,7 +625,9 @@ async def test_a_single_card_gate_call_past_its_deadline_is_reported_as_timed_ou
     server = _Server([_card("c1", "m1")], actions=["none"])
     calling = asyncio.Event()
 
-    async def call_model(_prompt: str, *, cancel: asyncio.Event) -> str:
+    async def call_model(prompt: str, *, cancel: asyncio.Event) -> str:
+        if '"conversation_id": "c0"' in prompt:
+            return json.dumps({"decisions": [{"conversation_id": "c0", "decision": "dismiss"}]})
         calling.set()
         await cancel.wait()
         return ""
@@ -628,10 +647,11 @@ async def test_a_single_card_gate_call_past_its_deadline_is_reported_as_timed_ou
         set_timer=fake.set_timer,
     )
     await loop.start()
+    await _prove(loop, server)
     loop.wake()
     await asyncio.wait_for(calling.wait(), 5.0)
     fake.advance(60_000)
-    await _eventually(lambda: loop.status().last_cycle is not None, "the cycle")
+    await _eventually(lambda: server.reports != [], "the report")
     assert server.reported() == [("c1", "m1", "timed_out", "runtime_check")]
     await loop.stop()
 
@@ -643,6 +663,7 @@ async def test_a_report_that_fails_is_none_and_the_loop_goes_on() -> None:
     events: list[dict[str, Any]] = []
     loop = _gate_loop(server, _Model(), check_runtime=lambda: True, on_event=events.append)
     await loop.start()
+    await _prove(loop, server)
     await _cycle(loop)
     [reported] = _events(events, "processing_failure")
     assert (reported["action"], reported["error"]) == ("none", "network down")
@@ -663,6 +684,7 @@ async def test_a_route_404_from_the_server_is_none() -> None:
     events: list[dict[str, Any]] = []
     loop = _gate_loop(server, _Model(), check_runtime=lambda: True, on_event=events.append)
     await loop.start()
+    await _prove(loop, server)
     await _cycle(loop)
     [reported] = _events(events, "processing_failure")
     assert (reported["action"], reported["error"]) == ("none", "CONVERSATION_NOT_FOUND")
@@ -738,15 +760,21 @@ async def test_a_failed_reply_turn_is_reported_once_another_turn_completes_and_r
 
 @pytest.mark.asyncio
 async def test_a_reply_turn_past_its_time_limit_is_reported_as_timed_out_with_the_runtime_check() -> None:
-    server = _Server([_card("c1", "m1")], actions=["none"])
+    server = _Server([_card("c0", "m0")], actions=["none"])
     turns = _Turns()
     loop = _gate_loop(server, _Model(lambda _cid: "reply"), start_turn=turns, check_runtime=lambda: True)
     await loop.start()
     await _cycle(loop)
-    turns.ends[0].set_result(TurnEnd(status="failed", detail="turn budget spent", timed_out=True))
+    # A first turn completes: the turn path has worked in this loop.
+    server.answered("c0")
+    turns.ends[0].set_result(TurnEnd(status="completed", agentchat_calls=AgentChatCallCount(made=2, failed=0)))
+    await _eventually(lambda: server.recorded != [], "c0's reply")
+    server.cards["c1"] = _card("c1", "m1")
+    await _cycle(loop)
+    turns.ends[1].set_result(TurnEnd(status="failed", detail="turn budget spent", timed_out=True))
     await _eventually(lambda: len(server.reports) == 1, "the report")
     assert server.reported() == [("c1", "m1", "timed_out", "runtime_check")]
-    assert len(turns.requests) == 1  # none: nothing more for it
+    assert len(turns.requests) == 2  # none: nothing more for it
     await loop.stop()
 
 
@@ -855,10 +883,28 @@ async def test_a_runtime_check_never_speaks_for_two_conversations_failing_togeth
     server = _Server([_flagged("c1", "m1"), _flagged("c2", "m2")], actions=["hidden"] * 4)
     loop = _gate_loop(server, _Model(), check_runtime=lambda: True)
     await loop.start()
+    await _prove(loop, server)
     await _cycle(loop)
     assert server.reports == []
     counters = loop.status().counters
     assert (counters["processing_failures"], counters["failures_waiting"], counters["runtime_checks_ok"]) == (2, 2, 0)
+    await loop.stop()
+
+
+@pytest.mark.asyncio
+async def test_a_runtime_check_never_speaks_for_a_path_that_has_not_completed_in_this_loop() -> None:
+    # A fresh install whose turns cannot run at all, with one conversation
+    # and a check that passes (a login check): nothing tells this apart from
+    # a refusal, so until a turn has completed in this loop the check is no
+    # evidence.
+    server = _Server([_card("c1", "m1")], actions=["retry", "hidden", "paused"])
+    turns = _Turns()
+    loop = _gate_loop(server, _Model(lambda _cid: "reply"), start_turn=turns, check_runtime=lambda: True)
+    await loop.start()
+    await _cycle(loop)
+    turns.ends[0].set_result(TurnEnd(status="failed", detail="the turn launcher is misconfigured"))
+    await _eventually(lambda: loop.status().counters["failures_waiting"] == 1, "c1's failure to wait")
+    assert server.reports == [] and loop.status().counters["runtime_checks_ok"] == 0
     await loop.stop()
 
 
@@ -932,6 +978,39 @@ async def test_a_conversation_is_held_out_of_the_gate_while_its_failed_turn_is_r
 
 
 @pytest.mark.asyncio
+async def test_a_failed_turn_is_held_out_of_the_gate_while_its_runtime_check_runs() -> None:
+    server = _Server([_card("c0", "m0")], actions=["retry"])
+    turns = _Turns()
+    checking = asyncio.Event()
+    passes = asyncio.Event()
+
+    async def check_runtime() -> bool:
+        checking.set()
+        await passes.wait()
+        return True
+
+    model = _Model(lambda _cid: "reply")
+    loop = _gate_loop(server, model, start_turn=turns, check_runtime=check_runtime)
+    await loop.start()
+    await _cycle(loop)
+    server.answered("c0")
+    turns.ends[0].set_result(TurnEnd(status="completed", agentchat_calls=AgentChatCallCount(made=2, failed=0)))
+    await _eventually(lambda: server.recorded != [], "c0's reply")
+    server.cards["c1"] = _card("c1", "m1")
+    await _cycle(loop)
+    turns.ends[1].set_result(TurnEnd(status="failed"))
+    await asyncio.wait_for(checking.wait(), 5.0)
+    gated = len(model.prompts)
+    await _cycle(loop)  # a wake while the check runs
+    assert len(model.prompts) == gated  # c1 is held: no gate call for it
+    passes.set()
+    await _eventually(lambda: len(turns.requests) == 3, "c1's turn to start again")
+    assert server.reported() == [("c1", "m1", "failed", "runtime_check")]
+    assert turns.requests[2].conversation_id == "c1"
+    await loop.stop()
+
+
+@pytest.mark.asyncio
 async def test_stop_does_not_wait_for_a_runtime_check_that_never_answers() -> None:
     server = _Server([_flagged("c1", "m1")])
     checking = asyncio.Event()
@@ -943,6 +1022,7 @@ async def test_stop_does_not_wait_for_a_runtime_check_that_never_answers() -> No
 
     loop = _gate_loop(server, _Model(), check_runtime=check_runtime, gate_call_timeout_ms=0)
     await loop.start()
+    await _prove(loop, server)
     loop.wake()
     await asyncio.wait_for(checking.wait(), 5.0)
     await asyncio.wait_for(loop.stop(), 5.0)
@@ -1083,10 +1163,13 @@ async def test_a_failed_conversation_run_is_reported_with_the_others_evidence_an
 
 @pytest.mark.asyncio
 async def test_a_conversation_run_that_keeps_failing_follows_retry_hidden_paused_then_stops() -> None:
-    server = _Server([_card("c1", "m1")], actions=["retry", "hidden", "paused"])
+    server = _Server([_card("c0", "m0")], actions=["retry", "hidden", "paused"])
     runs = _Runs(server, {"c1": ["failed", "timed_out", "failed", "failed"]})
     loop = _run_loop(server, runs, check_runtime=lambda: True)
     await loop.start()
+    await _cycle(loop)  # c0's run completes: the run path has worked in this loop
+    runs.requests.clear()
+    server.cards["c1"] = _card("c1", "m1")
     await _cycle(loop)
     assert [r.conversation_id for r in runs.requests] == ["c1", "c1", "c1"]
     assert server.reported() == [
@@ -1172,10 +1255,13 @@ async def test_conversation_runs_take_max_concurrent_turns_slots() -> None:
 
 @pytest.mark.asyncio
 async def test_conversation_runs_that_all_fail_report_nothing_even_when_the_check_passes() -> None:
-    server = _Server([_card("c1", "m1"), _card("c2", "m2")], actions=["retry"] * 6)
+    server = _Server([_card("c0", "m0")], actions=["retry"] * 6)
     runs = _Runs(server, {"c1": ["failed"] * 3, "c2": ["failed"] * 3})
     loop = _run_loop(server, runs, check_runtime=lambda: True)
     await loop.start()
+    await _cycle(loop)  # c0's run completes: the run path has worked in this loop
+    runs.requests.clear()
+    server.cards = {"c1": _card("c1", "m1"), "c2": _card("c2", "m2")}
     await _cycle(loop)
     assert server.reports == [] and len(runs.requests) == 2
     assert loop.status().counters["runtime_checks_ok"] == 0

@@ -70,8 +70,10 @@ the failed one started (``other_run_completed``; the completed work must
 have started within :data:`EVIDENCE_WINDOW_MS` of the failure's end), or
 the integration's ``check_runtime`` hook, run right after it, passed while
 no other conversation's work of that kind had failed since that kind last
-completed (``runtime_check``: several conversations failing together is
-how a broken runtime looks, and a check may be lighter than the work).
+completed, and once work of that kind has completed at least once in this
+loop (``runtime_check``: several conversations failing together is how a
+broken runtime looks, a check may be lighter than the work, and a path that
+never completed may never have worked).
 Without evidence nothing is reported: a broken runtime fails every run, and
 that is the ``runs_failing`` path. A turn whose AgentChat calls are known
 and none worked never read the conversation and is not reported. A failure
@@ -474,11 +476,16 @@ TurnStarter = Callable[[TurnRequest], Any]
 RunStarter = Callable[[RunRequest], Any]
 ReadinessCheck = Callable[[], Any]
 RuntimeCheck = Callable[[], Any]
-"""``check_runtime``: whether the runtime works right now (a model call that
-needs no AgentChat content, a login check). A coroutine or a plain function
-(run in a worker thread); ``True``, or a :class:`Readiness` (or anything)
-whose ``ready`` / ``ok`` is true, means it works. Bounded by
-``gate_call_timeout_ms``; raising or running past it means it does not."""
+"""``check_runtime``: whether the runtime works right now, through the same
+path as its gate calls, turns or runs (the same model and launcher), with no
+AgentChat content in it. A login check or a bare ping that passes while the
+real work cannot run is the kind of check that must not be used. A
+coroutine or a plain function (run in a worker thread); ``True``, or a
+:class:`Readiness` (or anything) whose ``ready`` / ``ok`` is true, means it
+works. Bounded by ``gate_call_timeout_ms`` and by :meth:`ReceiveLoop.stop`;
+raising or running past it means it does not. It speaks for a failure only
+when that conversation is the only one of its kind failing and work of
+that kind has completed at least once in this loop."""
 
 
 class _StaticTexts:
@@ -2196,11 +2203,11 @@ class ReceiveLoop:
     ) -> None:
         failure: Failure | None = None
         fresh: dict[str, Any] | None = None
+        conversation_id = str(card.get("conversation_id"))
         try:
             end = await self._tracker.confirmed_end(handle, done)
             if end is None or not self._tracker.holds(handle):
                 return  # released: nothing recorded
-            conversation_id = str(card.get("conversation_id"))
             # A later turn of the conversation ended: its earlier failures
             # say nothing any more (this one, if it failed, is the newest).
             self._ledger.clear(conversation_id, ("turn",))
@@ -2213,12 +2220,22 @@ class ReceiveLoop:
             failure, fresh = await self._track(
                 self._record_reply_outcome(handle, card, category, end, work, chain)
             )
+            if failure is not None:
+                # Held out of the gate from now until its failure is settled
+                # (a runtime check may take a while): a cycle woken by this
+                # end must not gate it meanwhile.
+                self._settling.add(conversation_id)
         finally:
             self._tracker.end(handle)
             self._slot_freed(handle)
             self._after_turn_ended()
-        if not self._stopped:
-            await self._track(self._settle_turns(failure, fresh))
+        try:
+            if not self._stopped:
+                await self._track(self._settle_turns(failure, fresh))
+        finally:
+            if failure is not None:
+                self._settling.discard(conversation_id)
+                self._after_turn_ended()
 
     async def _record_reply_outcome(
         self,
@@ -2537,6 +2554,9 @@ class ReceiveLoop:
                 ):
                     if works is None:
                         works = await self._runtime_check(in_cycle)
+                        # The check took time: a tray read before it may be
+                        # stale by now.
+                        fresh, read = None, False
                     if works:
                         evidence = "runtime_check"
                     else:

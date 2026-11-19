@@ -9,8 +9,10 @@ one started (``other_run_completed``: a gate call for a gate call, a turn
 for a turn, a run for a run, since each kind takes its own path through the
 runtime), or the integration's own runtime check passed (``runtime_check``)
 while this conversation was the only one of its kind failing since the last
-completion (several failing together is how a broken runtime looks, and a
-check can be lighter than the work that failed). Without evidence nothing
+completion, and once work of that kind has completed at least once in this
+loop (several failing together is how a broken runtime looks, a check can
+be lighter than the work that failed, and a path that never completed may
+never have worked). Without evidence nothing
 is reported: a broken runtime (logged out, out of credits) fails every run,
 and that is the ``runs_failing`` path, never a reason to hide anyone's
 messages.
@@ -103,6 +105,7 @@ class Ledger:
         self._completions: deque[_Completion] = deque(maxlen=_COMPLETIONS_MEMORY)
         self._parked: OrderedDict[str, Failure] = OrderedDict()
         self._failing: dict[FailureKind, set[str]] = {"gate": set(), "turn": set(), "run": set()}
+        self._proven: set[FailureKind] = set()
 
     def begin(self) -> Work:
         self._seq += 1
@@ -115,6 +118,7 @@ class Ledger:
             _Completion(seq=self._seq, started_at=work.at, kind=kind, keys=frozenset(keys))
         )
         self._failing[kind].clear()
+        self._proven.add(kind)
 
     def failed(self, failure: Failure) -> None:
         """A failed run, seen: its conversation is failing until work of
@@ -122,9 +126,12 @@ class Ledger:
         self._failing[failure.kind].add(failure.conversation_id)
 
     def isolated(self, failure: Failure) -> bool:
-        """No other conversation's work of the same kind has failed since
-        that kind last completed: a runtime check may then speak for it."""
-        return self._failing[failure.kind] <= {failure.conversation_id}
+        """Work of the same kind has completed in this loop, and no other
+        conversation's has failed since it last did: a runtime check may
+        then speak for the failure."""
+        return failure.kind in self._proven and self._failing[failure.kind] <= {
+            failure.conversation_id
+        }
 
     def has_evidence(self, failure: Failure) -> bool:
         """Another conversation's work of the same kind completed after the
