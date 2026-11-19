@@ -72,7 +72,10 @@ the integration's ``check_runtime`` hook (a real, minimal model call
 through the same path as the work), run right after it, passed while no
 other conversation's work of that kind had failed since that kind last
 completed (``runtime_check``: several conversations failing together is how
-a broken runtime looks).
+a broken runtime looks). A run that timed out (``timed_out``, or a gate call
+past its deadline) is reported only on ``other_run_completed``, never on
+the runtime check: a timeout is ambiguous (a brownout, a hung hook), and
+the check does not go through those paths.
 Without evidence nothing is reported: a broken runtime fails every run, and
 that is the ``runs_failing`` path. A turn whose AgentChat calls are known
 and none worked never read the conversation and is not reported. A failure
@@ -325,7 +328,8 @@ class RunEnd:
     detail: str | None = None
     timed_out: bool = False
     """A ``failed`` run the runtime stopped at its own time limit: reported,
-    when reported, as ``timed_out``."""
+    when reported, as ``timed_out``, and only when another conversation's
+    run completed since (a runtime check is no evidence for a timeout)."""
 
 
 @dataclass(frozen=True)
@@ -485,7 +489,8 @@ works. Bounded by ``gate_call_timeout_ms`` and by :meth:`ReceiveLoop.stop`;
 raising or running past it means it does not. It speaks for a failure only
 when that conversation is the only one of its kind failing since that kind
 last completed: with one active conversation (no other run to compare
-with), it is the only evidence there is."""
+with), it is the only evidence there is. It never speaks for a run that
+timed out: that one needs another conversation's run to complete."""
 
 
 class _StaticTexts:

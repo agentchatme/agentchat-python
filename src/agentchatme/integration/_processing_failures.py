@@ -11,7 +11,10 @@ runtime), or the integration's own runtime check passed (``runtime_check``)
 while this conversation was the only one of its kind failing since that
 kind last completed (several failing together is how a broken runtime
 looks). The check must be a real, minimal model call through the same path
-as the work, never a login or version check. Without evidence nothing
+as the work, never a login or version check. A run that timed out is
+reported only on ``other_run_completed``: a timeout is ambiguous (a
+brownout, a hung hook) and a runtime check does not go through those
+paths. Without evidence nothing
 is reported: a broken runtime (logged out, out of credits) fails every run,
 and that is the ``runs_failing`` path, never a reason to hide anyone's
 messages.
@@ -145,10 +148,12 @@ class Ledger:
         return False
 
     def fresh_for_check(self, failure: Failure) -> bool:
-        """Whether a runtime check run now may speak for the failure: not
-        checked before, still within the window, and isolated."""
+        """Whether a runtime check run now may speak for the failure: a
+        plain failure (never one that timed out), not checked before, still
+        within the window, and isolated."""
         return (
-            not failure.runtime_checked
+            failure.outcome == "failed"
+            and not failure.runtime_checked
             and self._now() - failure.ended_at <= EVIDENCE_WINDOW_MS
             and self.isolated(failure)
         )

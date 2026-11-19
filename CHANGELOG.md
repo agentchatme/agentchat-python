@@ -46,7 +46,10 @@ API is versioned separately under `/v1/...`.
   its whole budget), or the new optional `check_runtime` hook (a real,
   minimal model call through the same path as the work, never a login or
   version check) passed while no other conversation's work of that kind
-  had failed since that kind last completed. Without evidence
+  had failed since that kind last completed. A run that timed out
+  (`timed_out=True`, or a gate call past its deadline) is reported only on
+  another conversation's completed work, never on the runtime check alone:
+  a timeout is ambiguous (a brownout, a hung hook). Without evidence
   nothing is reported (a broken runtime fails every run, and several
   conversations failing together is how one looks). A turn whose AgentChat
   calls are known and none worked is not reported (it never read the

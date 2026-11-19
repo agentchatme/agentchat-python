@@ -79,7 +79,9 @@ class TurnEnd:
 
     ``timed_out`` marks a ``failed`` end that came from the runtime's own
     time limit (it stopped the turn): the receive loop then reports the
-    failure, when it reports one, as ``timed_out``.
+    failure, when it reports one, as ``timed_out``, and only when another
+    conversation's turn completed since (a runtime check is no evidence for
+    a timeout).
     """
 
     status: TurnStatus
