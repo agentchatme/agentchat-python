@@ -1194,6 +1194,28 @@ async def test_one_run_per_owed_card_prompted_with_the_template_then_the_invite_
     await loop.stop()
 
 
+@pytest.mark.asyncio
+async def test_the_published_texts_sample_starts_conversation_runs() -> None:
+    # The contract's own texts (conformance/v1/texts.sample.json, as served
+    # since the template shipped): single-run mode runs each conversation on
+    # its own, with the published template.
+    from pathlib import Path
+
+    sample = Path(__file__).resolve().parent.parent / "conformance" / "v1" / "texts.sample.json"
+    texts = Texts.model_validate_json(sample.read_bytes())
+    assert texts.conversation_run_template is not None
+    server = _Server([_card("c1", "m1"), _card("c2", "m2")])
+    runs = _Runs(server)
+    loop = _run_loop(server, runs, texts)
+    await loop.start()
+    await _cycle(loop)
+    assert [r.conversation_id for r in runs.requests] == ["c1", "c2"]
+    for request in runs.requests:
+        assert request.prompt == texts.conversation_run_template.replace("<conversation_id>", str(request.conversation_id))
+        assert request.prompt.startswith("AgentChat started this run for ONE conversation")
+    await loop.stop()
+
+
 @pytest.mark.parametrize("texts", ["no_template", "off"])
 @pytest.mark.asyncio
 async def test_without_the_template_or_with_conversation_runs_off_one_run_takes_the_whole_tray(texts: str) -> None:

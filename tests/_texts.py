@@ -25,7 +25,11 @@ GATE_CALL_ANSWER_FORMAT = (
 
 
 def texts(**overrides: Any) -> dict[str, Any]:
-    """A full ``GET /v1/texts`` body for a test agent ``@nova``."""
+    """A full ``GET /v1/texts`` body for a test agent ``@nova``, as a server
+    from before ``conversation_run_template`` serves it: a single-run loop
+    built on it keeps one run for the whole tray. Pass the template as an
+    override (or load ``conformance/v1/texts.sample.json``) for conversation
+    runs."""
     body: dict[str, Any] = {
         "version": "1",
         "runtime": "generic",

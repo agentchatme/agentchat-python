@@ -62,6 +62,6 @@ class Texts(_BaseModel):
     mode (one run for the whole tray)."""
     could_not_process_note: str | None = None
     """The served wording of the note a message hidden from you (could not
-    process) reads as. The server fills it into each hidden message itself
-    (sender included); this copy is for hosts that show or explain it.
-    Absent from servers that predate it."""
+    process) reads as, with ``<sender>`` where the sender's handle goes. The
+    server fills it into each hidden message itself; this copy is for hosts
+    that show or explain it. Absent from servers that predate it."""

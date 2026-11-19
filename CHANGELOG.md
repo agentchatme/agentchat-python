@@ -82,6 +82,9 @@ API is versioned separately under `/v1/...`.
 
 ### Changed
 
+- Conformance fixture `conformance/v1/texts.sample.json` (and the manifest)
+  copied from the published contract byte for byte: the served texts now
+  carry `conversation_run_template` and `could_not_process_note`.
 - `Message.client_msg_id` is optional (`None`): the server leaves it out on
   a message hidden from its recipient (it is the sender's own field), and
   parsing such a message never raises. Sends still carry one.
