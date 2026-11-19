@@ -268,8 +268,9 @@ async def test_the_sample_tray_through_the_loop_gives_gate_prompt_expected_byte_
     await loop.start()
     await _cycle(loop)
     assert prompts[0] + "\n" == expected
-    # The empty answer fails the chunk: each card is gated again on its own.
-    assert len(prompts) == 1 + len(tray["conversations"])
+    # The empty answer fails the chunk; its cards are gated again on their
+    # own until two in a row fail with nothing decided (no runtime check).
+    assert len(prompts) == 3
     await loop.stop()
 
 
@@ -335,12 +336,14 @@ async def test_every_chunk_failing_is_fail_closed_and_records_nothing() -> None:
     loop = _loop(client, call_model=lambda p: calls.append(p) or "", start_turn=_Turns())
     await loop.start()
     await _cycle(loop)
-    # Three chunk calls, then every card on its own: all fail.
-    assert len(calls) == 3 + 25 and client.decisions.recorded == []
+    # Three chunk calls, then cards on their own until two in a row fail
+    # with nothing decided: a runtime that fails every call costs 5 calls,
+    # not 28.
+    assert len(calls) == 3 + 2 and client.decisions.recorded == []
     summary = loop.status().last_cycle
     assert summary is not None and summary.outcome == "fail_closed"
     assert (summary.chunks_ok, summary.chunks_failed, summary.undecided, summary.gated) == (0, 3, 25, 25)
-    assert (summary.split_calls_ok, summary.split_calls_failed) == (0, 25)
+    assert (summary.split_calls_ok, summary.split_calls_failed, summary.split_stopped) == (0, 2, True)
     assert summary.failure == "3 of 3 gate chunks failed; chunk 1: no usable verdicts in the answer"
     await loop.stop()
 
@@ -678,16 +681,17 @@ async def test_a_deadline_does_not_wait_for_a_call_that_ignores_its_cancellation
     await loop.start()
     try:
         loop.wake()
-        # The chunk's call, then each card's own: every one past its deadline.
-        for made in range(1, 5):
+        # The chunk's call, then two cards' own: every one past its deadline
+        # (two in a row with nothing decided stop the split).
+        for made in range(1, 4):
             await _eventually(lambda made=made: len(calls) == made, f"gate call {made}")
             fake.advance(60_000)
         await _eventually(lambda: loop.status().last_cycle is not None, "the cycle to end at the deadlines")
         summary = loop.status().last_cycle
         assert summary is not None and summary.outcome == "fail_closed"
         assert summary.failure == "model call timed out: no answer within 60000 ms"
-        assert summary.split_calls_failed == 3
-        assert swallowed == [True] * 4  # the calls are still running, unheard
+        assert (summary.split_calls_failed, summary.split_stopped) == (2, True)
+        assert swallowed == [True] * 3  # the calls are still running, unheard
         release.set()  # its late answer is not acted on
         for _ in range(20):
             await asyncio.sleep(0)

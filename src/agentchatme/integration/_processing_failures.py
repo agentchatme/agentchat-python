@@ -3,12 +3,17 @@ may report, and the evidence that the runtime otherwise works.
 
 Only the agent's machine sees its AI fail on a conversation. A failed or
 timed-out run (a single-card gate call, a reply turn, a conversation run) is
-reported only with evidence that the runtime otherwise works: another
-conversation's run or gate call in this loop completed after the failed one
-started (``other_run_completed``), or the integration's own runtime check
-passed (``runtime_check``). Without evidence nothing is reported: a broken
-runtime (logged out, out of credits) fails every run, and that is the
-``runs_failing`` path, never a reason to hide anyone's messages.
+reported only with evidence that the runtime otherwise works: work of the
+same kind for another conversation in this loop completed after the failed
+one started (``other_run_completed``: a gate call for a gate call, a turn
+for a turn, a run for a run, since each kind takes its own path through the
+runtime), or the integration's own runtime check passed (``runtime_check``)
+while this conversation was the only one of its kind failing since the last
+completion (several failing together is how a broken runtime looks, and a
+check can be lighter than the work that failed). Without evidence nothing
+is reported: a broken runtime (logged out, out of credits) fails every run,
+and that is the ``runs_failing`` path, never a reason to hide anyone's
+messages.
 
 The ledger is in memory and orders work by a counter, never by a clock: a
 run that started before another one completed is known exactly. The loop's
@@ -82,47 +87,68 @@ class _Completion:
     seq: int
     """The counter when it completed."""
     started_at: float
+    kind: FailureKind
     keys: frozenset[str]
     """What it covered: conversation ids, ``invite:<id>`` for an invite."""
 
 
 class Ledger:
-    """Work started and completed in one loop, and the failures waiting
-    for evidence (at most one per conversation and kind: the newest)."""
+    """Work started and completed in one loop, the conversations failing
+    since the last completion of each kind, and the failures waiting for
+    evidence (at most one per conversation and kind: the newest)."""
 
     def __init__(self, now: Callable[[], float]) -> None:
         self._now = now
         self._seq = 0
         self._completions: deque[_Completion] = deque(maxlen=_COMPLETIONS_MEMORY)
         self._parked: OrderedDict[str, Failure] = OrderedDict()
+        self._failing: dict[FailureKind, set[str]] = {"gate": set(), "turn": set(), "run": set()}
 
     def begin(self) -> Work:
         self._seq += 1
         return Work(seq=self._seq, at=self._now())
 
-    def completed(self, work: Work, keys: Iterable[str]) -> None:
-        """Work that completed (the runtime worked through it)."""
+    def completed(self, work: Work, kind: FailureKind, keys: Iterable[str]) -> None:
+        """Work of ``kind`` that completed (the runtime worked through it)."""
         self._seq += 1
         self._completions.append(
-            _Completion(seq=self._seq, started_at=work.at, keys=frozenset(keys))
+            _Completion(seq=self._seq, started_at=work.at, kind=kind, keys=frozenset(keys))
         )
+        self._failing[kind].clear()
+
+    def failed(self, failure: Failure) -> None:
+        """A failed run, seen: its conversation is failing until work of
+        its kind completes again."""
+        self._failing[failure.kind].add(failure.conversation_id)
+
+    def isolated(self, failure: Failure) -> bool:
+        """No other conversation's work of the same kind has failed since
+        that kind last completed: a runtime check may then speak for it."""
+        return self._failing[failure.kind] <= {failure.conversation_id}
 
     def has_evidence(self, failure: Failure) -> bool:
-        """Another conversation's work completed after the failed run
-        started, and that work started no later than the window after the
-        failed run ended."""
+        """Another conversation's work of the same kind completed after the
+        failed run started, and that work started no later than the window
+        after the failed run ended."""
         for done in reversed(self._completions):
             if done.seq <= failure.work.seq:
                 return False
-            if done.keys - {failure.conversation_id} and (
-                done.started_at - failure.ended_at <= EVIDENCE_WINDOW_MS
+            if (
+                done.kind == failure.kind
+                and done.keys - {failure.conversation_id}
+                and done.started_at - failure.ended_at <= EVIDENCE_WINDOW_MS
             ):
                 return True
         return False
 
     def fresh_for_check(self, failure: Failure) -> bool:
-        """Whether a runtime check run now still speaks for the failure."""
-        return not failure.runtime_checked and self._now() - failure.ended_at <= EVIDENCE_WINDOW_MS
+        """Whether a runtime check run now may speak for the failure: not
+        checked before, still within the window, and isolated."""
+        return (
+            not failure.runtime_checked
+            and self._now() - failure.ended_at <= EVIDENCE_WINDOW_MS
+            and self.isolated(failure)
+        )
 
     def park(self, failure: Failure) -> bool:
         """Keep a failure until evidence comes. ``True`` when it is new (no
@@ -152,8 +178,9 @@ class Ledger:
         return out
 
     def clear(self, conversation_id: str, kinds: Iterable[FailureKind]) -> None:
-        """The conversation's work of these kinds completed since: its
-        waiting failures say nothing any more."""
+        """Later work of these kinds for the conversation ended (completed,
+        or failed and is the newest failure now): its waiting failures say
+        nothing any more."""
         for kind in kinds:
             self._parked.pop(f"{kind}:{conversation_id}", None)
 

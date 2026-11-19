@@ -38,15 +38,23 @@ API is versioned separately under `/v1/...`.
 - `integration.ReceiveLoop` reports a failed run for one conversation and
   follows the server's answer. A single-card gate call, a reply turn or a
   conversation run that failed or timed out while its card is still owed is
-  reported only with evidence: another conversation's turn, run or gate call
-  in this loop completed after it started (and started within
-  `EVIDENCE_WINDOW_MS`, 5 min, of its end), or the new optional
-  `check_runtime` hook passed. Without evidence nothing is reported (a
-  broken runtime fails every run). A failure waits for evidence until the
-  others have run (one per conversation, the newest). `retry` / `hidden` →
-  that conversation runs again after the others, from a fresh tray read;
-  `paused` / `none` → nothing more; at most `MAX_FAILURE_REPORTS` (3) per
-  conversation in one cycle. `TurnEnd.timed_out` / `RunEnd.timed_out` mark a
+  reported only with evidence: work of the same kind (gate call, turn, run)
+  for another conversation in this loop completed after it started (and
+  started within `EVIDENCE_WINDOW_MS`, 5 min, of its end), or the new
+  optional `check_runtime` hook passed while no other conversation's work
+  of that kind had failed since that kind last completed. Without evidence
+  nothing is reported (a broken runtime fails every run, and several
+  conversations failing together is how one looks). A turn whose AgentChat
+  calls are known and none worked is not reported (it never read the
+  conversation). A failure waits for evidence until the others have run
+  (one per conversation, the newest; a later end of that conversation's
+  work clears it), and right before a report the card is read on a fresh
+  tray: one gone, muted, answered or with a verdict since is not reported.
+  `retry` / `hidden` → that conversation runs again after the others, from
+  a fresh tray read (a turn's conversation is held out of the gate until
+  it starts again); `paused` / `none` → nothing more; at most
+  `MAX_FAILURE_REPORTS` (3) per conversation in one cycle. A runtime check
+  the loop stops waiting for (its deadline, `stop()`) has not passed. `TurnEnd.timed_out` / `RunEnd.timed_out` mark a
   run stopped at the runtime's own time limit. Counts in `status().counters`
   (`processing_failures`, `failures_reported`, `failure_actions`,
   `failure_report_errors`, `failures_waiting`, `reruns`,
@@ -74,6 +82,11 @@ API is versioned separately under `/v1/...`.
   split_calls_ok` / `split_calls_failed` and the counters `gate_splits`,
   `split_calls_ok`, `split_calls_failed` count them. A cycle whose chunks
   all failed but whose single-card calls decided some cards is `decided`.
+  So that a runtime failing every call does not cost one call per card:
+  once two cards in a row fail on their own and nothing in the cycle has
+  been decided, the split goes on only if `check_runtime` passes; otherwise
+  the cards left stay undecided for the next wake (`CycleSummary.
+  split_stopped`, counter `splits_stopped`).
 
 ## [1.4.0] — 2026-11-17
 
