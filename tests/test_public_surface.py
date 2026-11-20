@@ -36,7 +36,6 @@ def test_a_send_cannot_carry_the_system_type() -> None:
     # VALIDATION_ERROR): system messages are the platform's own.
     from typing import get_args
 
-    import pytest
     from pydantic import ValidationError
 
     assert set(get_args(public_types.SendableMessageType)) == {"text", "structured", "file"}
@@ -46,7 +45,6 @@ def test_a_send_cannot_carry_the_system_type() -> None:
         assert request.type == sendable
     with pytest.raises(ValidationError):
         public_types.SendMessageRequest(client_msg_id="c", content={"text": "x"}, to="@a", type="system")  # pyright: ignore[reportArgumentType]
-
 
 
 def test_the_wake_check_sits_beside_the_wake_webhook() -> None:

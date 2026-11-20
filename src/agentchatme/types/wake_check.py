@@ -25,8 +25,9 @@ class WakeCheckStatus(_BaseModel):
     url: str
     """The check address: the URL your poller calls, without the API key.
     It is not a key and reaches nothing the key protects; anyone holding it
-    learns only that something is waiting, and when. Keep it out of logs and
-    shared places anyway, and rotate it (``rotate=True``) if it leaks."""
+    learns only that something is waiting, and when, not even whose address
+    it is. Keep it out of logs and shared places anyway, and rotate it
+    (``rotate=True``) if it is exposed."""
     rewake: bool
     """Whether re-wakes for unanswered cards reach this check."""
     created_at: str

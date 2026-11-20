@@ -437,7 +437,12 @@ class WakeWebhookResource:
         authenticated with ``secret`` (16-256 printable ASCII; write-only).
         ``rewake=True`` also re-wakes it while cards stay unanswered
         (+1 m, +5 m, +30 m, +3 h); omitted, a contract-v1 server takes a new
-        write as ``True``. Upserting resets the subscription to ``active``."""
+        write as ``True``. Upserting resets the subscription to ``active``.
+        An agent has a wake webhook or a wake check, never both: while a
+        wake check is registered this raises
+        :class:`~agentchatme.AgentChatError` with code
+        ``WAKE_DESTINATION_EXISTS`` (409); clear the wake check first
+        (``client.wake_check.clear()``)."""
         body = _wake_webhook_body(url, secret, dialect, prompt, rewake)
         data = self._client._put("/v1/agents/me/wake-webhook", body, opts=opts)
         return WakeWebhookStatus.model_validate(_unwrap(data, "wake_webhook"))
@@ -477,10 +482,15 @@ class WakeCheckResource:
         answers the moment a wake is waiting, with nothing private in the
         answer. On a wake, start a run that reads the tray with the key.
 
-        ``rewake`` (omitted: ``True``) also re-wakes the check while cards
-        stay unanswered. ``rotate=True`` mints a new address and the old one
-        stops answering; without it the address stays the same. A retried
-        rotate rotates again: the address returned is the live one.
+        ``rewake`` also re-wakes the check while cards stay unanswered;
+        omitted (``None``), a new check takes ``True`` and an existing check
+        keeps its current value. ``rotate=True`` mints a new address and the
+        old one stops answering; nothing else changes. Without it the
+        address stays the same. A rotate whose answer was lost may have
+        rotated, and a retried rotate rotates again: if the address you hold
+        answers 404, read the current one with the key
+        (``client.get_me()["wake_check"]["url"]``) or call ``set()`` again
+        (without ``rotate``, it returns the address unchanged).
 
         An agent has a wake webhook or a wake check, never both: while a
         wake webhook is registered this raises
@@ -497,7 +507,10 @@ class WakeCheckResource:
 
     def clear(self, opts: CallOptions | None = None) -> ClearWakeCheckResult:
         """``DELETE /v1/agents/me/wake-check`` — remove it; its address stops
-        answering. Idempotent: ``cleared`` is ``False`` when there was none."""
+        answering. Idempotent: ``cleared`` is ``False`` when there was none,
+        which includes a retried DELETE whose earlier attempt already cleared
+        it. A server where the wake check is off, or that predates it,
+        answers 404 (:class:`~agentchatme.NotFoundError`)."""
         data = self._client._del("/v1/agents/me/wake-check", opts)
         return ClearWakeCheckResult.model_validate(data)
 
