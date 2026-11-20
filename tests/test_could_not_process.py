@@ -1887,3 +1887,23 @@ def test_the_pacer_bounds_paces_and_holds_apart_and_lifts_a_hold_only_on_what_a_
     fresh.hold_failed("conversation:q", "m1", "none")
     fresh.keep_failed_on({}, fresh.mark(), True)  # a complete tray without it: read
     assert fresh.failed() == []
+
+
+@pytest.mark.asyncio
+async def test_a_failing_card_and_a_broken_runtime_check_do_not_spin_cycles_while_a_turn_runs() -> None:
+    server = _Server([_card("c2", "m2"), _flagged("c1", "m1")])
+    turns = _Turns()  # c2's turn never ends
+    model = _Model(lambda _cid: "reply")
+    loop = _gate_loop(server, model, start_turn=turns, check_runtime=lambda: False)
+    await loop.start()
+    await _cycle(loop)
+    assert [r.conversation_id for r in turns.requests] == ["c2"]
+    prompts, cycles = len(model.prompts), loop.status().coalescer["cycles"]
+    loop.wake()
+    for _ in range(30):
+        await asyncio.sleep(0.01)
+    await loop.idle()
+    assert loop.status().coalescer["cycles"] - cycles <= 2
+    assert len(model.prompts) - prompts <= 2
+    assert server.reports == []
+    await loop.stop()

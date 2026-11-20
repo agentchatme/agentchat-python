@@ -1165,6 +1165,9 @@ class ReceiveLoop:
         self._started = False
         self._stopped = False
         self._held_while_running = False
+        # A cycle left a card out because its could-not-process report was
+        # out: the settle's end reads the tray again.
+        self._held_while_reporting = False
         self._last_cycle: CycleSummary | None = None
         self._recent: deque[CycleSummary] = deque(maxlen=RECENT_CYCLES)
         # The running cycle's identity: an abandoned cycle goes stale and
@@ -1604,12 +1607,16 @@ class ReceiveLoop:
         ladder), or race the turn, or start it on the input the server's
         answer is about."""
         conversation_id = card["conversation_id"]
-        return (
+        if (
             self._tracker.conversation_running(conversation_id)
             or conversation_id in self._records_in_flight
             or conversation_id in self._settling
-            or conversation_id in self._reporting
-        )
+        ):
+            return True
+        if conversation_id in self._reporting:
+            self._held_while_reporting = True
+            return True
+        return False
 
     def _pace_cards(self, cards: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], int, int]:
         """The cards neither paced (D5) nor held after a could-not-process
@@ -3011,17 +3018,22 @@ class ReceiveLoop:
 
     def _let_go(self, taken: list[Failure]) -> None:
         """The settle is done: those conversations are no longer held for
-        it; what waits for them goes on (or was dropped), and a card a cycle
-        left out meanwhile is read again."""
+        it, what waits for them goes on (or was dropped), and a card a cycle
+        left out meanwhile for a report is read again (only then: a wake for
+        anything else could spin while a turn runs)."""
         if not taken:
             return
         for failure in taken:
             self._reporting[failure.conversation_id] -= 1
             if self._reporting[failure.conversation_id] <= 0:
                 del self._reporting[failure.conversation_id]
-        if self._waiting and not self._stopped:
+        if self._stopped:
+            return
+        if self._waiting:
             self._spawn_turn(self._pump())
-        self._after_turn_ended()
+        if self._held_while_reporting:
+            self._held_while_reporting = False
+            self._wake_from("more")
 
     async def _settle_turns(
         self, failure: Failure | None, fresh: dict[str, Any] | None, taken: list[Failure]
