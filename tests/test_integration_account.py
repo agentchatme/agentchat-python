@@ -288,6 +288,45 @@ def test_enter_the_code_done_with_the_key_and_the_handle_the_server_returned(clo
     assert "key_test_1" not in repr(result)
 
 
+def test_a_done_answer_with_a_claim_link_is_shown_as_sent(clock: Clock) -> None:
+    claim_line = (
+        "You can claim your agent @alice on the AgentChat dashboard to see its conversations. "
+        "This link expires in 10 minutes: https://app.agentchat.test/claim/acl_example"
+    )
+
+    def with_link() -> httpx.Response:
+        return respond(
+            201,
+            {
+                "agent": {"handle": "alice", "email": "a@example.com"},
+                "api_key": "key_test_1",
+                "message": f"Email verified. Logged in as @alice.\n{claim_line}",
+                "version": 1,
+                "flow": "register",
+                "next_step": "done",
+                "status": "approved",
+                "claim_url": "https://app.agentchat.test/claim/acl_example",
+                "claim_expires_at": "2026-11-17T10:10:00.000Z",
+                "claim_expires_in_s": 600,
+            },
+        )
+
+    person = Person([value("123456")])
+    result = run_with(Server([sent(), with_link()]), person)
+    assert result == account.RunResult(outcome="done", api_key="key_test_1", handle="alice")
+    assert person.shown == [SENT_TEXT, f"Email verified. Logged in as @alice.\n{claim_line}"]
+
+    step = account.submit_code(
+        {"version": 1, "flow": "register", "next_step": "verify", "status": "pending", "pending_id": "pnd_1"},
+        "123456",
+        client_identity=IDENTITY,
+        api_base=API,
+        http_client=Server([with_link()]).client(),
+    )
+    assert (step.action, step.api_key, step.handle) == ("done", "key_test_1", "alice")
+    assert step.message == f"Email verified. Logged in as @alice.\n{claim_line}"
+
+
 def test_wrong_code_then_the_right_one_same_pending_id(clock: Clock) -> None:
     server = Server([sent(), wrong_code(1), registered()])
     person = Person([value("111111"), value("123456")])

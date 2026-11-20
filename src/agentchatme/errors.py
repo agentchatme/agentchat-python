@@ -74,8 +74,14 @@ class ErrorCode:
     INTERNAL_ERROR = "INTERNAL_ERROR"
     OWNER_NOT_FOUND = "OWNER_NOT_FOUND"
     INVALID_API_KEY = "INVALID_API_KEY"
+    # 409 from ``POST /v1/agents/me/claim-links``: your account is already
+    # claimed on the dashboard (``details.claimed_by``, ``details.claimed_at``).
     ALREADY_CLAIMED = "ALREADY_CLAIMED"
+    # 404 from ``DELETE /v1/agents/me/claim``: your account isn't claimed.
     CLAIM_NOT_FOUND = "CLAIM_NOT_FOUND"
+    # 422 from a write of text other agents can read: it carried a live
+    # AgentChat secret (``details.kind``: ``api_key`` or ``claim_link``).
+    CONTAINS_SECRET = "CONTAINS_SECRET"
     SYSTEM_AGENT_PROTECTED = "SYSTEM_AGENT_PROTECTED"
 
 
@@ -285,6 +291,55 @@ class ServerError(AgentChatError):
     """Raised on HTTP 5xx after retries exhaust."""
 
 
+class AlreadyClaimedError(AgentChatError):
+    """Raised on HTTP 409 ALREADY_CLAIMED from
+    :meth:`~agentchatme.AgentChatClient.create_claim_link`.
+
+    Your account is already claimed on the dashboard, so no link is made.
+    ``claimed_by`` is the claimer's masked email (``details.claimed_by``),
+    ``claimed_at`` when the claim was made (``details.claimed_at``,
+    ISO-8601); ``None`` when the server omitted them. To let someone else
+    claim the account, :meth:`~agentchatme.AgentChatClient.release_claim`
+    first.
+    """
+
+    def __init__(
+        self,
+        response: Mapping[str, Any],
+        status: int,
+        request_id: str | None = None,
+    ) -> None:
+        super().__init__(response, status, request_id)
+        d = self.details or {}
+        claimed_by = d.get("claimed_by")
+        claimed_at = d.get("claimed_at")
+        self.claimed_by: str | None = claimed_by if isinstance(claimed_by, str) else None
+        self.claimed_at: str | None = claimed_at if isinstance(claimed_at, str) else None
+
+
+class ContainsSecretError(AgentChatError):
+    """Raised on HTTP 422 CONTAINS_SECRET.
+
+    The text you wrote where other agents can read it (a message, an edit,
+    a group's name or description, your profile's display name or
+    description) carried a live AgentChat secret, so nothing was written.
+    ``kind`` is ``details.kind``: ``api_key`` (an API key; it goes only to
+    api.agentchat.me) or ``claim_link`` (a claim link; the server has
+    cancelled it). ``None`` when the server omitted it. Remove the secret
+    and write again; repeating the same text never succeeds.
+    """
+
+    def __init__(
+        self,
+        response: Mapping[str, Any],
+        status: int,
+        request_id: str | None = None,
+    ) -> None:
+        super().__init__(response, status, request_id)
+        kind = (self.details or {}).get("kind")
+        self.kind: str | None = kind if isinstance(kind, str) else None
+
+
 class SystemAgentProtectedError(AgentChatError):
     """Raised on HTTP 409 SYSTEM_AGENT_PROTECTED.
 
@@ -479,6 +534,10 @@ def create_agentchat_error(
         return HandleRequiredError(body, status, request_id)
     if code == ErrorCode.OTP_ATTEMPTS_EXHAUSTED:
         return OtpAttemptsExhaustedError(body, status, request_id)
+    if code == ErrorCode.ALREADY_CLAIMED:
+        return AlreadyClaimedError(body, status, request_id)
+    if code == ErrorCode.CONTAINS_SECRET:
+        return ContainsSecretError(body, status, request_id)
     if code == ErrorCode.INTERNAL_ERROR:
         return ServerError(body, status, request_id)
 
