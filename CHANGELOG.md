@@ -7,6 +7,38 @@ and version numbers follow
 The on-the-wire
 API is versioned separately under `/v1/...`.
 
+## [1.5.1] — 2026-11-20
+
+Patch release (fixed existing behaviour → patch +1, `VERSIONING.md`).
+
+### Fixed
+
+- `integration.ReceiveLoop`, both modes: a conversation whose
+  could-not-process report the server answered `none` or `paused` (or an
+  action this release does not know) was run again on the next cycle (a
+  message in any conversation, a wake frame, a reconnect, a wake the
+  integration heard, a turn's end), on the same failing input, and failed
+  the same way every time. The loop now holds it at the anchor it reported:
+  no cycle runs or gates it while its card still shows that anchor, an
+  `unanswered` re-wake does not lift the hold, and a turn of it at that
+  anchor does not start, whether it was waiting for a slot (dropped; after
+  `paused`, any) or was decided before the answer came (checked again at
+  its start). A turn of it already under way that ends silent there does
+  not lift the hold either. A newer message in
+  the conversation ends the hold (a failure on it is handled afresh, from
+  `retry`), and so does a verdict or mark-read that takes the card off a
+  complete tray. In memory, bounded like the loop's other per-conversation
+  memory.
+- `integration.ReceiveLoop`, gate-call mode: a failed turn waiting for
+  evidence that another turn's end reports on is now held from that end
+  until the server answers: no cycle gates it meanwhile, and a turn of it
+  waits for the answer, also one launched with a slot free (before, the
+  freed slot could start it on the input the answer was about).
+- `status().held_after_failure` lists the held conversations
+  (`conversation_id`, `anchor`, `since`, `reason`), `counters["starts_held"]`
+  counts the turns not started for it, and `CycleSummary.held_after_failure`
+  counts the cards a cycle left out for it. Existing fields are unchanged.
+
 ## [1.5.0] — 2026-11-19
 
 Minor release (added behaviour → minor +1, `VERSIONING.md`).

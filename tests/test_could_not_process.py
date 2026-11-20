@@ -21,6 +21,7 @@ from agentchatme.integration import (
     AgentChatCallCount,
     Readiness,
     ReceiveLoop,
+    ReceiveLoopSocketOptions,
     RunEnd,
     RunRequest,
     TurnEnd,
@@ -37,6 +38,7 @@ from agentchatme.types import (
 
 from ._texts import texts as texts_body
 from .test_integration_kit import _card, _cycle, _eventually, _tray, _Turns
+from .test_realtime import MockWebSocket, _flush
 from .test_receive_loop_chunks import _FakeTime
 
 BASE = "https://api.test"
@@ -731,6 +733,7 @@ async def test_a_report_that_fails_is_none_and_the_loop_goes_on() -> None:
     counters = loop.status().counters
     assert (counters["failure_report_errors"], counters["failures_reported"]) == (1, 0)
     assert [str(e["error"]) for e in _events(events, "error")] == ["network down"]
+    assert loop.status().held_after_failure == []  # the server did not answer: nothing held
     server.report_error = None
     server.cards = {"c2": _card("c2", "m2")}
     await _cycle(loop)
@@ -749,6 +752,7 @@ async def test_a_route_404_from_the_server_is_none() -> None:
     [reported] = _events(events, "processing_failure")
     assert (reported["action"], reported["error"]) == ("none", "CONVERSATION_NOT_FOUND")
     assert loop.status().counters["failure_report_errors"] == 0
+    assert loop.status().held_after_failure == []  # an error, not an answer: nothing held
     await loop.stop()
 
 
@@ -1412,3 +1416,494 @@ async def test_stop_during_a_conversation_run_starts_no_further_run() -> None:
     await asyncio.wait_for(running.wait(), 5.0)
     await asyncio.wait_for(loop.stop(), 5.0)
     assert started == ["c1"]
+
+
+# ─────────────── the hold: a none or paused answer, until a newer message ───────────────
+
+
+def _message(mid: str, cid: str, seq: int) -> dict[str, Any]:
+    return {"type": "message.new", "payload": {"id": mid, "conversation_id": cid, "sender": "peer", "seq": seq}}
+
+
+def _unanswered(*ids: str) -> dict[str, Any]:
+    return {"type": "wake", "payload": {"reason": "unanswered", "conversation_ids": list(ids), "step": 1, "at": "t"}}
+
+
+class _Sockets:
+    """The socket's connections: each connect gets a fresh one."""
+
+    def __init__(self) -> None:
+        self.all: list[MockWebSocket] = []
+
+    async def __call__(self, _url: str, **_kw: Any) -> MockWebSocket:
+        ws = MockWebSocket()
+        self.all.append(ws)
+        return ws
+
+    async def hello(self) -> MockWebSocket:
+        await _eventually(lambda: bool(self.all) and bool(self.all[-1].sent), "the HELLO")
+        ws = self.all[-1]
+        await ws.push({"type": "hello.ok", "capabilities": ["ack", "heartbeat", "rewake"]})
+        return ws
+
+
+async def _settled(loop: ReceiveLoop, cycles: int, what: str) -> None:
+    await _eventually(lambda: loop.status().coalescer["cycles"] >= cycles, what)
+    for _ in range(3):
+        await asyncio.sleep(0.01)
+        await loop.idle()
+
+
+@pytest.mark.asyncio
+async def test_none_holds_it_through_a_message_elsewhere_a_wake_frame_an_unanswered_rewake_and_a_reconnect() -> None:
+    server = _Server([_card("c1", "m1")], actions=["none", "retry"])
+    runs = _Runs(server, {"c1": ["failed", "failed", "completed"]})
+    sockets = _Sockets()
+    events: list[dict[str, Any]] = []
+    loop = _run_loop(
+        server,
+        runs,
+        check_runtime=lambda: True,
+        on_event=events.append,
+        socket=ReceiveLoopSocketOptions(
+            api_key="k", websocket_connect=sockets, reconnect_interval_ms=5, max_reconnect_interval_ms=5
+        ),
+    )
+    await loop.start()
+    await _flush()
+    ws = await sockets.hello()  # the connect wake: c1 runs and fails; alone, the runtime check is the evidence
+    await _eventually(lambda: len(server.reports) == 1, "the report")
+    await _settled(loop, 1, "the connect cycle")
+    assert server.reported() == [("c1", "m1", "failed", "runtime_check")]
+    [held] = loop.status().held_after_failure
+    assert {k: held[k] for k in ("conversation_id", "anchor", "reason")} == {
+        "conversation_id": "c1",
+        "anchor": "m1",
+        "reason": "none",
+    }
+    assert isinstance(held["since"], str) and held["since"].endswith("Z")
+
+    # A message in another conversation: c2 runs, c1 does not.
+    server.cards["c2"] = _card("c2", "m2")
+    cycles = loop.status().coalescer["cycles"]
+    await ws.push(_message("m2", "c2", 1))
+    await _settled(loop, cycles + 1, "the message cycle")
+    assert [r.conversation_id for r in runs.requests] == ["c1", "c2"]
+    summary = loop.status().last_cycle
+    assert summary is not None and summary.held_after_failure == 1
+
+    # A wake frame (a reminder), an unanswered re-wake naming c1, a reconnect: nothing for c1.
+    cycles = loop.status().coalescer["cycles"]
+    await ws.push({"type": "wake", "payload": {"reason": "reminder", "conversation_id": "c1", "anchor_message_id": "m1", "step": 1, "at": "t"}})
+    await _settled(loop, cycles + 1, "the wake-frame cycle")
+    cycles = loop.status().coalescer["cycles"]
+    await ws.push(_unanswered("c1"))
+    await _settled(loop, cycles + 1, "the re-wake cycle")
+    summary = loop.status().last_cycle
+    assert summary is not None and (summary.outcome, summary.held_after_failure) == ("nothing_owed", 1)
+    cycles = loop.status().coalescer["cycles"]
+    connections = len(sockets.all)
+    await ws.close()
+    await _eventually(lambda: len(sockets.all) > connections, "the reconnect")
+    ws = await sockets.hello()
+    await _settled(loop, cycles + 1, "the reconnect cycle")
+    assert [r.conversation_id for r in runs.requests] == ["c1", "c2"]
+    assert len(loop.status().held_after_failure) == 1
+
+    # A newer message in c1: the hold ends; its failure is reported through the new anchor and retried.
+    server.cards["c1"] = _card("c1", "m3")
+    await ws.push(_message("m3", "c1", 3))
+    await _eventually(lambda: len(runs.requests) == 4, "c1 on the newer message, then again on retry")
+    await _settled(loop, cycles + 2, "the newer message's cycle")
+    assert [(r.conversation_id, r.anchor) for r in runs.requests] == [("c1", "m1"), ("c2", "m2"), ("c1", "m3"), ("c1", "m3")]
+    assert server.reported() == [("c1", "m1", "failed", "runtime_check"), ("c1", "m3", "failed", "runtime_check")]
+    assert [e["action"] for e in _events(events, "processing_failure")] == ["none", "retry"]
+    assert loop.status().held_after_failure == []
+    await loop.stop()
+
+
+@pytest.mark.parametrize("action", ["none", "retry"])
+@pytest.mark.asyncio
+async def test_a_turn_of_it_waiting_for_a_slot_waits_for_the_answer_and_none_drops_it(action: str) -> None:
+    server = _Server([_card("c1", "m1"), _card("c2", "m2")], actions=[action])
+    reporting = asyncio.Event()
+    answer = asyncio.Event()
+    report = server.conversations.report_processing_failure
+
+    async def slow_report(conversation_id: str, **kwargs: Any) -> Any:
+        reporting.set()
+        await answer.wait()
+        return await report(conversation_id, **kwargs)
+
+    server.conversations.report_processing_failure = slow_report  # type: ignore[method-assign]
+    turns = _Turns()
+    model = _Model(lambda _cid: "reply")
+    loop = _gate_loop(server, model, start_turn=turns)
+    await loop.start()
+    await _cycle(loop)
+    assert [r.conversation_id for r in turns.requests] == ["c1"]  # c2 waits for the slot
+    turns.ends[0].set_result(TurnEnd(status="failed"))
+    await _eventually(lambda: len(turns.requests) == 2, "c2's turn")
+    await _eventually(lambda: loop.status().counters["failures_waiting"] == 1, "c1's failure to wait")
+    # The next wake gates c1 again: its turn waits behind c2's.
+    await _cycle(loop)
+    await _eventually(lambda: loop.status().counters["turns_waiting"] == 1, "c1's turn waiting")
+    # c2's turn completes (the evidence): the slot is free, but c1's turn waits for the server's answer.
+    server.answered("c2")
+    turns.ends[1].set_result(TurnEnd(status="completed", agentchat_calls=AgentChatCallCount(made=2, failed=0)))
+    await asyncio.wait_for(reporting.wait(), 5.0)
+    for _ in range(10):
+        await asyncio.sleep(0.005)
+    assert len(turns.requests) == 2 and loop.status().counters["turns_waiting"] == 1
+    gated = len(model.prompts)
+    await _cycle(loop)  # a wake meanwhile neither gates it nor starts it
+    assert len(model.prompts) == gated and len(turns.requests) == 2
+    answer.set()
+    if action == "none":
+        await _eventually(lambda: loop.status().counters["turns_waiting"] == 0, "the waiting turn dropped")
+        for _ in range(10):
+            await asyncio.sleep(0.005)
+        assert len(turns.requests) == 2 and loop.status().turns == []
+        assert [h["conversation_id"] for h in loop.status().held_after_failure] == ["c1"]
+    else:
+        await _eventually(lambda: len(turns.requests) == 3, "c1's turn after the answer")
+        assert turns.requests[2].conversation_id == "c1"
+        assert loop.status().held_after_failure == []
+    assert server.reported() == [("c1", "m1", "failed", "other_run_completed")]
+    await loop.stop()
+
+
+@pytest.mark.asyncio
+async def test_paused_holds_the_same_way_also_while_the_card_is_not_shown_muted() -> None:
+    server = _Server([_card("c1", "m1")], actions=["paused"])
+    runs = _Runs(server, {"c1": ["failed", "completed"]})
+    loop = _run_loop(server, runs, check_runtime=lambda: True)
+    await loop.start()
+    await _cycle(loop)
+    [held] = loop.status().held_after_failure
+    assert (held["conversation_id"], held["anchor"], held["reason"]) == ("c1", "m1", "paused")
+    server.cards["c1"]["muted"] = False  # the hold does not lean on the server's mute
+    server.cards["c2"] = _card("c2", "m2")
+    await _cycle(loop)
+    await _cycle(loop)
+    assert [r.conversation_id for r in runs.requests] == ["c1", "c2"]
+    summary = loop.status().last_cycle
+    assert summary is not None and (summary.outcome, summary.held_after_failure) == ("nothing_owed", 1)
+    server.cards["c1"] = _card("c1", "m3")  # a newer message lifts it
+    await _cycle(loop)
+    assert [(r.conversation_id, r.anchor) for r in runs.requests] == [("c1", "m1"), ("c2", "m2"), ("c1", "m3")]
+    await loop.stop()
+
+
+@pytest.mark.asyncio
+async def test_a_card_read_meanwhile_ends_the_hold_and_a_truncated_tray_without_it_proves_nothing() -> None:
+    server = _Server([_card("c1", "m1")], actions=["none"])
+    runs = _Runs(server, {"c1": ["failed", "completed"]})
+    loop = _run_loop(server, runs, check_runtime=lambda: True)
+    await loop.start()
+    await _cycle(loop)
+    assert len(loop.status().held_after_failure) == 1
+    tray = server.inbox.tray
+
+    async def truncated(**_kwargs: Any) -> Any:
+        return _tray([_card("c2", "m2")], truncated=True)
+
+    server.inbox.tray = truncated  # type: ignore[method-assign]
+    await _cycle(loop)
+    assert len(loop.status().held_after_failure) == 1  # not on a truncated tray: proves nothing
+    server.inbox.tray = tray  # type: ignore[method-assign]
+    server.cards = {}  # the card was read (a verdict, a mark-read)
+    await _cycle(loop)
+    assert loop.status().held_after_failure == []
+    server.cards["c1"] = _card("c1", "m1")  # back at the same anchor (a deferred card's reminder)
+    await _cycle(loop)
+    assert [r.conversation_id for r in runs.requests if r.conversation_id == "c1"] == ["c1", "c1"]
+    await loop.stop()
+
+
+@pytest.mark.asyncio
+async def test_gate_call_a_turn_answered_none_is_not_gated_again_and_an_unanswered_rewake_does_not_lift_it() -> None:
+    server = _Server([_card("c1", "m1")], actions=["none"])
+    turns = _Turns()
+    model = _Model(lambda _cid: "reply")
+    loop = _gate_loop(server, model, start_turn=turns, check_runtime=lambda: True)
+    await loop.start()
+    await _cycle(loop)
+    turns.ends[0].set_result(TurnEnd(status="failed", detail="API Error: safeguards flagged"))
+    await _eventually(lambda: len(server.reports) == 1, "the report")
+    await _eventually(lambda: loop.status().held_after_failure != [], "the hold")
+    # A message elsewhere: c2 is gated, c1 is not.
+    server.cards["c2"] = _card("c2", "m2")
+    await _cycle(loop)
+    assert model.cards()[-1] == ["c2"]
+    summary = loop.status().last_cycle
+    assert summary is not None and summary.held_after_failure == 1
+    server.answered("c2")
+    turns.ends[1].set_result(TurnEnd(status="completed", agentchat_calls=AgentChatCallCount(made=2, failed=0)))
+    await _eventually(lambda: loop.status().turns == [], "c2's turn to end")
+    # An unanswered re-wake naming c1: still no gate call for it.
+    gated = len(model.prompts)
+    loop._on_wake_frame(_unanswered("c1"))
+    for _ in range(3):
+        await asyncio.sleep(0.01)
+        await loop.idle()
+    assert len(model.prompts) == gated and len(turns.requests) == 2
+    # A newer message in c1: gated again.
+    server.cards["c1"] = _card("c1", "m3")
+    await _cycle(loop)
+    assert model.cards()[-1] == ["c1"] and turns.requests[-1].anchor == "m3"
+    turns.ends[2].set_result(TurnEnd(status="completed", agentchat_calls=AgentChatCallCount(made=2, failed=0)))
+    await loop.stop()
+
+
+@pytest.mark.asyncio
+async def test_gate_call_a_single_card_call_answered_none_is_not_gated_again_until_a_newer_message() -> None:
+    server = _Server([_flagged("c1", "m1")], actions=["none"])
+    model = _Model()
+    loop = _gate_loop(server, model, check_runtime=lambda: True)
+    await loop.start()
+    await _cycle(loop)
+    assert server.reported() == [("c1", "m1", "failed", "runtime_check")]
+    server.cards["c2"] = _card("c2", "m2")
+    await _cycle(loop)
+    server.cards["c3"] = _card("c3", "m3")
+    await _cycle(loop)
+    assert model.cards() == [["c1"], ["c2"], ["c3"]]
+    server.cards["c1"] = _card("c1", "m4")  # a newer message, one the model can read
+    await _cycle(loop)
+    assert model.cards()[-1] == ["c1"]
+    assert loop.status().held_after_failure == []
+    await loop.stop()
+
+
+# ─────────────── the hold at the start itself: an answer after the card was read ───────────────
+
+
+class _HeldModel(_Model):
+    """Replies to every card; a call can be held until the test lets it go."""
+
+    def __init__(self) -> None:
+        super().__init__(lambda _cid: "reply")
+        self.go = asyncio.Event()
+        self.go.set()
+        self.entered = asyncio.Event()
+
+    async def __call__(self, prompt: str) -> str:
+        self.entered.set()
+        await self.go.wait()
+        return await super().__call__(prompt)
+
+
+async def _gate_with_parked_c1(
+    server: _Server, model: _HeldModel, turns: _Turns, reported: Callable[[], bool] | None = None
+) -> ReceiveLoop:
+    """c1's turn fails while c2 waits (no evidence yet); the next gate call
+    (c1 again) is held while c2's turn completes and c1's report goes out."""
+    loop = _gate_loop(server, model, start_turn=turns)
+    await loop.start()
+    await _cycle(loop)
+    turns.ends[0].set_result(TurnEnd(status="failed"))
+    await _eventually(lambda: len(turns.requests) == 2, "c2's turn")
+    await _eventually(lambda: loop.status().counters["failures_waiting"] == 1, "c1's failure to wait")
+    model.go.clear()
+    model.entered.clear()
+    loop.wake()
+    await asyncio.wait_for(model.entered.wait(), 5.0)
+    server.answered("c2")
+    turns.ends[1].set_result(TurnEnd(status="completed", agentchat_calls=AgentChatCallCount(made=2, failed=0)))
+    await _eventually(reported or (lambda: len(server.reports) == 1), "the report")
+    return loop
+
+
+@pytest.mark.asyncio
+async def test_none_landing_while_the_gate_call_carrying_the_card_is_out_starts_no_turn_at_that_anchor() -> None:
+    server = _Server([_card("c1", "m1"), _card("c2", "m2")], actions=["none"])
+    model = _HeldModel()
+    turns = _Turns()
+    loop = await _gate_with_parked_c1(server, model, turns)
+    await _eventually(lambda: loop.status().held_after_failure != [], "the hold")
+    model.go.set()  # the gate says reply for c1
+    await _eventually(lambda: loop.status().last_cycle is not None and loop.status().coalescer["state"] == "idle", "the cycle")
+    for _ in range(3):
+        await asyncio.sleep(0.01)
+        await loop.idle()
+    assert [(r.conversation_id, r.anchor) for r in turns.requests] == [("c1", "m1"), ("c2", "m2")]
+    assert loop.status().counters["starts_held"] == 1
+    summary = loop.status().last_cycle
+    assert summary is not None and summary.held_after_failure == 1
+    await loop.stop()
+
+
+@pytest.mark.asyncio
+async def test_a_turn_launched_while_its_report_is_out_waits_for_the_answer_even_with_a_slot_free() -> None:
+    server = _Server([_card("c1", "m1"), _card("c2", "m2")], actions=["none"])
+    answer = asyncio.Event()
+    asked = asyncio.Event()
+    report = server.conversations.report_processing_failure
+
+    async def slow_report(conversation_id: str, **kwargs: Any) -> Any:
+        asked.set()
+        await answer.wait()
+        return await report(conversation_id, **kwargs)
+
+    server.conversations.report_processing_failure = slow_report  # type: ignore[method-assign]
+    model = _HeldModel()
+    turns = _Turns()
+    loop = await _gate_with_parked_c1(server, model, turns, reported=asked.is_set)
+    model.go.set()  # the gate answers while the report is still out
+    await _eventually(lambda: loop.status().counters["turns_waiting"] == 1, "c1's turn waiting for the answer")
+    for _ in range(10):
+        await asyncio.sleep(0.005)
+    assert len(turns.requests) == 2 and loop.status().counters["turns_active"] == 0
+    answer.set()
+    await _eventually(lambda: loop.status().counters["turns_waiting"] == 0, "c1's turn dropped")
+    for _ in range(10):
+        await asyncio.sleep(0.005)
+    assert len(turns.requests) == 2
+    assert loop.status().counters["starts_held"] == 1
+    await loop.stop()
+
+
+@pytest.mark.parametrize("action", ["none", "paused"])
+@pytest.mark.asyncio
+async def test_none_keeps_a_waiting_turn_at_a_newer_anchor_and_paused_drops_it(action: str) -> None:
+    server = _Server([_card("c1", "m1"), _card("c2", "m2")], actions=[action])
+    answer = asyncio.Event()
+    asked = asyncio.Event()
+    report = server.conversations.report_processing_failure
+
+    async def slow_report(conversation_id: str, **kwargs: Any) -> Any:
+        asked.set()
+        await answer.wait()
+        return await report(conversation_id, **kwargs)
+
+    server.conversations.report_processing_failure = slow_report  # type: ignore[method-assign]
+    turns = _Turns()
+    loop = _gate_loop(server, _Model(lambda _cid: "reply"), start_turn=turns)
+    await loop.start()
+    await _cycle(loop)
+    turns.ends[0].set_result(TurnEnd(status="failed"))
+    await _eventually(lambda: len(turns.requests) == 2, "c2's turn")
+    await _eventually(lambda: loop.status().counters["failures_waiting"] == 1, "c1's failure to wait")
+    server.cards["c1"] = _card("c1", "m3")  # a newer message: c1 is gated again on it
+    await _cycle(loop)
+    await _eventually(lambda: loop.status().counters["turns_waiting"] == 1, "c1's turn at m3 waiting")
+    server.answered("c2")
+    turns.ends[1].set_result(TurnEnd(status="completed", agentchat_calls=AgentChatCallCount(made=2, failed=0)))
+    await asyncio.wait_for(asked.wait(), 5.0)
+    answer.set()
+    await _eventually(lambda: len(server.reports) == 1, "the answer")
+    assert server.reports[0]["through_message_id"] == "m1"
+    if action == "none":
+        await _eventually(lambda: len(turns.requests) == 3, "c1 on the newer message")
+        assert turns.requests[2].anchor == "m3"
+        assert loop.status().counters["starts_held"] == 0
+    else:
+        await _eventually(lambda: loop.status().counters["turns_waiting"] == 0, "the waiting turn dropped")
+        for _ in range(10):
+            await asyncio.sleep(0.005)
+        assert len(turns.requests) == 2 and loop.status().counters["starts_held"] == 1
+    await loop.stop()
+
+
+@pytest.mark.asyncio
+async def test_a_turn_under_way_when_none_lands_ending_silent_there_does_not_lift_the_hold() -> None:
+    server = _Server([_card("c1", "m1"), _card("c2", "m2")], actions=["none"])
+    turns = _Turns()
+    model = _Model(lambda _cid: "reply")
+    loop = _gate_loop(server, model, start_turn=turns, max_concurrent_turns=2)
+    await loop.start()
+    await _cycle(loop)
+    assert [r.conversation_id for r in turns.requests] == ["c1", "c2"]
+    turns.ends[0].set_result(TurnEnd(status="failed"))  # c2 still runs: c1 waits for evidence
+    await _eventually(lambda: loop.status().counters["failures_waiting"] == 1, "c1's failure to wait")
+    await _cycle(loop)  # c1 gated again: a second turn of it runs
+    await _eventually(lambda: len(turns.requests) == 3, "c1's second turn")
+    server.answered("c2")
+    turns.ends[1].set_result(TurnEnd(status="completed", agentchat_calls=AgentChatCallCount(made=2, failed=0)))
+    await _eventually(lambda: loop.status().held_after_failure != [], "the hold")
+    # c1's second turn ends silent at the same anchor (it looked and did nothing).
+    turns.ends[2].set_result(TurnEnd(status="completed", agentchat_calls=AgentChatCallCount(made=2, failed=0)))
+    await _eventually(lambda: loop.status().turns == [], "the turn to end")
+    gated = len(model.prompts)
+    await _cycle(loop)
+    assert len(model.prompts) == gated and len(turns.requests) == 3
+    assert [h["anchor"] for h in loop.status().held_after_failure] == ["m1"]
+    await loop.stop()
+
+
+@pytest.mark.asyncio
+async def test_an_invite_turns_end_takes_a_waiting_failed_turn_for_its_report() -> None:
+    # Python counts an invite turn as a turn: its completion is evidence.
+    server = _Server([_card("c1", "m1")], actions=["none"], invites=[INVITE])
+    turns = _Turns()
+    loop = _gate_loop(server, _Model(lambda _cid: "reply"), start_turn=turns)
+    await loop.start()
+    await _cycle(loop)
+    assert [r.kind for r in turns.requests] == ["reply"]  # the invite turn waits for the slot
+    turns.ends[0].set_result(TurnEnd(status="failed"))
+    await _eventually(lambda: len(turns.requests) == 2, "the invite turn")
+    assert server.reports == []
+    server.invites = []
+    turns.ends[1].set_result(TurnEnd(status="completed", agentchat_calls=AgentChatCallCount(made=1, failed=0)))
+    await _eventually(lambda: len(server.reports) == 1, "the report")
+    await _eventually(lambda: loop.status().held_after_failure != [], "the hold")
+    gated = loop.status().counters["chunks_ok"] + loop.status().counters["chunks_failed"]
+    await _cycle(loop)
+    assert loop.status().counters["chunks_ok"] + loop.status().counters["chunks_failed"] == gated
+    await loop.stop()
+
+
+def test_the_pacer_bounds_paces_and_holds_apart_and_lifts_a_hold_only_on_what_a_later_read_shows() -> None:
+    from agentchatme.integration.receive_loop import _Pacer
+
+    clock = [1_000.0]
+    pacer = _Pacer(60_000, lambda: clock[0])
+    pacer.hold_failed("conversation:p", "m1", "none")
+    for i in range(1_500):
+        pacer.hold(f"conversation:c{i}", "m")
+    assert [key for key, *_ in pacer.failed()] == ["conversation:p"]  # paces never push a hold out
+    for i in range(1_000):
+        clock[0] += 1
+        pacer.hold_failed(f"conversation:h{i}", "m", "paused")
+    held = pacer.failed()
+    assert len(held) == 1_000 and held[0][0] == "conversation:h0"  # the oldest hold went first
+    assert pacer.check("conversation:c1499", "m") == "paced"
+
+    fresh = _Pacer(60_000, lambda: clock[0])
+    before = fresh.mark()
+    fresh.hold_failed("conversation:p", "m1", "none")
+    fresh.keep_failed_on({}, before, True)  # a read that began before the hold
+    assert fresh.held_failed_at("conversation:p", "m1")
+    fresh.keep_failed_on({}, fresh.mark(), False)  # truncated, card not shown: proves nothing
+    assert fresh.held_failed_at("conversation:p", "m1")
+    fresh.hold("conversation:p", "m1")  # a pace at the same anchor does not replace it
+    assert fresh.check("conversation:p", "m1") == "failed"
+    fresh.release_pace("conversation:p")  # an unanswered wake
+    assert not fresh.held_failed_at("conversation:p", "m0")  # an older anchor neither matches nor lifts it
+    assert fresh.held_failed_at("conversation:p", "m1")
+    fresh.keep_failed_on({"conversation:p": "m2"}, fresh.mark(), False)  # a newer anchor shown
+    assert fresh.failed() == []
+    fresh.hold_failed("conversation:q", "m1", "none")
+    fresh.keep_failed_on({}, fresh.mark(), True)  # a complete tray without it: read
+    assert fresh.failed() == []
+
+
+@pytest.mark.asyncio
+async def test_a_failing_card_and_a_broken_runtime_check_do_not_spin_cycles_while_a_turn_runs() -> None:
+    server = _Server([_card("c2", "m2"), _flagged("c1", "m1")])
+    turns = _Turns()  # c2's turn never ends
+    model = _Model(lambda _cid: "reply")
+    loop = _gate_loop(server, model, start_turn=turns, check_runtime=lambda: False)
+    await loop.start()
+    await _cycle(loop)
+    assert [r.conversation_id for r in turns.requests] == ["c2"]
+    prompts, cycles = len(model.prompts), loop.status().coalescer["cycles"]
+    loop.wake()
+    for _ in range(30):
+        await asyncio.sleep(0.01)
+    await loop.idle()
+    assert loop.status().coalescer["cycles"] - cycles <= 2
+    assert len(model.prompts) - prompts <= 2
+    assert server.reports == []
+    await loop.stop()
