@@ -93,11 +93,26 @@ loop follows: ``retry`` or ``hidden`` → that conversation runs again (a
 gate call for its card alone, a reply turn, a conversation run), after the
 others queued in this cycle, from a fresh read of the tray (a hidden
 message shows as the served note; a turn's conversation is held out of the
-gate from its report until it starts again); ``paused`` or ``none`` →
-nothing more for it. At most :data:`MAX_FAILURE_REPORTS` (3) reports per conversation in
-one cycle. A server that predates the route answers ``none``. The counts
-are in ``status().counters`` and each report is a ``processing_failure``
-event.
+gate from its report until it starts again); ``paused`` or ``none`` (or
+an action this release does not know) → nothing more for it, and the loop
+holds it at the anchor it reported: no later cycle runs it or gates it
+again (a message elsewhere, a wake frame, a reconnect, an ``unanswered``
+re-wake included), and a turn of it at that anchor does not start: one
+waiting for a slot is dropped, one decided before the answer came is
+checked again at its start, and a turn of it already under way that ends
+silent there does not lift the hold. A failed message is not redelivered to
+the model; new messages
+flow: a newer message in that conversation moves its anchor and ends the
+hold (its failures are reported afresh), and so does a verdict or
+mark-read that takes the card off the tray. In memory: a restart may try
+it once more, and that report holds it again. A failed turn waiting for
+evidence that another turn's end reports on is held the same way from that
+end until the answer (no gate, and a turn of it waiting for a slot waits
+for the answer). At most :data:`MAX_FAILURE_REPORTS` (3) reports per
+conversation in one cycle. A server that predates the route answers
+``none``. The counts are in ``status().counters``, the conversations held
+in ``status().held_after_failure``, and each report is a
+``processing_failure`` event.
 
 Pacing (D5): after a silent turn (it looked and did nothing) the same
 conversation at the same anchor is not gated again for ``pace_ms`` (60 s)
@@ -105,7 +120,9 @@ unless a newer message moves its anchor or an ``unanswered`` wake names it;
 after an invite turn that left the invite pending, no second invite turn for
 it within ``pace_ms`` unless an ``unanswered`` wake arrives. In single-run
 mode the run that would dismiss an ignored invite counts only when it ended
-at least ``pace_ms`` after the first counted one. In memory.
+at least ``pace_ms`` after the first counted one. In memory. The
+could-not-process hold above is the same hold without the time limit, and
+an ``unanswered`` wake does not lift it.
 
 Chunks (contract v1, section 3.6): a tray holds up to 50 cards, and one
 answer for all of them can outgrow what a runtime lets its model write; a
@@ -181,7 +198,7 @@ import inspect
 import logging
 import threading
 import time
-from collections import OrderedDict, deque
+from collections import Counter, OrderedDict, deque
 from collections.abc import Awaitable, Iterator, Mapping
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
@@ -241,9 +258,15 @@ PACE_MS = 60_000
 """D5 pacing: how long a silent turn's card (or an invite after its turn) is
 not gated again at the same anchor."""
 _SILENT_MEMORY = 1_000
-"""Silent-turn memory (D5 "second time for the same anchor"), bounded."""
+"""Silent-turn memory (D5 "second time for the same anchor"), bounded; the
+pacer's paces, and its could-not-process holds apart, to the same bound."""
+_CONVERSATION_KEY = "conversation:"
+"""A conversation's key in the tracker and the pacer."""
 
 ReceiveLoopMode = Literal["gate_call", "single_run"]
+FailureHoldReason = Literal["none", "paused"]
+"""The server's answer that holds a conversation after a could-not-process
+report."""
 WakeSource = Literal["message", "wake_frame", "connect", "invite", "external", "more"]
 CycleOutcome = Literal[
     "empty",
@@ -371,9 +394,14 @@ class CycleSummary:
     turns_queued: int = 0
     """Reply or invite turns waiting for a slot (``max_concurrent_turns``)."""
     held_by_turns: int = 0
-    """Cards left out because a turn for their conversation is running."""
+    """Cards left out because a turn for their conversation is running (or
+    its could-not-process report is out)."""
     paced: int = 0
     """Cards and invites left out by D5 pacing (a recent silent turn)."""
+    held_after_failure: int = 0
+    """Cards left out because a could-not-process report through their
+    anchor was answered ``none`` or ``paused``: not run again until a newer
+    message."""
     truncated: bool = False
     failure: str | None = None
     """Why the cycle could not finish, or, when some gate chunks failed, how
@@ -435,8 +463,19 @@ class ReceiveLoopStatus:
     waiting for evidence now), ``reruns``, ``runtime_checks_ok`` /
     ``runtime_checks_failed``; the gate's split: ``gate_splits`` (failed
     chunks gated again card by card) and ``split_calls_ok`` /
-    ``split_calls_failed``."""
+    ``split_calls_failed``; ``starts_held``: reply turns not started because
+    their conversation is held after a could-not-process answer (dropped
+    from the queue, or stopped at their start)."""
     last_error: str | None
+    held_after_failure: list[dict[str, Any]] = field(default_factory=list)
+    """Could not process: the conversations not run again until a new
+    message arrives, because the server answered ``none`` or ``paused`` to
+    their report (oldest first): ``conversation_id``, ``anchor`` (the
+    report's ``through_message_id``), ``since`` (ISO 8601) and ``reason``
+    (``none`` / ``paused``). As of the last tray read: a card read since (a
+    verdict, a mark-read) or moved to a newer anchor leaves the list at the
+    next one. In memory: a restart may try it once more, and that report
+    holds it again."""
 
 
 ReceiveLoopEvent = dict[str, Any]
@@ -665,6 +704,9 @@ class _ChunkedGate:
     held: int = 0
     """Cards left out of their chunk: a turn took them while earlier chunks
     were gated."""
+    held_after_failure: int = 0
+    """Cards left out of their chunk: a could-not-process answer held them
+    while earlier chunks were gated."""
     reply: list[Any] = field(default_factory=list)
     """The replies, chunk by chunk, each chunk's in the model's order, then
     those of the single-card calls."""
@@ -815,36 +857,158 @@ def _api_key_of(client: Any) -> str | None:
     return key if isinstance(key, str) and key else None
 
 
+@dataclass(frozen=True)
+class _FailureHold:
+    """A could-not-process hold: the server's answer, when it came, and its
+    place among holds and tray reads."""
+
+    reason: FailureHoldReason
+    since: float
+    seq: int
+
+
+@dataclass(frozen=True)
+class _PaceEntry:
+    """A key held at one anchor: a D5 pace (until a time), or a
+    could-not-process hold (until the anchor moves)."""
+
+    anchor: str | None
+    until: float
+    """When a pace ends (epoch ms); a could-not-process hold has no end
+    (``inf``)."""
+    failure: _FailureHold | None = None
+
+
 class _Pacer:
     """D5 pacing, in memory: a key (``conversation:<id>`` / ``invite:<id>``)
-    held until a time, for one anchor."""
+    held until a time, for one anchor. A could-not-process hold
+    (:meth:`hold_failed`) is the same hold with no end time: its conversation
+    is held at that anchor until a newer message moves the anchor
+    (:meth:`check` or :meth:`keep_failed_on` sees another anchor), the card
+    leaves a complete tray (:meth:`keep_failed_on`), or a later answer of the
+    server runs it again (:meth:`release`). A pace at the same anchor (a turn
+    of it already under way when the answer came, ending silent) does not
+    replace it. An ``unanswered`` wake lifts paces only
+    (:meth:`release_pace`): a re-wake of the same failed input would send
+    the same messages to the model again. Paces and holds are bounded apart,
+    so a burst of paces never pushes a hold out."""
 
     def __init__(self, pace_ms: float, now: Callable[[], float]) -> None:
         self._pace_ms = pace_ms
         self._now = now
-        self._until: dict[str, tuple[str | None, float]] = {}
+        self._until: dict[str, _PaceEntry] = {}
+        # Orders holds and tray reads: a read lifts only holds older than
+        # its start.
+        self._seq = 0
 
     def hold(self, key: str, anchor: str | None) -> None:
-        self._until[key] = (anchor, self._now() + self._pace_ms)
-        if len(self._until) > _SILENT_MEMORY:
-            self._until.pop(next(iter(self._until)))
+        """A D5 pace. It never replaces a could-not-process hold at the same
+        anchor (that input stays held)."""
+        prior = self._until.get(key)
+        if prior is not None and prior.failure is not None and prior.anchor == anchor:
+            return
+        self._set(key, _PaceEntry(anchor=anchor, until=self._now() + self._pace_ms))
 
-    def held(self, key: str, anchor: str | None) -> bool:
+    def hold_failed(self, key: str, anchor: str, reason: FailureHoldReason) -> None:
+        """Could not process: hold the key at this anchor until a newer
+        message moves it (held again at it: since the first time)."""
+        prior = self._until.get(key)
+        since = (
+            prior.failure.since
+            if prior is not None and prior.failure is not None and prior.anchor == anchor
+            else self._now()
+        )
+        self._seq += 1
+        self._set(
+            key,
+            _PaceEntry(
+                anchor=anchor, until=float("inf"), failure=_FailureHold(reason=reason, since=since, seq=self._seq)
+            ),
+        )
+
+    def check(self, key: str, anchor: str | None) -> Literal["paced", "failed"] | None:
+        """What holds the key at this anchor now: a pace, a
+        could-not-process hold, or nothing (a stale entry goes)."""
         entry = self._until.get(key)
         if entry is None:
-            return False
-        held_anchor, until = entry
-        if held_anchor != anchor or self._now() >= until:
+            return None
+        if entry.anchor != anchor or self._now() >= entry.until:
             del self._until[key]
-            return False
-        return True
+            return None
+        return "failed" if entry.failure is not None else "paced"
+
+    def held(self, key: str, anchor: str | None) -> bool:
+        return self.check(key, anchor) is not None
+
+    def held_failed_at(self, key: str, anchor: str | None) -> bool:
+        """A could-not-process hold on the key at exactly this anchor;
+        changes nothing (a queued turn's anchor may be older than the
+        card's)."""
+        entry = self._until.get(key)
+        return entry is not None and entry.failure is not None and entry.anchor == anchor
 
     def release(self, key: str) -> None:
+        """Lift whatever holds the key (a pace or a could-not-process hold)."""
         self._until.pop(key, None)
+
+    def release_pace(self, key: str) -> None:
+        """Lift a pace; a could-not-process hold stays."""
+        entry = self._until.get(key)
+        if entry is not None and entry.failure is None:
+            del self._until[key]
 
     def release_invites(self) -> None:
         for key in [k for k in self._until if k.startswith("invite:")]:
             del self._until[key]
+
+    def mark(self) -> int:
+        """Taken before a tray read: :meth:`keep_failed_on` lifts only holds
+        made before it."""
+        return self._seq
+
+    def keep_failed_on(self, anchors: Mapping[str, str | None], mark: int, complete: bool) -> None:
+        """After a tray read from ``mark`` (``anchors``: each card's key and
+        anchor): a hold whose card shows another anchor is over (a newer
+        message came), and, on a complete tray (``complete``: not
+        truncated), so is one whose card is gone (read meanwhile: a verdict,
+        a mark-read). Only holds made before the read started: a read that
+        began earlier says nothing of a later hold."""
+        for key, entry in list(self._until.items()):
+            if entry.failure is None or entry.failure.seq > mark:
+                continue
+            if key not in anchors:
+                if complete:
+                    del self._until[key]
+            elif anchors[key] != entry.anchor:
+                del self._until[key]
+
+    def failed(self) -> list[tuple[str, str, FailureHoldReason, float]]:
+        """The could-not-process holds, oldest first (by ``since``):
+        ``(key, anchor, reason, since)``."""
+        held = [
+            (key, entry.anchor, entry.failure.reason, entry.failure.since)
+            for key, entry in self._until.items()
+            if entry.failure is not None and entry.anchor is not None
+        ]
+        return sorted(held, key=lambda hold: hold[3])
+
+    def _set(self, key: str, entry: _PaceEntry) -> None:
+        # Newest last (the oldest goes first), each kind to its own bound.
+        self._until.pop(key, None)
+        self._until[key] = entry
+        paces = sum(1 for held in self._until.values() if held.failure is None)
+        holds = len(self._until) - paces
+        if paces <= _SILENT_MEMORY and holds <= _SILENT_MEMORY:
+            return
+        for old, held in list(self._until.items()):
+            if paces <= _SILENT_MEMORY and holds <= _SILENT_MEMORY:
+                break
+            if held.failure is None and paces > _SILENT_MEMORY:
+                del self._until[old]
+                paces -= 1
+            elif held.failure is not None and holds > _SILENT_MEMORY:
+                del self._until[old]
+                holds -= 1
 
 
 class ReceiveLoop:
@@ -985,6 +1149,14 @@ class ReceiveLoop:
         # Conversations whose failed turn is being reported, or started
         # again, outside a cycle: held out of the gate meanwhile.
         self._settling: set[str] = set()
+        # Could not process: conversations with a failed turn waiting for
+        # evidence, taken for a settle when another turn ended (right after
+        # its slot was freed, before the pump that spawned runs): held out of
+        # the gate, and a turn of theirs waiting for a slot waits, until the
+        # settle is done.
+        # Counted: two settles holding one conversation hold it until both
+        # are done.
+        self._reporting: Counter[str] = Counter()
         # The event loop the loop runs on (set by start()): a release from
         # another thread is handed over to it.
         self._event_loop: asyncio.AbstractEventLoop | None = None
@@ -1039,6 +1211,7 @@ class ReceiveLoop:
             "reruns": 0,
             "runtime_checks_ok": 0,
             "runtime_checks_failed": 0,
+            "starts_held": 0,
         }
         self._outcomes: dict[str, int] = {}
         self._failure_actions: dict[str, int] = {}
@@ -1201,6 +1374,15 @@ class ReceiveLoop:
                 "failure_actions": dict(self._failure_actions),
             },
             last_error=self._last_error,
+            held_after_failure=[
+                {
+                    "conversation_id": key[len(_CONVERSATION_KEY) :],
+                    "anchor": anchor,
+                    "since": _iso(since),
+                    "reason": reason,
+                }
+                for key, anchor, reason, since in self._pacer.failed()
+            ],
         )
 
     # ─── wakes ───────────────────────────────────────────────────────────
@@ -1239,9 +1421,11 @@ class ReceiveLoop:
         ids = data.get("conversation_ids")
         named = [i for i in ids if isinstance(i, str)] if isinstance(ids, list) else []
         if reason == "unanswered":
-            # The server says these are still unanswered: pacing yields.
+            # The server says these are still unanswered: pacing yields. A
+            # could-not-process hold does not: the same input would fail the
+            # same way.
             for conversation_id in named:
-                self._pacer.release(f"conversation:{conversation_id}")
+                self._pacer.release_pace(f"{_CONVERSATION_KEY}{conversation_id}")
             self._pacer.release_invites()
         extra: dict[str, Any] = {"reason": reason}
         if named:
@@ -1415,41 +1599,83 @@ class ReceiveLoop:
         """Held out of the gate: a running or waiting turn holds the card's
         conversation, or a verdict for it is still being recorded (an
         abandoned cycle's last call), or its failed turn is being reported
-        and started again. Gating it again could record the same verdict
-        twice (a second defer climbs the ladder), or race the turn."""
+        and started again (``_settling``, ``_reporting``). Gating it again
+        could record the same verdict twice (a second defer climbs the
+        ladder), or race the turn, or start it on the input the server's
+        answer is about."""
         conversation_id = card["conversation_id"]
         return (
             self._tracker.conversation_running(conversation_id)
             or conversation_id in self._records_in_flight
             or conversation_id in self._settling
+            or conversation_id in self._reporting
         )
 
+    def _pace_cards(self, cards: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], int, int]:
+        """The cards neither paced (D5) nor held after a could-not-process
+        answer (``none`` / ``paused`` through the anchor they still show),
+        and how many of each were left out. A card whose anchor moved is no
+        longer held."""
+        open_cards: list[dict[str, Any]] = []
+        paced = 0
+        held = 0
+        for card in cards:
+            state = self._pacer.check(f"{_CONVERSATION_KEY}{card['conversation_id']}", _gate.anchor_of(card))
+            if state == "paced":
+                paced += 1
+            elif state == "failed":
+                held += 1
+            else:
+                open_cards.append(card)
+        return open_cards, paced, held
+
+    def _held_after_failure(self, card: Mapping[str, Any]) -> bool:
+        """Held after a could-not-process answer, at the anchor this card
+        still shows."""
+        key = f"{_CONVERSATION_KEY}{card['conversation_id']}"
+        return self._pacer.check(key, _gate.anchor_of(card)) == "failed"
+
+    def _forget_cleared(self, tray: Mapping[str, Any], mark: int) -> None:
+        """A tray read after ``mark``, every card on it (a turn's and a
+        muted one's included): a held conversation whose card shows a newer
+        anchor is no longer held, and on a complete tray (not truncated)
+        neither is one whose card is gone (read meanwhile: a verdict, a
+        mark-read). A truncated tray proves nothing about the cards it does
+        not show."""
+        anchors = {f"{_CONVERSATION_KEY}{card['conversation_id']}": _gate.anchor_of(card) for card in _gate.cards_of(tray)}
+        self._pacer.keep_failed_on(anchors, mark, tray.get("truncated") is not True)
+
+    def _start_held(self, handle: TurnHandle) -> bool:
+        """The start of a reply turn: held after a could-not-process answer
+        at the anchor it was started for."""
+        turn = handle.turn
+        return turn.kind == "reply" and self._pacer.held_failed_at(f"{_CONVERSATION_KEY}{turn.conversation_id}", turn.anchor)
+
     async def _gate_call_cycle(self, token: int, cancel: _CallCancel) -> CycleSummary:
+        mark = self._pacer.mark()
         tray = await self._read_tray()
         if self._stale(token):
             return self._summary("abandoned")
         if tray is None:
             return self._summary("tray_failed", failure=self._last_error)
         cards = _gate.cards_of(tray)
+        self._forget_cleared(tray, mark)
         invites = _tray_invites(tray)
         unheld = [card for card in cards if not self._held(card)]
         held = len(cards) - len(unheld)
         if held > 0:
             self._held_while_running = True
-        gate_cards = [
-            card
-            for card in unheld
-            if not self._pacer.held(f"conversation:{card['conversation_id']}", _gate.anchor_of(card))
-        ]
+        gate_cards, paced_cards, held_after_failure = self._pace_cards(unheld)
         open_invites = [i for i in invites if not self._tracker.invite_running(i["invite_id"])]
         owed_invites = [i for i in open_invites if not self._pacer.held(f"invite:{i['invite_id']}", None)]
-        paced = (len(unheld) - len(gate_cards)) + (len(open_invites) - len(owed_invites))
+        paced = paced_cards + (len(open_invites) - len(owed_invites))
         owed_cards = [card for card in gate_cards if card.get("muted") is not True]
         base: dict[str, Any] = {
             "cards": len(cards),
             "invites": len(invites),
             "held_by_turns": held,
             "paced": paced,
+            "held_after_failure": held_after_failure,
             "truncated": tray.get("truncated") is True,
         }
         if not cards and not invites:
@@ -1493,6 +1719,7 @@ class ReceiveLoop:
         if owed_cards:
             gate = await self._gate_in_chunks(token, cancel, tray, gate_cards, texts)
             held_during_gate = gate.held
+            held_after_failure += gate.held_after_failure
             recorded = gate.recorded
             tally["gated"] = gate.gated
             for decision, count in gate.verdicts.items():
@@ -1515,18 +1742,27 @@ class ReceiveLoop:
                 for reply in gate.reply:
                     if self._stale(token):
                         break
-                    tally[f"turns_{await self._start_reply_turn(reply, texts)}"] += 1
+                    launched = await self._start_reply_turn(reply, texts)
+                    if launched == "held":
+                        held_after_failure += 1
+                    else:
+                        tally[f"turns_{launched}"] += 1
             elif tally["chunks_failed"] > 0 or gate.split_failed > 0:
                 outcome = "fail_closed"
             elif not owed_invites and not self._stale(token):
                 # Every card was taken by a turn while the gate ran: no call
                 # was made.
-                return self._summary("nothing_owed", **{**base, "held_by_turns": held + held_during_gate})
+                return self._summary(
+                    "nothing_owed",
+                    **{**base, "held_by_turns": held + held_during_gate, "held_after_failure": held_after_failure},
+                )
         for invite in owed_invites:
             if self._stale(token):
                 break
-            tally[f"turns_{await self._start_invite_turn_for(invite, texts)}"] += 1
-        parts = {**base, "held_by_turns": held + held_during_gate, **tally}
+            launched = await self._start_invite_turn_for(invite, texts)
+            if launched != "held":  # an invite turn is never held; the type allows it
+                tally[f"turns_{launched}"] += 1
+        parts = {**base, "held_by_turns": held + held_during_gate, "held_after_failure": held_after_failure, **tally}
         # Stopped (or abandoned) part-way: what was done is still reported;
         # the reason is the stop itself, not a failure.
         if self._stale(token):
@@ -1572,6 +1808,12 @@ class ReceiveLoop:
         for index, planned in enumerate(chunks, start=1):
             if self._stale(token):
                 break
+            # A card held after a could-not-process answer since the tray was
+            # read (a turn's report, answered while this gate ran) is not
+            # gated.
+            planned_all = planned
+            planned = [card for card in planned_all if not self._held_after_failure(card)]
+            out.held_after_failure += len(planned_all) - len(planned)
             chunk = [card for card in planned if not self._held(card)]
             if len(chunk) < len(planned):
                 out.held += len(planned) - len(chunk)
@@ -1648,6 +1890,8 @@ class ReceiveLoop:
         while not self._stale(token):
             while queue and not self._stale(token):
                 card, chain = queue.popleft()
+                if self._held_after_failure(card):
+                    continue  # the server's answer holds it at this anchor
                 if self._held(card):
                     # A turn took it meanwhile: read again once it ends.
                     self._held_while_running = True
@@ -1797,6 +2041,7 @@ class ReceiveLoop:
         )
 
     async def _single_run_cycle(self, token: int) -> CycleSummary:
+        mark = self._pacer.mark()
         tray = await self._read_tray()
         if self._stale(token):
             return self._summary("abandoned")
@@ -1804,6 +2049,7 @@ class ReceiveLoop:
         invites: int | None = None
         base: dict[str, Any] = {"cards": 0, "invites": 0, "held_by_turns": 0, "truncated": False}
         if tray is not None:
+            self._forget_cleared(tray, mark)
             all_cards = _gate.cards_of(tray)
             cards = len([card for card in all_cards if card.get("muted") is not True])
             invites = len(_tray_invites(tray))
@@ -1898,13 +2144,12 @@ class ReceiveLoop:
         (:meth:`_settle`), and run again after the others when the server
         says ``retry`` or ``hidden``."""
         cards = [card for card in _gate.cards_of(tray) if card.get("muted") is not True]
-        owed = [
-            card
-            for card in cards
-            if not self._pacer.held(f"conversation:{card['conversation_id']}", _gate.anchor_of(card))
-        ]
+        # Paced after a run that left its card (D5), or held after the server
+        # answered ``none`` / ``paused`` to a report through the anchor it
+        # still shows.
+        owed, paced, held_after_failure = self._pace_cards(cards)
         invites = _tray_invites(tray)
-        parts: dict[str, Any] = {**base, "paced": len(cards) - len(owed)}
+        parts: dict[str, Any] = {**base, "paced": paced, "held_after_failure": held_after_failure}
         if not owed and not invites:
             return self._summary("nothing_owed", **parts)
         queue: deque[_RunItem] = deque(_RunItem(card=card) for card in owed)
@@ -2086,7 +2331,7 @@ class ReceiveLoop:
 
     async def _start_reply_turn(
         self, reply: Any, texts: Texts, *, chain: int = 0, by_cycle: bool = True
-    ) -> Literal["started", "refused", "queued"]:
+    ) -> Literal["started", "refused", "queued", "held"]:
         """``chain``: reports already made for this conversation in this
         cycle (a turn started again after ``retry`` / ``hidden``);
         ``by_cycle``: started by the running cycle (its admission is not
@@ -2129,7 +2374,7 @@ class ReceiveLoop:
 
     async def _launch(
         self, handle: TurnHandle, admit: Callable[[], Awaitable[bool]], *, by_cycle: bool = True
-    ) -> Literal["started", "refused", "queued"]:
+    ) -> Literal["started", "refused", "queued", "held"]:
         """Start a turn now when a slot is free, else let it wait for one
         (held out of the gate by its tracker entry meanwhile).
 
@@ -2138,10 +2383,23 @@ class ReceiveLoop:
         runs queues behind them instead of taking the slot. (After a turn
         ends, the TypeScript kit's pump takes the slot synchronously.) A
         refused admission hands its slot on the same way. Only the cycle's
-        own admission (``by_cycle``) is left out by its watchdog."""
-        if self._waiting or len(self._active) >= self._max_turns:
+        own admission (``by_cycle``) is left out by its watchdog.
+
+        ``held``: not started, because a could-not-process answer that came
+        after its card was read (while a gate call ran) holds its
+        conversation at that anchor. One whose conversation's report is out
+        (``_reporting``) waits for the answer, even with a slot free."""
+        if self._start_held(handle):
+            self._tracker.end(handle)
+            self._counts["starts_held"] += 1
+            return "held"
+        waits = handle.turn.conversation_id in self._reporting
+        if self._waiting or len(self._active) >= self._max_turns or waits:
             self._waiting.append((handle, admit))
             self._counts["turns_queued"] += 1
+            if len(self._active) < self._max_turns and not self._stopped:
+                # A free slot: the pump hands it to the first turn that may go.
+                self._spawn_turn(self._pump())
             return "queued"
         self._active.add(handle)
         uncounted: contextlib.AbstractContextManager[None] = (
@@ -2155,11 +2413,22 @@ class ReceiveLoop:
         return "refused"
 
     async def _pump(self) -> None:
-        """A slot freed: start the turns waiting for one."""
-        while self._waiting and len(self._active) < self._max_turns and not self._stopped:
-            handle, admit = self._waiting.popleft()
+        """A slot freed: start the turns waiting for one, in order, except
+        that one whose conversation's could-not-process report is out
+        (``_reporting``) waits for the answer (the settle pumps again)."""
+        while len(self._active) < self._max_turns and not self._stopped:
+            entry = next((e for e in self._waiting if e[0].turn.conversation_id not in self._reporting), None)
+            if entry is None:
+                return
+            self._waiting.remove(entry)
+            handle, admit = entry
             if not self._tracker.holds(handle):
                 continue  # released while it waited: it never starts
+            if self._start_held(handle):
+                # Held at its anchor since it was queued: it does not start.
+                self._tracker.end(handle)
+                self._counts["starts_held"] += 1
+                continue
             self._active.add(handle)
             if not await admit():
                 self._active.discard(handle)
@@ -2236,13 +2505,17 @@ class ReceiveLoop:
             self._tracker.end(handle)
             self._slot_freed(handle)
             self._after_turn_ended()
+        # Before the pump spawned above, or a cycle, runs: the failed turns
+        # waiting for evidence that this end may report on.
+        taken = self._take_waiting_turns()
         try:
             if not self._stopped:
-                await self._track(self._settle_turns(failure, fresh))
+                await self._track(self._settle_turns(failure, fresh, taken))
         finally:
             if failure is not None:
                 self._settling.discard(conversation_id)
                 self._after_turn_ended()
+            self._let_go(taken)
 
     async def _record_reply_outcome(
         self,
@@ -2313,7 +2586,7 @@ class ReceiveLoop:
 
     async def _start_invite_turn_for(
         self, invite: dict[str, Any], texts: Texts
-    ) -> Literal["started", "refused", "queued"]:
+    ) -> Literal["started", "refused", "queued", "held"]:
         handle = self._tracker.begin(TrackedTurn.invite(invite["invite_id"]))
         if handle is None:
             return "refused"
@@ -2360,8 +2633,12 @@ class ReceiveLoop:
             self._tracker.end(handle)
             self._slot_freed(handle)
             self._after_turn_ended()
-        if not self._stopped:
-            await self._track(self._settle_turns(None, None))
+        taken = self._take_waiting_turns()
+        try:
+            if not self._stopped:
+                await self._track(self._settle_turns(None, None, taken))
+        finally:
+            self._let_go(taken)
 
     async def _after_run_invites(self, invites: list[dict[str, Any]], end: RunEnd) -> None:
         completed = end.status == "completed"
@@ -2611,6 +2888,14 @@ class ReceiveLoop:
         action = raw if isinstance(raw, str) and raw else "none"
         if error is None:
             self._counts["failures_reported"] += 1
+            if action in ("retry", "hidden"):
+                # The server says to run it again: nothing here holds it.
+                self._pacer.release(f"{_CONVERSATION_KEY}{failure.conversation_id}")
+            else:
+                # ``paused``, ``none``, or an action this release does not
+                # know (read as ``none``, as the TypeScript client reads it):
+                # not run again on this input.
+                self._hold_failed(failure, "paused" if action == "paused" else "none")
         self._failure_actions[action] = self._failure_actions.get(action, 0) + 1
         hidden = _field(answer, "hidden_message_ids")
         self._emit(
@@ -2630,6 +2915,33 @@ class ReceiveLoop:
             }
         )
         return action
+
+    def _hold_failed(self, failure: Failure, reason: FailureHoldReason) -> None:
+        """The server answered ``none`` or ``paused``: the conversation is
+        held at the anchor the report read through, so no later cycle (a
+        message elsewhere, a wake frame, a reconnect, an ``unanswered``
+        re-wake, a turn's end) runs it again on the same input. A newer
+        message moves its anchor and lifts the hold (:meth:`_pace_cards`); a
+        card read meanwhile leaves the tray, and the hold with it
+        (:meth:`_forget_cleared`). A turn of it waiting for a slot at that
+        anchor (after ``paused``, the server's mute, any) does not start."""
+        conversation_id = failure.conversation_id
+        anchor = failure.through_message_id
+        self._pacer.hold_failed(f"{_CONVERSATION_KEY}{conversation_id}", anchor, reason)
+        kept: deque[tuple[TurnHandle, Callable[[], Awaitable[bool]]]] = deque()
+        for handle, admit in self._waiting:
+            turn = handle.turn
+            if (
+                turn.kind == "reply"
+                and turn.conversation_id == conversation_id
+                and (reason == "paused" or turn.anchor == anchor)
+            ):
+                self._tracker.end(handle)
+                self._counts["starts_held"] += 1
+                continue
+            kept.append((handle, admit))
+        if len(kept) != len(self._waiting):
+            self._waiting = kept
 
     async def _runtime_check(self, in_cycle: bool) -> bool:
         """The integration's ``check_runtime``, bounded by
@@ -2684,17 +2996,46 @@ class ReceiveLoop:
         self._emit({"type": "runtime_check", "ok": works, "detail": detail})
         return works
 
-    async def _settle_turns(self, failure: Failure | None, fresh: dict[str, Any] | None) -> None:
+    def _take_waiting_turns(self) -> list[Failure]:
+        """The failed turns waiting for evidence, taken for a settle after a
+        turn's end. Their conversations are held from now until the settle is
+        done (``_reporting``): no gate, and a turn of theirs waiting for a
+        slot waits, so it never starts on the input the server's answer is
+        about. Take them before anything else runs after the turn's end."""
+        if self._stopped:
+            return []
+        taken = self._ledger.take(("turn",))
+        for failure in taken:
+            self._reporting[failure.conversation_id] += 1
+        return taken
+
+    def _let_go(self, taken: list[Failure]) -> None:
+        """The settle is done: those conversations are no longer held for
+        it; what waits for them goes on (or was dropped), and a card a cycle
+        left out meanwhile is read again."""
+        if not taken:
+            return
+        for failure in taken:
+            self._reporting[failure.conversation_id] -= 1
+            if self._reporting[failure.conversation_id] <= 0:
+                del self._reporting[failure.conversation_id]
+        if self._waiting and not self._stopped:
+            self._spawn_turn(self._pump())
+        self._after_turn_ended()
+
+    async def _settle_turns(
+        self, failure: Failure | None, fresh: dict[str, Any] | None, taken: list[Failure]
+    ) -> None:
         """After a reply or invite turn's end (gate-call mode): settle its
-        failure and the failed turns waiting (``fresh``: the tray read after
-        the turn). The runtime check runs only once no turn is running or
-        waiting: the others' ends come first. A turn the server says to run
-        again is started again (queued behind the waiting ones); until then
-        its conversation is held out of the gate, so a cycle cannot gate it
-        meanwhile."""
+        failure and the failed turns waiting (``taken`` at the end, and any
+        parked since; ``fresh``: the tray read after the turn). The runtime
+        check runs only once no turn is running or waiting: the others' ends
+        come first. A turn the server says to run again is started again
+        (queued behind the waiting ones); until then its conversation is held
+        out of the gate, so a cycle cannot gate it meanwhile."""
         drained = not self._active and not self._waiting
         reported = await self._settle(
-            [failure] if failure is not None else [],
+            [*taken, failure] if failure is not None else list(taken),
             ("turn",),
             runtime_check=drained,
             in_cycle=False,
@@ -2918,6 +3259,7 @@ __all__ = [
     "TRAY_LIMIT",
     "CycleOutcome",
     "CycleSummary",
+    "FailureHoldReason",
     "Readiness",
     "ReceiveLoop",
     "ReceiveLoopEvent",
