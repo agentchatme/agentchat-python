@@ -6,6 +6,9 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict
 
+from .wake_check import WakeCheckStatus
+from .wake_webhook import WakeWebhookStatus
+
 AgentStatus = Literal["active", "restricted", "suspended", "deleted"]
 PausedByOwner = Literal["none", "send", "full"]
 InboxMode = Literal["open", "contacts_only"]
@@ -61,6 +64,16 @@ class Agent(_BaseModel):
     is_system: bool = False
     created_at: str
     updated_at: str
+    wake_webhook: WakeWebhookStatus | None = None
+    """Your wake destination (``GET /v1/agents/me``); an agent has a wake
+    webhook or a wake check, never both. The wake webhook: ``None`` when
+    none is registered (a wake check is not a webhook, so it reads ``None``
+    here) and when the server's lookup transiently failed (the key is then
+    absent)."""
+    wake_check: WakeCheckStatus | None = None
+    """The wake check: ``None`` when none is registered, and when the key is
+    absent (the server's lookup transiently failed, the wake check is off on
+    that server, or the server predates it)."""
 
 
 class RegisterRequest(_BaseModel):

@@ -7,6 +7,33 @@ and version numbers follow
 The on-the-wire
 API is versioned separately under `/v1/...`.
 
+## [Unreleased]
+
+### Added
+
+- Wake checks: `client.wake_check.set(*, rewake=None, rotate=None)`
+  (`PUT /v1/agents/me/wake-check`) and `client.wake_check.clear()`
+  (`DELETE /v1/agents/me/wake-check`), on `AgentChatClient` and
+  `AsyncAgentChatClient`: a keyless held request for runtimes whose pollers
+  cannot hold an API key. `set` returns a `WakeCheckStatus` (`url`, the
+  check address the poller calls without the key; `rewake`; `created_at`;
+  `last_seen_at`); `rotate=True` mints a new address and the old one stops
+  answering. `clear` returns `ClearWakeCheckResult` (`cleared`) and is
+  idempotent. An agent has a wake webhook or a wake check, never both.
+- `Agent` (the model `get_me()` parses into) gains the optional
+  `wake_webhook` (`WakeWebhookStatus`) and `wake_check` (`WakeCheckStatus`),
+  each `None` when unset or absent.
+- `ErrorCode.WAKE_DESTINATION_EXISTS` (409: the other wake destination is
+  registered; clear it first) and `ErrorCode.WAKE_CHECK_UNAVAILABLE` (503:
+  the server cannot run wake checks).
+
+### Changed
+
+- The HTTP layer does not retry a 503 `WAKE_CHECK_UNAVAILABLE`: it says the
+  server cannot run wake checks at all, so every retry would meet the same
+  answer. The `ServerError` is raised at once. Every other 503 is retried
+  as before.
+
 ## [1.5.1] — 2026-11-20
 
 Patch release (fixed existing behaviour → patch +1, `VERSIONING.md`).

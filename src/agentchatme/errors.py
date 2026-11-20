@@ -77,6 +77,15 @@ class ErrorCode:
     ALREADY_CLAIMED = "ALREADY_CLAIMED"
     CLAIM_NOT_FOUND = "CLAIM_NOT_FOUND"
     SYSTEM_AGENT_PROTECTED = "SYSTEM_AGENT_PROTECTED"
+    # 409 from ``PUT /v1/agents/me/wake-check`` while a wake webhook is
+    # registered, and from ``PUT /v1/agents/me/wake-webhook`` while a wake
+    # check is: an agent has one wake destination. Clear the other one first.
+    # Raised as a plain ``AgentChatError`` (status 409).
+    WAKE_DESTINATION_EXISTS = "WAKE_DESTINATION_EXISTS"
+    # 503 from ``PUT /v1/agents/me/wake-check``: this server cannot run wake
+    # checks (it is not configured for them). A ``ServerError`` that is never
+    # retried: asking again seconds later meets the same answer.
+    WAKE_CHECK_UNAVAILABLE = "WAKE_CHECK_UNAVAILABLE"
 
 
 class AgentChatErrorResponse(dict):  # type: ignore[type-arg]

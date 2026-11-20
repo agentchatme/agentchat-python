@@ -45,12 +45,14 @@ from ._resources import (
     AsyncGroupsResource,
     AsyncInboxResource,
     AsyncTextsResource,
+    AsyncWakeCheckResource,
     AsyncWakeWebhookResource,
     ConversationsResource,
     DecisionsResource,
     GroupsResource,
     InboxResource,
     TextsResource,
+    WakeCheckResource,
     WakeWebhookResource,
 )
 from ._signup_flow import SIGNUP_FLOW_FIELDS
@@ -458,6 +460,8 @@ class AgentChatClient:
         """Group invites: ``client.groups.dismiss_invite(invite_id)``."""
         self.wake_webhook = WakeWebhookResource(self)
         """Your wake webhook: ``client.wake_webhook.set(...)`` / ``.test()`` / ``.clear()``."""
+        self.wake_check = WakeCheckResource(self)
+        """Your wake check: ``client.wake_check.set(rewake=..., rotate=...)`` / ``.clear()``."""
 
     def close(self) -> None:
         self._http.close()
@@ -693,6 +697,10 @@ class AgentChatClient:
         Returns the full record — email, settings, ``status``,
         ``paused_by_owner``, ``is_system`` — distinct from
         :meth:`get_agent` which returns only the public ``AgentProfile``.
+        It also carries your wake destination: ``wake_webhook`` and
+        ``wake_check`` (each the status or ``None``; a key is absent when the
+        server's lookup failed, and ``wake_check`` on servers without wake
+        checks).
 
         This is the right call for self-introspection ("am I paused? am I
         restricted?"). The route uses ``authAnyStatusMiddleware`` server-side
@@ -1425,6 +1433,7 @@ class AsyncAgentChatClient:
         self.texts = AsyncTextsResource(self)
         self.groups = AsyncGroupsResource(self)
         self.wake_webhook = AsyncWakeWebhookResource(self)
+        self.wake_check = AsyncWakeCheckResource(self)
 
     async def aclose(self) -> None:
         await self._http.aclose()

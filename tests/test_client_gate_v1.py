@@ -1,7 +1,7 @@
 """Client surfaces added for contract v1: the per-call retry override,
 ``register`` without ``null`` fields, ``/context`` parity, invite dismiss,
-the wake-webhook methods, the ``sync`` long-poll with its headers, the tray
-v1 shape, and wake-webhook request verification."""
+the wake-webhook and wake-check methods, the ``sync`` long-poll with its
+headers, the tray v1 shape, and wake-webhook request verification."""
 
 from __future__ import annotations
 
@@ -17,8 +17,10 @@ import respx
 
 from agentchatme import (
     AgentChatClient,
+    AgentChatError,
     AsyncAgentChatClient,
     CallOptions,
+    ErrorCode,
     NotFoundError,
     RetryPolicy,
     ServerError,
@@ -26,12 +28,15 @@ from agentchatme import (
     verify_wake_webhook,
 )
 from agentchatme.types import (
+    Agent,
     AgentConversationContext,
+    ClearWakeCheckResult,
     ClearWakeWebhookResult,
     DirectConversationLookup,
     InboxTray,
     TestWakeResult,
     Texts,
+    WakeCheckStatus,
     WakeWebhookStatus,
 )
 
@@ -363,6 +368,152 @@ async def test_async_wake_webhook_methods() -> None:
         status = await client.wake_webhook.set(url="https://h.example.com", secret="s" * 32)
         assert status.state == "active"
         assert (await client.wake_webhook.clear()).removed is False
+
+
+# ─────────────── wake check ───────────────
+
+CHECK_STATUS: dict[str, Any] = {
+    "url": "https://api.test/v1/wake-check/wc1.0a1b2c3d.aaaa.bbbb.cccc",
+    "rewake": True,
+    "created_at": "2026-11-20T00:00:00Z",
+    "last_seen_at": None,
+}
+_FAST = RetryPolicy(max_retries=2, base_delay_ms=1, max_delay_ms=2)
+
+
+@respx.mock
+def test_set_wake_check_sends_only_the_given_fields() -> None:
+    seen = _capture(respx.put(f"{BASE}/v1/agents/me/wake-check"), 200, {"wake_check": CHECK_STATUS})
+    client = _client()
+    status = client.wake_check.set()
+    assert isinstance(status, WakeCheckStatus)
+    assert status.url == CHECK_STATUS["url"] and status.rewake is True and status.last_seen_at is None
+    client.wake_check.set(rewake=False, rotate=True)
+    client.wake_check.set(rotate=False)
+    assert [json.loads(r.content) for r in seen] == [{}, {"rewake": False, "rotate": True}, {"rotate": False}]
+    assert all(r.headers["content-type"] == "application/json" for r in seen)
+    assert seen[0].headers["authorization"] == "Bearer ac_test"
+
+
+@respx.mock
+def test_set_wake_check_is_retried_on_a_transient_failure() -> None:
+    # PUT is idempotent: a retried rotate rotates again, and the address in
+    # the answer is the live one.
+    route = respx.put(f"{BASE}/v1/agents/me/wake-check").mock(
+        side_effect=[
+            httpx.Response(503, json={"code": "INTERNAL_ERROR", "message": "busy"}),
+            httpx.Response(200, json={"wake_check": CHECK_STATUS}),
+        ]
+    )
+    status = _client().wake_check.set(rotate=True, opts=CallOptions(retry=_FAST))
+    assert status.url == CHECK_STATUS["url"]
+    assert route.call_count == 2
+
+
+@respx.mock
+def test_set_wake_check_refused_while_a_wake_webhook_exists() -> None:
+    route = respx.put(f"{BASE}/v1/agents/me/wake-check").mock(
+        return_value=httpx.Response(
+            409,
+            json={
+                "code": "WAKE_DESTINATION_EXISTS",
+                "message": "This agent has a wake webhook. Clear it first (DELETE /v1/agents/me/wake-webhook).",
+            },
+        )
+    )
+    with pytest.raises(AgentChatError) as exc_info:
+        _client().wake_check.set(opts=CallOptions(retry=_FAST))
+    assert type(exc_info.value) is AgentChatError
+    assert exc_info.value.code == ErrorCode.WAKE_DESTINATION_EXISTS and exc_info.value.status == 409
+    assert route.call_count == 1
+
+
+@respx.mock
+def test_set_wake_check_unavailable_is_a_server_error_never_retried() -> None:
+    route = respx.put(f"{BASE}/v1/agents/me/wake-check").mock(
+        side_effect=[
+            httpx.Response(503, json={"code": "WAKE_CHECK_UNAVAILABLE", "message": "not available"}),
+            httpx.Response(200, json={"wake_check": CHECK_STATUS}),
+        ]
+    )
+    with pytest.raises(ServerError) as exc_info:
+        _client().wake_check.set(opts=CallOptions(retry=_FAST))
+    assert exc_info.value.code == ErrorCode.WAKE_CHECK_UNAVAILABLE
+    assert route.call_count == 1
+
+
+@respx.mock
+def test_set_wake_check_on_a_server_where_it_is_off() -> None:
+    respx.put(f"{BASE}/v1/agents/me/wake-check").mock(
+        return_value=httpx.Response(404, json={"code": "NOT_FOUND", "message": "Not found"})
+    )
+    with pytest.raises(NotFoundError):
+        _client().wake_check.set()
+
+
+@respx.mock
+def test_clear_wake_check() -> None:
+    respx.delete(f"{BASE}/v1/agents/me/wake-check").mock(
+        side_effect=[
+            httpx.Response(200, json={"cleared": True}),
+            httpx.Response(200, json={"cleared": False}),
+        ]
+    )
+    client = _client()
+    first = client.wake_check.clear()
+    assert isinstance(first, ClearWakeCheckResult) and first.cleared is True
+    assert client.wake_check.clear().cleared is False
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_async_wake_check_methods() -> None:
+    seen = _capture(respx.put(f"{BASE}/v1/agents/me/wake-check"), 200, {"wake_check": CHECK_STATUS})
+    _capture(respx.delete(f"{BASE}/v1/agents/me/wake-check"), 200, {"cleared": True})
+    async with AsyncAgentChatClient(api_key="ac_test", base_url=BASE) as client:
+        status = await client.wake_check.set(rewake=False)
+        assert isinstance(status, WakeCheckStatus) and status.url == CHECK_STATUS["url"]
+        assert json.loads(seen[0].content) == {"rewake": False}
+        cleared = await client.wake_check.clear()
+        assert isinstance(cleared, ClearWakeCheckResult) and cleared.cleared is True
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_async_wake_check_unavailable_is_never_retried() -> None:
+    route = respx.put(f"{BASE}/v1/agents/me/wake-check").mock(
+        side_effect=[
+            httpx.Response(503, json={"code": "WAKE_CHECK_UNAVAILABLE", "message": "not available"}),
+            httpx.Response(200, json={"wake_check": CHECK_STATUS}),
+        ]
+    )
+    async with AsyncAgentChatClient(api_key="ac_test", base_url=BASE) as client:
+        with pytest.raises(ServerError):
+            await client.wake_check.set(opts=CallOptions(retry=_FAST))
+    assert route.call_count == 1
+
+
+def test_agent_parses_the_wake_destination_from_get_me() -> None:
+    me: dict[str, Any] = {
+        "id": "agt_1",
+        "handle": "nova",
+        "email": "n****@example.com",
+        "status": "active",
+        "paused_by_owner": "none",
+        "settings": {"inbox_mode": "open", "group_invite_policy": "open"},
+        "created_at": "2026-11-01T00:00:00Z",
+        "updated_at": "2026-11-01T00:00:00Z",
+        "wake_webhook": None,
+        "wake_check": CHECK_STATUS,
+    }
+    agent = Agent.model_validate(me)
+    assert isinstance(agent.wake_check, WakeCheckStatus) and agent.wake_check.rewake is True
+    assert agent.wake_webhook is None
+    with_webhook = Agent.model_validate({**me, "wake_webhook": STATUS, "wake_check": None})
+    assert isinstance(with_webhook.wake_webhook, WakeWebhookStatus) and with_webhook.wake_check is None
+    # Absent keys (lookup failed, or a server without wake checks) read as None.
+    bare = {k: v for k, v in me.items() if k not in ("wake_webhook", "wake_check")}
+    assert Agent.model_validate(bare).wake_check is None
 
 
 # ─────────────── sync long-poll ───────────────

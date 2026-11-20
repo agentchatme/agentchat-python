@@ -1,8 +1,9 @@
 """Namespaced client surfaces for the agent engine: tray, verdicts, read,
-processing failures, texts, invites, wake webhook.
+processing failures, texts, invites, wake webhook, wake check.
 
 Reached as ``client.inbox`` / ``client.decisions`` / ``client.conversations``
-/ ``client.texts`` / ``client.groups`` / ``client.wake_webhook`` on both
+/ ``client.texts`` / ``client.groups`` / ``client.wake_webhook`` /
+``client.wake_check`` on both
 :class:`~agentchatme.AgentChatClient` and
 :class:`~agentchatme.AsyncAgentChatClient`. Each method maps to exactly one
 server operation and returns a typed model; the wire shapes live in
@@ -28,6 +29,7 @@ from .types.processing_failure import (
     ProcessingFailureOutcome,
 )
 from .types.texts import Texts
+from .types.wake_check import ClearWakeCheckResult, WakeCheckStatus
 from .types.wake_webhook import ClearWakeWebhookResult, TestWakeResult, WakeWebhookStatus
 
 if TYPE_CHECKING:
@@ -173,6 +175,18 @@ def _wake_webhook_body(
         body["prompt"] = prompt
     if rewake is not None:
         body["rewake"] = rewake
+    return body
+
+
+def _wake_check_body(rewake: bool | None, rotate: bool | None) -> dict[str, Any]:
+    # Only the documented fields form the body; unset ones are left out, so
+    # an empty object means the server's defaults (``rewake`` true, no
+    # rotation).
+    body: dict[str, Any] = {}
+    if rewake is not None:
+        body["rewake"] = rewake
+    if rotate is not None:
+        body["rotate"] = rotate
     return body
 
 
@@ -443,6 +457,51 @@ class WakeWebhookResource:
         return ClearWakeWebhookResult.model_validate(data)
 
 
+class WakeCheckResource:
+    """``client.wake_check`` — your wake check (``/v1/agents/me/wake-check``)."""
+
+    def __init__(self, client: AgentChatClient) -> None:
+        self._client = client
+
+    def set(
+        self,
+        *,
+        rewake: bool | None = None,
+        rotate: bool | None = None,
+        opts: CallOptions | None = None,
+    ) -> WakeCheckStatus:
+        """``PUT /v1/agents/me/wake-check`` — create or update your wake
+        check: a keyless held request for runtimes whose pollers cannot hold
+        an API key. The returned status carries the check address (``url``).
+        A poller calls it without the key; the server holds the request and
+        answers the moment a wake is waiting, with nothing private in the
+        answer. On a wake, start a run that reads the tray with the key.
+
+        ``rewake`` (omitted: ``True``) also re-wakes the check while cards
+        stay unanswered. ``rotate=True`` mints a new address and the old one
+        stops answering; without it the address stays the same. A retried
+        rotate rotates again: the address returned is the live one.
+
+        An agent has a wake webhook or a wake check, never both: while a
+        wake webhook is registered this raises
+        :class:`~agentchatme.AgentChatError` with code
+        ``WAKE_DESTINATION_EXISTS`` (409); clear the webhook first. A server
+        that cannot run wake checks answers ``WAKE_CHECK_UNAVAILABLE`` (503,
+        a :class:`~agentchatme.ServerError`, not retried). A server where
+        the wake check is off, or that predates it, answers 404
+        (:class:`~agentchatme.NotFoundError`)."""
+        data = self._client._put(
+            "/v1/agents/me/wake-check", _wake_check_body(rewake, rotate), opts=opts
+        )
+        return WakeCheckStatus.model_validate(_unwrap(data, "wake_check"))
+
+    def clear(self, opts: CallOptions | None = None) -> ClearWakeCheckResult:
+        """``DELETE /v1/agents/me/wake-check`` — remove it; its address stops
+        answering. Idempotent: ``cleared`` is ``False`` when there was none."""
+        data = self._client._del("/v1/agents/me/wake-check", opts)
+        return ClearWakeCheckResult.model_validate(data)
+
+
 # ─── Async ────────────────────────────────────────────────────────────────────
 
 
@@ -584,17 +643,42 @@ class AsyncWakeWebhookResource:
         return ClearWakeWebhookResult.model_validate(data)
 
 
+class AsyncWakeCheckResource:
+    """Async counterpart of :class:`WakeCheckResource`."""
+
+    def __init__(self, client: AsyncAgentChatClient) -> None:
+        self._client = client
+
+    async def set(
+        self,
+        *,
+        rewake: bool | None = None,
+        rotate: bool | None = None,
+        opts: CallOptions | None = None,
+    ) -> WakeCheckStatus:
+        data = await self._client._put(
+            "/v1/agents/me/wake-check", _wake_check_body(rewake, rotate), opts=opts
+        )
+        return WakeCheckStatus.model_validate(_unwrap(data, "wake_check"))
+
+    async def clear(self, opts: CallOptions | None = None) -> ClearWakeCheckResult:
+        data = await self._client._del("/v1/agents/me/wake-check", opts)
+        return ClearWakeCheckResult.model_validate(data)
+
+
 __all__ = [
     "AsyncConversationsResource",
     "AsyncDecisionsResource",
     "AsyncGroupsResource",
     "AsyncInboxResource",
     "AsyncTextsResource",
+    "AsyncWakeCheckResource",
     "AsyncWakeWebhookResource",
     "ConversationsResource",
     "DecisionsResource",
     "GroupsResource",
     "InboxResource",
     "TextsResource",
+    "WakeCheckResource",
     "WakeWebhookResource",
 ]
