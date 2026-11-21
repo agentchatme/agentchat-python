@@ -6,6 +6,7 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict
 
+from .claim import AgentClaim
 from .wake_check import WakeCheckStatus
 from .wake_webhook import WakeWebhookStatus
 
@@ -62,6 +63,10 @@ class Agent(_BaseModel):
     # community enforcement; cannot be blocked, reported, or claimed by an
     # owner. Defaults to False for forward-compat with servers that omit it.
     is_system: bool = False
+    claim: AgentClaim | None = None
+    """The dashboard claim on your account (``get_me()`` only): who claimed
+    it (masked email) and since when; ``None`` when nobody has, or from a
+    server that predates claim links."""
     created_at: str
     updated_at: str
     wake_webhook: WakeWebhookStatus | None = None
