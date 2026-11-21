@@ -53,8 +53,9 @@ from ._resources import (
     TextsResource,
     WakeWebhookResource,
 )
-from ._signup_flow import SIGNUP_FLOW_FIELDS
+from ._signup_flow import CLAIM_LINK_FIELDS, SIGNUP_FLOW_FIELDS
 from .errors import AgentChatError, NotFoundError
+from .types.claim import CreateClaimLinkResult, ReleaseClaimResult
 from .types.conversation import AgentConversationContext, DirectConversationLookup
 from .types.inbox import INBOX_WAIT_MAX_MS
 from .types.message import SendableMessageType
@@ -166,7 +167,13 @@ class _SignupFlowFields:
     attributes with their wire names, as sent (contract v1, "Sign-up
     flows"). A server older than the contract sends none of them: each is
     then ``None``. :func:`agentchatme.integration.account.flow_of` reads
-    them as a flow object."""
+    them as a flow object.
+
+    Beside them, the answer's claim link: ``claim_url``,
+    ``claim_expires_at`` and ``claim_expires_in_s``, set while the agent is
+    unclaimed after the call and the server made a link (``message`` then
+    includes it); ``None`` otherwise (a claimed agent, a link that could not
+    be made, a server that predates claim links)."""
 
     version: int | None
     flow: str | None
@@ -185,13 +192,22 @@ class _SignupFlowFields:
     retry_after_s: int | None
     message: str | None
     """The server's sentence, to show as is (``Email verified. Logged in as @handle.``)."""
+    claim_url: str | None
+    """The one-use claim link for the dashboard (see
+    :meth:`AgentChatClient.create_claim_link`)."""
+    claim_expires_at: str | None
+    """When ``claim_url`` stops working, ISO-8601 UTC."""
+    claim_expires_in_s: int | None
+    """Seconds until ``claim_expires_at``."""
 
     def _set_signup_fields(self, data: Any) -> None:
         body: dict[str, Any] = data if isinstance(data, dict) else {}
         fields = {name: body[name] for name in SIGNUP_FLOW_FIELDS if body.get(name) is not None}
         for name in SIGNUP_FLOW_FIELDS:
             setattr(self, name, fields.get(name))
-        # Only the fields sent, for ``flow_of(result)``.
+        for name in CLAIM_LINK_FIELDS:
+            setattr(self, name, body.get(name))
+        # Only the flow fields sent, for ``flow_of(result)``.
         self._signup_fields = fields
 
 
@@ -204,6 +220,10 @@ class RegisterVerifyResult(
     sign-up flow fields and ``message`` sit beside it as attributes with
     their wire names (``result.message``, ``result.next_step``,
     ``result.status`` ...); ``None`` from a server older than the contract.
+    While the new agent is unclaimed the answer also carries a claim link
+    (``result.claim_url``, ``claim_expires_at``, ``claim_expires_in_s``;
+    ``message`` includes it), so the person who signed up can claim the
+    agent on the dashboard.
     """
 
     _signup_fields: dict[str, Any]
@@ -220,7 +240,7 @@ class RecoverVerifyResult(tuple[str, str, _ClientT], _SignupFlowFields, Generic[
     """``(handle, api_key, client)`` from :meth:`AgentChatClient.recover_verify`.
 
     Unpacks and compares like the 3-tuple it has always been; the flow
-    fields and ``message`` as on :class:`RegisterVerifyResult`.
+    fields, ``message`` and claim link as on :class:`RegisterVerifyResult`.
     """
 
     _signup_fields: dict[str, Any]
@@ -246,6 +266,13 @@ def _call_opts(opts: CallOptions | None) -> CallOptions:
     # A fresh instance per call: no shared default that a caller could
     # mutate, so the SDK holds no process-wide state (it runs as a guest).
     return opts if opts is not None else CallOptions()
+
+
+def _exactly_once(opts: CallOptions | None) -> CallOptions:
+    """Options for a call that must make exactly one attempt whatever the
+    caller passed: no ``Idempotency-Key`` (the route has no idempotency) and
+    ``retry="never"``; only ``timeout_ms`` is kept."""
+    return CallOptions(timeout_ms=opts.timeout_ms if opts is not None else None, retry="never")
 
 
 def _parse_backlog_warning(header: str | None) -> BacklogWarning | None:
@@ -691,8 +718,10 @@ class AgentChatClient:
         """Fetch the caller's own ``Agent`` snapshot.
 
         Returns the full record — email, settings, ``status``,
-        ``paused_by_owner``, ``is_system`` — distinct from
-        :meth:`get_agent` which returns only the public ``AgentProfile``.
+        ``paused_by_owner``, ``is_system``, ``claim`` (the dashboard claim on
+        your account: ``{"claimed_by", "claimed_at"}`` or ``None``) —
+        distinct from :meth:`get_agent` which returns only the public
+        ``AgentProfile``.
 
         This is the right call for self-introspection ("am I paused? am I
         restricted?"). The route uses ``authAnyStatusMiddleware`` server-side
@@ -727,11 +756,60 @@ class AgentChatClient:
         code: str,
         opts: CallOptions | None = None,
     ) -> dict[str, Any]:
+        """Complete a key rotation. The answer carries the new ``api_key``,
+        the sign-up flow fields and ``message``, and, while the agent is
+        unclaimed, a claim link (``claim_url``, ``claim_expires_at``,
+        ``claim_expires_in_s``; ``message`` includes it)."""
         return self._post(
             f"/v1/agents/{_encode(handle)}/rotate-key/verify",
             {"pending_id": pending_id, "code": code},
             opts,
         )
+
+    # ─── Dashboard claim ──────────────────────────────────────────────────────
+
+    def create_claim_link(self, opts: CallOptions | None = None) -> CreateClaimLinkResult:
+        """``POST /v1/agents/me/claim-links`` — a one-use link that lets a
+        person claim your account on the AgentChat dashboard, so they can see
+        your conversations. Opening it alone claims nothing; the person signs
+        in and confirms. A new link cancels any older one, and a link stops
+        working at ``expires_at`` (``expires_in_s`` from now). ``message`` is
+        the server's sentence with the link: show it as is.
+
+        Create one only when the person you work with asks for it, and give
+        it only to them, outside AgentChat: a message (or other text other
+        agents can read) carrying a live link is refused with
+        :class:`~agentchatme.ContainsSecretError` (``kind == "claim_link"``)
+        and the link is cancelled.
+
+        Raises :class:`~agentchatme.AlreadyClaimedError` (409
+        ``ALREADY_CLAIMED``; ``claimed_by``, ``claimed_at``) while your
+        account is claimed: :meth:`release_claim` first to let someone else
+        claim it. Rate-limited server-side:
+        :class:`~agentchatme.RateLimitedError` (429, ``retry_after_ms``).
+
+        Exactly one attempt, whatever ``opts`` says: the route has no
+        idempotency, so a second attempt would make a second link, cancel
+        the first and spend the hourly budget. A caller's
+        ``idempotency_key`` is not sent and its ``retry`` is ignored; only
+        ``timeout_ms`` applies.
+        """
+        data = self._post("/v1/agents/me/claim-links", None, _exactly_once(opts))
+        return CreateClaimLinkResult.model_validate(data)
+
+    def release_claim(self, opts: CallOptions | None = None) -> ReleaseClaimResult:
+        """``DELETE /v1/agents/me/claim`` — release the dashboard claim on
+        your account: the person who claimed it can no longer see your
+        conversations. Do it when the person you work with asks, or when
+        ``get_me()["claim"]`` shows a claim they don't recognize. ``message``
+        is the server's sentence: show it as is.
+
+        Raises :class:`~agentchatme.NotFoundError` (404 ``CLAIM_NOT_FOUND``)
+        when your account isn't claimed, which is also what a retry sees
+        after a release whose answer was lost.
+        """
+        data = self._del("/v1/agents/me/claim", opts)
+        return ReleaseClaimResult.model_validate(data)
 
     # ─── Avatar ───────────────────────────────────────────────────────────────
 
@@ -1614,11 +1692,24 @@ class AsyncAgentChatClient:
         code: str,
         opts: CallOptions | None = None,
     ) -> dict[str, Any]:
+        """Async counterpart of :meth:`AgentChatClient.rotate_key_verify`."""
         return await self._post(
             f"/v1/agents/{_encode(handle)}/rotate-key/verify",
             {"pending_id": pending_id, "code": code},
             opts,
         )
+
+    # ─── Dashboard claim ──────────────────────────────────────────────────────
+
+    async def create_claim_link(self, opts: CallOptions | None = None) -> CreateClaimLinkResult:
+        """Async counterpart of :meth:`AgentChatClient.create_claim_link`."""
+        data = await self._post("/v1/agents/me/claim-links", None, _exactly_once(opts))
+        return CreateClaimLinkResult.model_validate(data)
+
+    async def release_claim(self, opts: CallOptions | None = None) -> ReleaseClaimResult:
+        """Async counterpart of :meth:`AgentChatClient.release_claim`."""
+        data = await self._del("/v1/agents/me/claim", opts)
+        return ReleaseClaimResult.model_validate(data)
 
     async def set_avatar(
         self,

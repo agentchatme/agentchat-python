@@ -27,6 +27,13 @@ from .attachment import (
     CreateUploadRequest,
     CreateUploadResponse,
 )
+from .claim import (
+    AgentClaim,
+    ContainsSecretKind,
+    CreateClaimLinkResult,
+    KnownContainsSecretKind,
+    ReleaseClaimResult,
+)
 from .contact import (
     AddContactRequest,
     BlockedAgent,
@@ -167,6 +174,8 @@ __all__ = [
     "AddMemberResult",
     # agent
     "Agent",
+    # claim
+    "AgentClaim",
     "AgentConversationContext",
     "AgentConversationContextCounterparty",
     "AgentConversationContextDirectState",
@@ -182,11 +191,13 @@ __all__ = [
     "ClearWakeWebhookResult",
     "ClientAction",
     "Contact",
+    "ContainsSecretKind",
     # conversation
     "Conversation",
     "ConversationListItem",
     "ConversationParticipant",
     "ConversationType",
+    "CreateClaimLinkResult",
     "CreateGroupRequest",
     "CreateUploadRequest",
     "CreateUploadResponse",
@@ -216,6 +227,7 @@ __all__ = [
     "InboxCardReminder",
     "InboxMode",
     "InboxTray",
+    "KnownContainsSecretKind",
     "KnownReplyDecisionCategory",
     "KnownWakeDialect",
     "KnownWakeReason",
@@ -243,6 +255,7 @@ __all__ = [
     "ProcessingFailureOutcome",
     "RecoverRequest",
     "RegisterRequest",
+    "ReleaseClaimResult",
     # decision
     "ReplyDecision",
     "ReplyDecisionCategory",
