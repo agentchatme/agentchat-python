@@ -9,6 +9,34 @@ API is versioned separately under `/v1/...`.
 
 ## [Unreleased]
 
+### Added
+
+- The identity block follows the served texts without touching a block that
+  is not plainly this agent's: `integration.anchor.follow(path, *, handle,
+  identity_line, template=None, is_setup_offer=None)` reads the file,
+  decides, and writes atomically, reading the file again right before the
+  rename (an edit saved meanwhile is decided on again, `FOLLOW_ATTEMPTS` = 3
+  times at most, then `edited_meanwhile`). It never creates a file or a
+  block and never raises. Outcomes: `updated`, `unchanged`, `absent`,
+  `setup_offer`, `hand_edited`, `other_agent`, `several_blocks`,
+  `edited_meanwhile`, `failed` (`FollowResult`: `outcome`, `path`,
+  `claimed`, `named`, `detail`). The write keeps the file's line breaks,
+  final line break, byte-order mark, permission bits, a symlink and, under
+  root, the owner; a file that is not UTF-8, is read-only or is not a
+  regular file is `failed`, never written. Synchronous; the TypeScript
+  `follow` is the same, returning a promise.
+- `integration.anchor.decide(text, *, handle, identity_line, template=None,
+  is_setup_offer=None)`: the same decision, pure, for `status` and `doctor`
+  (`Decision`: `outcome`, `claimed`, `named`, `next`, `detail`).
+- `integration.anchor.owner(found, *, handle=None, identity_line=None,
+  template=None)`: whose block it is, strictly. A block's handle is its
+  handle line's; without one, only a whole text that is exactly the served
+  identity line, the served template filled in, or an entry of
+  `integration.anchor.EARLIER_IDENTITY_LINES` (the identity lines served
+  before, in the three tool spellings they were served in) counts.
+- `is_setup_offer` marks an integration's own blocks that are not identity
+  blocks (a setup offer, its declined variant): `setup_offer`, left as it is.
+
 ### Fixed
 
 - `integration.ManualSync`: a retry synced against the texts it already
@@ -30,6 +58,35 @@ API is versioned separately under `/v1/...`.
   texts in hand. `stop()` cancels a pending retry, and a retry stopped
   during its refresh syncs nothing. A texts source without `refresh()` is
   synced against as before. No new options or exports.
+- `anchor.replace` and `anchor.remove` keep a CRLF text CRLF. Before, the
+  new block and the blank lines around it were LF, and a CR was left at the
+  end of the text before the block, so a CRLF file came back with mixed
+  line endings. The style is the one most of the user's own lines use (the
+  blank lines next to a block, which a replacement rewrites, decide only
+  when the text has no other line break), so replacing again gives the same
+  text. (A text read with `Path.read_text()` has its CRLF turned
+  into LF already; read the bytes, as `follow` does, to keep them.)
+- `anchor.replace` and `anchor.remove` no longer add a final line break to
+  a text that had none when they replace or remove a block in place. A
+  block appended to a text with no block still ends with one.
+- `anchor.replace` and `anchor.remove` keep a leading byte-order mark.
+  Before, a text starting with one was not read at its first line: a block
+  there was not found, so `replace` added a second one.
+- `anchor.replace` no longer slows down on a long run of blank lines next
+  to a block (it was quadratic: 40,000 blank lines took seconds).
+
+### Changed
+
+- The anchor functions count as space around a line, a body or a word what
+  JavaScript's `trim()` does, as the TypeScript kit does: U+FEFF is space,
+  U+0085 and U+001C-U+001F are not (`str.strip()` had it the other way
+  round). Only text holding those characters next to a marker reads
+  differently.
+- `FoundBlock.handle` is documented as display only for a block with no
+  handle line: it reads the block's words loosely, so a sentence of the
+  user's that says "I am @x" reads as a claim. What it returns is unchanged
+  (the published contract's `find` cases pin it). Decide with `owner`,
+  `decide` or `follow`.
 
 ## [1.7.0] — 2026-11-21
 

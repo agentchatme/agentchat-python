@@ -62,3 +62,18 @@ async def test_the_async_client_has_the_wake_check_too() -> None:
     async with agentchatme.AsyncAgentChatClient(api_key="ac_test", base_url="https://api.test") as client:
         assert inspect.iscoroutinefunction(client.wake_check.set)
         assert inspect.iscoroutinefunction(client.wake_check.clear)
+
+
+def test_the_identity_block_has_a_strict_reading_and_a_follow() -> None:
+    from agentchatme import integration
+    from agentchatme.integration import anchor
+
+    for name in ("owner", "decide", "follow"):
+        assert callable(getattr(anchor, name))
+        assert name in anchor.__all__
+    assert anchor.FOLLOW_ATTEMPTS == 3
+    assert len(anchor.EARLIER_IDENTITY_LINES) == 3
+    assert {"Decision", "FollowResult", "FollowOutcome", "EARLIER_IDENTITY_LINES", "FOLLOW_ATTEMPTS"} <= set(anchor.__all__)
+    # The file mechanics stay internal: the kit's public file helpers are unchanged.
+    assert not hasattr(integration, "replace_if_unchanged")
+    assert not hasattr(integration, "read_for_replace")
