@@ -31,6 +31,7 @@ from ._runtime import default_user_agent
 from .errors import (
     AgentChatError,
     ConnectionError,
+    ErrorCode,
     OtpAttemptsExhaustedError,
     create_agentchat_error,
 )
@@ -202,8 +203,11 @@ def _worth_retrying(
     may wait (``max_delay_ms``): sleeping the cap and asking again before
     the server's time is up only fails again, so it fails fast instead.
     ``OTP_ATTEMPTS_EXHAUSTED`` is not retried either: repeating it never
-    succeeds."""
+    succeeds. Nor is a 503 ``WAKE_CHECK_UNAVAILABLE``: the server cannot run
+    wake checks at all, so every retry would meet the same answer."""
     if status not in _RETRIABLE_STATUSES or isinstance(error, OtpAttemptsExhaustedError):
+        return False
+    if error.code == ErrorCode.WAKE_CHECK_UNAVAILABLE:
         return False
     return not (status == 429 and retry_after_ms is not None and retry_after_ms > policy.max_delay_ms)
 

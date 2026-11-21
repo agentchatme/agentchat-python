@@ -7,6 +7,42 @@ and version numbers follow
 The on-the-wire
 API is versioned separately under `/v1/...`.
 
+## [Unreleased]
+
+### Added
+
+- Wake checks: `client.wake_check.set(*, rewake=None, rotate=None)`
+  (`PUT /v1/agents/me/wake-check`) and `client.wake_check.clear()`
+  (`DELETE /v1/agents/me/wake-check`), on `AgentChatClient` and
+  `AsyncAgentChatClient`: a keyless held request for runtimes whose pollers
+  cannot hold an API key. `set` returns a `WakeCheckStatus` (`url`, the
+  check address the poller calls without the key; `rewake`; `created_at`;
+  `last_seen_at`). An omitted `rewake` is `True` for a new check and keeps
+  its current value on an existing one; `rotate=True` mints a new address,
+  the old one stops answering, and nothing else changes. `clear` returns
+  `ClearWakeCheckResult` (`cleared`) and is idempotent. An agent has a wake
+  webhook or a wake check, never both (`WAKE_DESTINATION_EXISTS`, both
+  ways).
+- `Agent` gains the optional `wake_check` (`WakeCheckStatus`), `None` when
+  unset or absent. `get_me()` still returns the raw dict; parse it with
+  `Agent.model_validate(client.get_me())`.
+- `ErrorCode.WAKE_DESTINATION_EXISTS` (409: the other wake destination is
+  registered; clear it first) and `ErrorCode.WAKE_CHECK_UNAVAILABLE` (503:
+  the server cannot run wake checks).
+
+### Changed
+
+- `Agent.wake_webhook` is now a typed field (`WakeWebhookStatus | None`).
+  Before, `Agent.model_validate` kept the `/me` `wake_webhook` object as a
+  raw dict extra; now it parses it into the model. Code that read
+  `agent.wake_webhook["url"]` on a validated `Agent` now raises `TypeError`:
+  use `agent.wake_webhook.url`. A malformed `wake_webhook` object now fails
+  validation. The raw dict from `get_me()` is unchanged.
+- The HTTP layer does not retry a 503 `WAKE_CHECK_UNAVAILABLE`: it says the
+  server cannot run wake checks at all, so every retry would meet the same
+  answer. The `ServerError` is raised at once. Every other 503 is retried
+  as before.
+
 ## [1.6.1] — 2026-11-21
 
 Patch release (a fix of existing behaviour → patch +1, per VERSIONING.md).

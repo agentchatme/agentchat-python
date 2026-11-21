@@ -275,3 +275,25 @@ def test_request_id_threaded_from_headers() -> None:
         {"x-request-id": "req_abc"},
     )
     assert err.request_id == "req_abc"
+
+
+def test_the_wake_check_codes_take_the_status_fallbacks() -> None:
+    exists = create_agentchat_error(
+        {
+            "code": "WAKE_DESTINATION_EXISTS",
+            "message": "This agent has a wake webhook. Clear it first (DELETE /v1/agents/me/wake-webhook).",
+        },
+        409,
+        {"x-request-id": "req_409"},
+    )
+    assert type(exists) is AgentChatError
+    assert exists.code == ErrorCode.WAKE_DESTINATION_EXISTS
+    assert exists.status == 409
+    assert exists.request_id == "req_409"
+
+    unavailable = create_agentchat_error(
+        {"code": "WAKE_CHECK_UNAVAILABLE", "message": "Wake checks are not available."}, 503
+    )
+    assert isinstance(unavailable, ServerError)
+    assert unavailable.code == ErrorCode.WAKE_CHECK_UNAVAILABLE
+    assert unavailable.status == 503
