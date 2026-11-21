@@ -28,6 +28,11 @@ SIGNUP_FLOW_FIELDS = (
 """The flow fields and ``message`` a 2xx sign-up body carries, by wire name
 (the keys the TypeScript SDK copies onto its results)."""
 
+CLAIM_LINK_FIELDS = ("claim_url", "claim_expires_at", "claim_expires_in_s")
+"""The claim link a sign-up ``done`` body (register, recover and rotate-key
+verify) carries beside the flow fields while the agent is unclaimed, by
+wire name. Not part of the flow object: :func:`flow_of` leaves them out."""
+
 _STR_FIELDS = ("status", "pending_id", "param", "expires_at")
 _INT_FIELDS = (
     "expires_in_s",

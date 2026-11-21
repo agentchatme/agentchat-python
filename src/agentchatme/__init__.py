@@ -66,9 +66,11 @@ from ._wake_verify import WakeWebhookVerificationError, verify_wake_webhook
 from .errors import (
     AgentChatError,
     AgentChatErrorResponse,
+    AlreadyClaimedError,
     AwaitingReplyError,
     BlockedError,
     ConnectionError,
+    ContainsSecretError,
     EmailExhaustedError,
     EmailLimitReachedError,
     ErrorCode,
@@ -108,6 +110,7 @@ __all__ = [
     # Errors
     "AgentChatError",
     "AgentChatErrorResponse",
+    "AlreadyClaimedError",
     "AsyncAgentChatClient",
     "AsyncGateReply",
     # HTTP transport (advanced)
@@ -117,6 +120,7 @@ __all__ = [
     "CallOptions",
     "ConnectHandler",
     "ConnectionError",
+    "ContainsSecretError",
     "DisconnectHandler",
     "EmailExhaustedError",
     "EmailLimitReachedError",
