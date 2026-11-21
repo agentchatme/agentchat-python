@@ -9,6 +9,7 @@ import base64
 import hashlib
 import hmac
 import json
+import warnings
 from typing import Any
 
 import httpx
@@ -557,12 +558,61 @@ def test_agent_parses_the_wake_destination_from_get_me() -> None:
     with_webhook = Agent.model_validate({**me, "wake_webhook": STATUS, "wake_check": None})
     assert isinstance(with_webhook.wake_webhook, WakeWebhookStatus) and with_webhook.wake_check is None
     assert with_webhook.wake_webhook.url == STATUS["url"]
-    # The compatibility change: the field is a model now, not a raw dict.
-    with pytest.raises(TypeError):
-        with_webhook.wake_webhook["url"]  # type: ignore[index]  # pyright: ignore[reportIndexIssue]
+    # Before 1.7.0 the field was the raw dict; a dict-style read still works.
+    with pytest.warns(DeprecationWarning, match="attribute access"):
+        assert with_webhook.wake_webhook["url"] == STATUS["url"]
     # Absent keys (lookup failed, or a server without wake checks) read as None.
     bare = {k: v for k, v in me.items() if k not in ("wake_webhook", "wake_check")}
     assert Agent.model_validate(bare).wake_check is None
+
+
+def test_wake_webhook_status_keeps_dict_reads_deprecated() -> None:
+    # Before 1.7.0, Agent.wake_webhook was the raw /me dict. ["key"] and
+    # .get("key") answer as that dict did, each with a DeprecationWarning.
+    status = WakeWebhookStatus.model_validate(STATUS)
+
+    with pytest.warns(DeprecationWarning, match="attribute access") as item_read:
+        assert status["url"] == STATUS["url"]
+    with pytest.warns(DeprecationWarning, match="attribute access"):
+        assert status["prompt"] is None  # sent as null: present, None
+    with pytest.warns(DeprecationWarning, match="attribute access") as get_read:
+        assert status.get("url") == STATUS["url"]
+    # The warning names the caller's line, not the SDK's.
+    assert item_read[0].filename == __file__ and get_read[0].filename == __file__
+    with pytest.warns(DeprecationWarning, match="attribute access"):
+        assert status.get("consecutive_failures", 99) == 0
+
+    # A missing key: KeyError from [], the default from get().
+    with pytest.warns(DeprecationWarning), pytest.raises(KeyError):
+        status["nope"]
+    with pytest.warns(DeprecationWarning):
+        assert status.get("nope") is None
+    with pytest.warns(DeprecationWarning):
+        assert status.get("nope", "fallback") == "fallback"
+    # Model attributes are not keys.
+    with pytest.warns(DeprecationWarning), pytest.raises(KeyError):
+        status["model_dump"]
+
+    # A declared field the server did not send is missing, as in the dict
+    # (an older server without rewake); a field it added is present.
+    older = WakeWebhookStatus.model_validate(
+        {**{k: v for k, v in STATUS.items() if k != "rewake"}, "added_later": "x"}
+    )
+    assert older.rewake is None
+    with pytest.warns(DeprecationWarning), pytest.raises(KeyError):
+        older["rewake"]
+    with pytest.warns(DeprecationWarning):
+        assert older.get("rewake", True) is True
+    with pytest.warns(DeprecationWarning):
+        assert older["added_later"] == "x"
+
+    # Attribute access is unchanged and warns nothing.
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        assert status.url == STATUS["url"]
+        assert status.rewake is True
+        assert status.prompt is None
+        assert status.model_dump() == STATUS
 
 
 # ─────────────── sync long-poll ───────────────

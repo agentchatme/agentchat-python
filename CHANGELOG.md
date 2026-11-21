@@ -36,10 +36,15 @@ Minor release (added behaviour → minor +1, `VERSIONING.md`).
 
 - `Agent.wake_webhook` is now a typed field (`WakeWebhookStatus | None`).
   Before, `Agent.model_validate` kept the `/me` `wake_webhook` object as a
-  raw dict extra; now it parses it into the model. Code that read
-  `agent.wake_webhook["url"]` on a validated `Agent` now raises `TypeError`:
-  use `agent.wake_webhook.url`. A malformed `wake_webhook` object now fails
-  validation. The raw dict from `get_me()` is unchanged.
+  raw dict extra; now it parses it into the model. Dict-style reads keep
+  working, deprecated: `agent.wake_webhook["url"]` and
+  `agent.wake_webhook.get("url", default)` answer as the dict did (a key
+  the server did not send raises `KeyError`, or returns the default) and
+  emit a `DeprecationWarning`. Use attribute access,
+  `agent.wake_webhook.url`. Other dict operations (`in`, `keys()`,
+  iteration, comparing with a dict) are not kept. A malformed
+  `wake_webhook` object now fails validation. The raw dict from `get_me()`
+  is unchanged.
 - The HTTP layer does not retry a 503 `WAKE_CHECK_UNAVAILABLE`: it says the
   server cannot run wake checks at all, so every retry would meet the same
   answer. The `ServerError` is raised at once. Every other 503 is retried

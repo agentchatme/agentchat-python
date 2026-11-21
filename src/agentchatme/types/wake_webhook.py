@@ -5,7 +5,8 @@ goes through the tray."""
 
 from __future__ import annotations
 
-from typing import Literal, Union
+import warnings
+from typing import Any, Literal, Union
 
 from pydantic import BaseModel, ConfigDict
 
@@ -44,6 +45,50 @@ class WakeWebhookStatus(_BaseModel):
     rewake: bool | None = None
     """Whether the server's unanswered re-wake is delivered to this
     subscription. Absent from servers that predate it."""
+
+    # Before 1.7.0, ``Agent.wake_webhook`` was the raw ``/me`` dict, so code
+    # read it as ``agent.wake_webhook["url"]`` or ``.get("url")``. These two
+    # reads keep working, deprecated, with the dict's answers: a key is
+    # present when the server sent it.
+
+    def __getitem__(self, key: str) -> Any:
+        """Deprecated: ``status["url"]``. Use attribute access, ``status.url``.
+
+        Returns the value the server sent for ``key``, or raises
+        ``KeyError`` when it sent none, as the dict did. Emits a
+        :class:`DeprecationWarning`."""
+        warnings.warn(_DICT_READ_DEPRECATED, DeprecationWarning, stacklevel=2)
+        return _sent_value(self, key)
+
+    def get(self, key: str, default: Any = None) -> Any:
+        """Deprecated: ``status.get("url")``. Use attribute access,
+        ``status.url``.
+
+        Returns the value the server sent for ``key``, or ``default`` when
+        it sent none, as the dict did. Emits a :class:`DeprecationWarning`."""
+        warnings.warn(_DICT_READ_DEPRECATED, DeprecationWarning, stacklevel=2)
+        try:
+            return _sent_value(self, key)
+        except KeyError:
+            return default
+
+
+_DICT_READ_DEPRECATED = (
+    "Reading WakeWebhookStatus like a dict is deprecated: use attribute access"
+    " (status.url, not status['url'] or status.get('url'))."
+)
+
+
+def _sent_value(status: WakeWebhookStatus, key: str) -> Any:
+    """What the pre-1.7.0 dict held under ``key``: a declared field the input
+    set, or an undeclared field the server added. ``KeyError`` otherwise,
+    including for a declared field the input left out."""
+    if key in type(status).model_fields and key in status.model_fields_set:
+        return getattr(status, key)
+    extra = status.model_extra or {}
+    if key in extra:
+        return extra[key]
+    raise KeyError(key)
 
 
 class TestWakeResult(_BaseModel):
