@@ -39,6 +39,25 @@ API is versioned separately under `/v1/...`.
 
 ### Fixed
 
+- `integration.ManualSync`: a retry synced against the texts it already
+  held. When the server shipped a new manual during the backoff, the
+  address served the new version while the texts in hand still announced
+  the old one, so every retry downloaded the new body and refused it
+  correctly ("the body is version 2.4.3, the server announced 2.4.2"), and
+  the file stayed stale until the daily texts refetch, up to 24 h. Each
+  retry now first refreshes the texts through the source's own `refresh()`
+  (a `TextsCache`: one fetch, joined with a fetch already in flight). When
+  the texts changed, the change syncs against the new announcement and
+  resets the backoff; when not, the retry syncs against the texts in hand.
+  A download that is the agentchat manual but not the announced one
+  (another version, or the announced version with other bytes) refreshes
+  the texts at once instead of at the next step; the body is still refused,
+  and a retry that has just refreshed asks for no second refresh. While the
+  texts cache is failing (`last_error` set) no refresh is asked for: its
+  own timer retries on its own backoff, and the retry syncs against the
+  texts in hand. `stop()` cancels a pending retry, and a retry stopped
+  during its refresh syncs nothing. A texts source without `refresh()` is
+  synced against as before. No new options or exports.
 - `anchor.replace` and `anchor.remove` keep a CRLF text CRLF. Before, the
   new block and the blank lines around it were LF, and a CR was left at the
   end of the text before the block, so a CRLF file came back with mixed
