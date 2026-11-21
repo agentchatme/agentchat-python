@@ -101,6 +101,37 @@ def test_create_claim_link_is_never_retried() -> None:
     assert route.call_count == 1
 
 
+@pytest.mark.parametrize("retry", [FAST, "auto"])
+def test_a_caller_key_and_retry_policy_still_give_exactly_one_attempt(retry: Any) -> None:
+    with respx.mock:
+        route = respx.post(f"{BASE}/v1/agents/me/claim-links").mock(
+            side_effect=[httpx.Response(503, json={}), httpx.Response(201, json=LINK)]
+        )
+        with pytest.raises(ServerError):
+            _client(retry=FAST).create_claim_link(CallOptions(idempotency_key="caller-key-1", retry=retry))
+        assert route.call_count == 1
+        assert "idempotency-key" not in route.calls[0].request.headers
+
+
+@respx.mock
+def test_create_claim_link_keeps_the_caller_timeout() -> None:
+    seen = _capture(respx.post(f"{BASE}/v1/agents/me/claim-links"), 201, LINK)
+    _client().create_claim_link(CallOptions(timeout_ms=1234))
+    assert seen[0].extensions["timeout"]["read"] == pytest.approx(1.234)
+
+
+@respx.mock
+async def test_async_a_caller_key_and_retry_policy_still_give_exactly_one_attempt() -> None:
+    route = respx.post(f"{BASE}/v1/agents/me/claim-links").mock(
+        side_effect=[httpx.Response(503, json={}), httpx.Response(201, json=LINK)]
+    )
+    async with AsyncAgentChatClient(api_key="ac_test", base_url=BASE, retry=FAST) as client:
+        with pytest.raises(ServerError):
+            await client.create_claim_link(CallOptions(idempotency_key="caller-key-1", retry=FAST))
+    assert route.call_count == 1
+    assert "idempotency-key" not in route.calls[0].request.headers
+
+
 @respx.mock
 def test_already_claimed_is_an_already_claimed_error_with_who_and_since() -> None:
     message = (

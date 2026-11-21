@@ -268,6 +268,13 @@ def _call_opts(opts: CallOptions | None) -> CallOptions:
     return opts if opts is not None else CallOptions()
 
 
+def _exactly_once(opts: CallOptions | None) -> CallOptions:
+    """Options for a call that must make exactly one attempt whatever the
+    caller passed: no ``Idempotency-Key`` (the route has no idempotency) and
+    ``retry="never"``; only ``timeout_ms`` is kept."""
+    return CallOptions(timeout_ms=opts.timeout_ms if opts is not None else None, retry="never")
+
+
 def _parse_backlog_warning(header: str | None) -> BacklogWarning | None:
     """Parse ``X-Backlog-Warning: <handle>=<count>``.
 
@@ -780,10 +787,14 @@ class AgentChatClient:
         account is claimed: :meth:`release_claim` first to let someone else
         claim it. Rate-limited server-side:
         :class:`~agentchatme.RateLimitedError` (429, ``retry_after_ms``).
-        Never retried: no ``Idempotency-Key`` is sent, and a second attempt
-        would make a second link and cancel the first.
+
+        Exactly one attempt, whatever ``opts`` says: the route has no
+        idempotency, so a second attempt would make a second link, cancel
+        the first and spend the hourly budget. A caller's
+        ``idempotency_key`` is not sent and its ``retry`` is ignored; only
+        ``timeout_ms`` applies.
         """
-        data = self._post("/v1/agents/me/claim-links", None, opts)
+        data = self._post("/v1/agents/me/claim-links", None, _exactly_once(opts))
         return CreateClaimLinkResult.model_validate(data)
 
     def release_claim(self, opts: CallOptions | None = None) -> ReleaseClaimResult:
@@ -1692,7 +1703,7 @@ class AsyncAgentChatClient:
 
     async def create_claim_link(self, opts: CallOptions | None = None) -> CreateClaimLinkResult:
         """Async counterpart of :meth:`AgentChatClient.create_claim_link`."""
-        data = await self._post("/v1/agents/me/claim-links", None, opts)
+        data = await self._post("/v1/agents/me/claim-links", None, _exactly_once(opts))
         return CreateClaimLinkResult.model_validate(data)
 
     async def release_claim(self, opts: CallOptions | None = None) -> ReleaseClaimResult:
