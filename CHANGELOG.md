@@ -7,6 +7,31 @@ and version numbers follow
 The on-the-wire
 API is versioned separately under `/v1/...`.
 
+## [Unreleased]
+
+### Fixed
+
+- `integration.ManualSync`: a manual that failed to download was not tried
+  again until the texts changed or the process restarted. A sync ran at
+  `start()` and on each texts change only, and `TextsCache` reports a
+  change only when the content differs. A gateway that started offline,
+  with cached texts already announcing a newer manual, kept the old file
+  (as it should), and the next successful texts fetch returned the same
+  texts, so nothing ran again: the manual stayed stale for as long as the
+  process lived. While following (between `start()` and `stop()`), a sync
+  that leaves the file not the announced manual (`up_to_date` not `True`)
+  is now tried again on its own after 5 min, doubling to 1 h (the texts
+  cache's retry cadence), each wait ±20 %. A current result ends the
+  retries and resets the backoff; a texts change still syncs at once and
+  starts the backoff over; nothing announced means no retry. `stop()`
+  cancels a pending retry; the retry is a timer on the running loop, so it
+  never keeps the process alive; retries take the same lock as every other
+  sync, one at a time. `on_result` still hears a repeated failure once. No
+  new options or exports.
+- The `manual_sync` module docstring said "the next texts refresh tries
+  again" after a failed sync; only a texts change did. It now says what
+  happens.
+
 ## [1.6.0] — 2026-11-21
 
 Minor release (added behaviour → minor +1, `VERSIONING.md`).
