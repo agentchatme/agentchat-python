@@ -131,6 +131,7 @@ from .signup import (
     SignupVerifyStep,
 )
 from .texts import Texts, TextsManual, TextsRuntime
+from .wake_check import ClearWakeCheckResult, WakeCheckStatus
 from .wake_webhook import (
     ClearWakeWebhookResult,
     KnownWakeDialect,
@@ -188,6 +189,7 @@ __all__ = [
     "AttachmentMime",
     "BlockedAgent",
     # ws
+    "ClearWakeCheckResult",
     "ClearWakeWebhookResult",
     "ClientAction",
     "Contact",
@@ -283,6 +285,7 @@ __all__ = [
     "UpdateContactRequest",
     "UpdateGroupRequest",
     "VerifyRequest",
+    "WakeCheckStatus",
     "WakeConversation",
     "WakeDialect",
     "WakeFrame",

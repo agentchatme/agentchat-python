@@ -434,3 +434,26 @@ def test_otp_attempts_exhausted_is_not_rate_limited_and_never_retried() -> None:
         assert exc_info.value.details is not None and exc_info.value.details["resend_after_s"] == 30
         assert route.call_count == 1
         http.close()
+
+
+def test_wake_check_unavailable_is_never_retried_while_other_503s_are() -> None:
+    with respx.mock(base_url="https://api.test") as mock:
+        route = mock.put("/v1/agents/me/wake-check").mock(
+            side_effect=[
+                httpx.Response(
+                    503,
+                    json={"code": "WAKE_CHECK_UNAVAILABLE", "message": "Wake checks are not available."},
+                ),
+                httpx.Response(503, json={"code": "INTERNAL_ERROR", "message": "busy"}),
+                httpx.Response(200, json={"ok": True}),
+            ]
+        )
+        http = _make(retry=RetryPolicy(max_retries=3, base_delay_ms=1, max_delay_ms=2))
+        with pytest.raises(ServerError) as exc_info:
+            http.request("PUT", "/v1/agents/me/wake-check", body={})
+        assert exc_info.value.code == "WAKE_CHECK_UNAVAILABLE"
+        assert route.call_count == 1
+        # Any other 503 on the same PUT is still retried.
+        assert http.request("PUT", "/v1/agents/me/wake-check", body={}).data == {"ok": True}
+        assert route.call_count == 3
+        http.close()
