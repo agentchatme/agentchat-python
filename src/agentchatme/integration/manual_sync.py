@@ -10,8 +10,9 @@ announces one, the sha256 of its bytes say what is placed.
 Every path is "never worse than before": offline, an error answer, a body
 over the size cap, a body that is not the agentchat skill at the announced
 version (or hash) — the existing file stays exactly as it is, and
-:class:`ManualSync` tries again on its own (after 5 min, doubling to 1 h)
-until the file is current. This package bundles no manual (every text is
+:class:`ManualSync` tries again on its own (after 5 min, doubling to 1 h,
+each retry refreshing the texts first) until the file is current. This
+package bundles no manual (every text is
 served): an integration that wants a first-install fallback passes its own
 ``fallback`` bytes, written only when no file exists and nothing verified
 could be had, or when they are the announced manual.
@@ -40,6 +41,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import hashlib
+import inspect
 import random
 import re
 import time
@@ -73,6 +75,12 @@ _RETRY_JITTER = 0.2
 :class:`ManualSync` tries again on the texts cache's own retry cadence
 (``TEXTS_RETRY_MS``, doubling to ``TEXTS_RETRY_MAX_MS``), each wait spread
 ±20 % so a fleet that failed together does not retry together."""
+
+
+class _OtherManual(ValueError):
+    """The body is the agentchat manual, but not the announced one (another
+    version, or the announced version with other bytes). Never accepted; a
+    sign the texts in hand may be behind."""
 
 ManualSyncState = Literal["current", "updated", "kept", "fallback", "failed"]
 """
@@ -270,7 +278,8 @@ def _check_manual_text(text: str, announced: str) -> None:
         )
     version = manual_version(text)
     if version != announced:
-        raise ValueError(f"the body is version {version or '(none)'}, the server announced {announced}")
+        message = f"the body is version {version or '(none)'}, the server announced {announced}"
+        raise ValueError(message) if version is None else _OtherManual(message)
 
 
 def sync_manual(
@@ -310,12 +319,24 @@ class ManualSync:
     (offline, an error answer, a body that failed a check, a write that
     failed), it is tried again on its own after 5 min, doubling to 1 h
     (±20 %), until one is current: the texts may not change again for a day
-    or more. A texts change syncs at once and starts the backoff over. Calls
-    are serialised and run in a worker thread; :meth:`stop` stops following
-    and cancels a pending retry. The retry is a timer on the running loop
-    (``call_later``), so it never keeps the process alive. ``on_result``
-    hears every result that is up to date and every failure once per
-    condition.
+    or more. A texts change syncs at once and starts the backoff over.
+
+    Each retry first asks the texts source to refresh (a
+    :class:`~agentchatme.integration.TextsCache`'s own :meth:`refresh`,
+    joined with a fetch in flight), so a retry does not keep syncing against
+    an announcement the server has since replaced: when the texts changed,
+    the change syncs; when not, the retry syncs against the texts in hand. A
+    download that was the manual but not the announced one (another version,
+    other bytes) asks for that refresh at once, without waiting for the next
+    step; the body is still refused. While the texts cache is failing
+    (``last_error`` set) no refresh is asked for: its own timer retries on
+    its own backoff. A source without ``refresh()`` is not refreshed.
+
+    Calls are serialised and run in a worker thread; :meth:`stop` stops
+    following and cancels a pending retry. The retry is a timer on the
+    running loop (``call_later``), so it never keeps the process alive.
+    ``on_result`` hears every result that is up to date and every failure
+    once per condition.
     """
 
     def __init__(
@@ -347,6 +368,9 @@ class ManualSync:
         left the file not the announced manual."""
         self._retry: TimerHandle | None = None
         self._background: set[asyncio.Future[Any]] = set()
+        self._changes = 0
+        """Texts changes heard: a refresh that moved it has already started
+        the change's sync."""
 
     @property
     def result(self) -> ManualSyncResult | None:
@@ -375,16 +399,18 @@ class ManualSync:
     async def sync(self, served: Any = None) -> ManualSyncResult | None:
         """One serialised sync against ``served`` (default: the texts in
         hand). ``None`` when nothing is in hand or stopped."""
-        return await self._run(served, announced=False)
+        return await self._run(served, announced=False, fresh=False)
 
-    def _texts_changed(self, texts: Any, _source: Any = None) -> asyncio.Future[Any]:
+    def _texts_changed(self, texts: Any, source: Any = None) -> asyncio.Future[Any]:
         # A new announcement: synced at once, the backoff from its start.
+        self._changes += 1
         self._cancel_retry()
-        return self._spawn(self._run(texts, announced=True))
+        return self._spawn(self._run(texts, announced=True, fresh=source == "server"))
 
-    async def _run(self, served: Any, *, announced: bool) -> ManualSyncResult | None:
+    async def _run(self, served: Any, *, announced: bool, fresh: bool) -> ManualSyncResult | None:
         """:meth:`sync`, under the lock. ``announced``: the texts changed, so
-        the backoff starts over."""
+        the backoff starts over. ``fresh``: the texts were just had from the
+        server, so a download that is another manual asks for no refresh."""
         announcement = _served_of(served if served is not None else self.texts)
         async with self._lock:
             if announcement is None or self._stopped:
@@ -407,14 +433,52 @@ class ManualSync:
             if announced:
                 self._misses = 0
             self._schedule_retry(result)
+            # The address serves another manual than the one in hand: the
+            # texts may be behind. Ask now; a change syncs and resets the
+            # backoff, no change leaves the retry armed above.
+            if syncer.other_manual and not fresh and self._following and not self._stopped:
+                self._spawn(self._refresh_texts())
             return result
+
+    async def _retry_now(self) -> None:
+        """One retry: refresh the texts, then sync unless the refresh changed
+        them (the change has started its own sync)."""
+        refreshed = await self._refresh_texts()
+        if refreshed == "changed" or not self._following or self._stopped:
+            return
+        await self._run(None, announced=False, fresh=refreshed == "fresh")
+
+    async def _refresh_texts(self) -> Literal["changed", "fresh", "stale"]:
+        """The texts source's own ``refresh()`` (a :class:`TextsCache`: one
+        fetch, joined with one in flight, its timer re-armed by it).
+        ``changed``: a change was heard, and its sync has started. ``fresh``:
+        the server answered with the same texts. ``stale``: no answer, or not
+        asked — no ``refresh()``, stopped, or the cache is failing
+        (``last_error`` set) and its own timer retries on its own backoff."""
+        refresh = getattr(self.texts, "refresh", None)
+        failing = isinstance(getattr(self.texts, "last_error", None), str)
+        if not callable(refresh) or failing or not self._following or self._stopped:
+            return "stale"
+        before = self._changes
+        answered: Any = False
+        try:
+            answered = refresh()
+            if inspect.isawaitable(answered):
+                answered = await answered
+        except Exception:
+            # A refresh that raises is the source's to report; the retry goes
+            # on with the texts in hand.
+            answered = False
+        if self._changes != before:
+            return "changed"
+        return "fresh" if answered is True else "stale"
 
     def _schedule_retry(self, result: ManualSyncResult) -> None:
         """After each result: a current one (or nothing announced) ends the
         retries and resets the backoff; any other arms the next attempt,
         while following (between :meth:`start` and :meth:`stop`). At most one
-        is pending; it runs under the lock like any sync, against the texts
-        in hand when it fires."""
+        is pending; when it fires it refreshes the texts, then syncs under the
+        lock like any sync, against the texts in hand."""
         self._cancel_retry()
         if result.served is None or result.up_to_date is True:
             self._misses = 0
@@ -429,7 +493,7 @@ class ManualSync:
     def _fire_retry(self) -> None:
         self._retry = None
         if self._following and not self._stopped:
-            self._spawn(self.sync())
+            self._spawn(self._retry_now())
 
     def _cancel_retry(self) -> None:
         if self._retry is not None:
@@ -464,6 +528,9 @@ class _Syncer:
         self.timeout_ms = timeout_ms
         self.max_bytes = max_bytes
         self._http_client = http_client
+        self.other_manual = False
+        """After :meth:`sync`: the download was the manual, but not the
+        announced one (:class:`_OtherManual`)."""
 
     def sync(self, served: ServedManual | None) -> ManualSyncResult:
         path = self.target_path
@@ -509,6 +576,7 @@ class _Syncer:
                             source = "download"
                         except Exception as err:
                             error = str(err) or type(err).__name__
+                            self.other_manual = isinstance(err, _OtherManual)
                     if data is not None:
                         try:
                             write_atomic(path, data, mode=0o644)
@@ -574,7 +642,7 @@ class _Syncer:
         if digest is not None:
             got = _sha256(data)
             if got != digest:
-                raise ValueError(f"the body's sha256 is {got}, the server announced {digest}")
+                raise _OtherManual(f"the body's sha256 is {got}, the server announced {digest}")
         return data
 
     def _fetch_hops(

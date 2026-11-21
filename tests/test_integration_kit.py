@@ -772,6 +772,287 @@ def test_a_pending_manual_retry_does_not_keep_the_loop_alive(tmp_path: Path, mon
     assert len(handles) == 1 and isinstance(handles[0], asyncio.TimerHandle) and not handles[0].cancelled()
 
 
+# ─────────────── ManualSync: each retry refreshes the texts first ───────────────
+
+
+class _TextsServer:
+    """``GET /v1/texts`` for a real :class:`TextsCache`: announces ``manual``,
+    fails while ``down``, and while ``hold`` is set waits for it before it
+    answers."""
+
+    base_url = "https://api.agentchat.me"
+
+    def __init__(self, manual: dict[str, Any]) -> None:
+        self.manual = manual
+        self.down = False
+        self.hold: asyncio.Event | None = None
+        self.calls = 0
+        self.texts = self
+
+    async def get(self, *, runtime: str, opts: Any = None) -> Texts:
+        self.calls += 1
+        if self.hold is not None:
+            await self.hold.wait()
+        if self.down:
+            raise OSError("503")
+        return Texts.model_validate(texts_body(manual=self.manual, runtime=runtime))
+
+    def release(self) -> None:
+        hold, self.hold = self.hold, None
+        if hold is not None:
+            hold.set()
+
+
+async def _settle(seconds: float = 0.1) -> None:
+    """Time for the worker thread and the loop to finish what was started:
+    to see that nothing more happens (by the loop's clock, not a count of
+    sleeps, which a coarse Windows timer can cut short)."""
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + seconds
+    while loop.time() < deadline:
+        await asyncio.sleep(0.01)
+
+
+def _announcing(version: str) -> dict[str, Any]:
+    return _served(_manual(version), version=version)
+
+
+def _announced_version(cache: TextsCache) -> str | None:
+    texts = cache.current()
+    return None if texts is None else texts.manual.version
+
+
+@pytest.mark.asyncio
+async def test_the_lab_case_a_manual_announced_during_the_backoff_is_placed_by_the_next_retry(
+    tmp_path: Path, retry_clock: _RetryClock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(manual_sync_module.random, "random", lambda: 0.5)
+    skill = tmp_path / "SKILL.md"
+    skill.write_bytes(_manual("2.4.1"))
+    server = _TextsServer(_announcing("2.4.2"))
+    cache = TextsCache(server, runtime="hermes")
+    address = _ManualServer(offline=True, version="2.4.2")
+    results: list[str] = []
+    manual = ManualSync(
+        texts=cache, target_path=skill, http_client=address.client,
+        on_result=lambda r: results.append(f"{r.state}:{r.served}"),
+    )
+    try:
+        await cache.start()
+        first = await manual.start()
+        assert first is not None and first.state == "kept" and first.served == "2.4.2"
+        assert retry_clock.pending == 1
+
+        # The server ships 2.4.3: the address and the announcement both move on.
+        server.manual = _announcing("2.4.3")
+        address.version = "2.4.3"
+        address.offline = False
+
+        retry_clock.advance(5 * _MIN_MS)
+        await eventually(lambda: manual.result is not None and manual.result.state == "updated", "the retry")
+        await _settle()
+        assert skill.read_bytes() == _manual("2.4.3")
+        assert manual.result is not None and manual.result.served == "2.4.3" and manual.result.up_to_date is True
+        assert server.calls == 2  # start, and the retry's refresh
+        assert len(address.requests) == 2  # no download synced against the old announcement
+        assert results == ["kept:2.4.2", "updated:2.4.3"]  # the change's sync only, no second one
+        assert retry_clock.pending == 0
+    finally:
+        manual.stop()
+        cache.stop()
+
+
+@pytest.mark.asyncio
+async def test_a_download_that_is_another_manual_refreshes_the_texts_at_once(
+    tmp_path: Path, retry_clock: _RetryClock
+) -> None:
+    skill = tmp_path / "SKILL.md"
+    skill.write_bytes(_manual("2.4.1"))
+    server = _TextsServer(_announcing("2.4.2"))
+    cache = TextsCache(server, runtime="hermes")
+    address = _ManualServer(offline=False, version="2.4.3")
+    manual = ManualSync(texts=cache, target_path=skill, http_client=address.client)
+    try:
+        await cache.start()
+        server.manual = _announcing("2.4.3")  # the texts in hand are behind
+        first = await manual.start()
+        assert first is not None and first.state == "kept" and first.served == "2.4.2"
+        assert "the body is version 2.4.3, the server announced 2.4.2" in (first.error or "")
+        await eventually(
+            lambda: manual.result is not None and manual.result.state == "updated", "the refreshed announcement"
+        )
+        assert skill.read_bytes() == _manual("2.4.3")
+        assert server.calls == 2 and len(address.requests) == 2
+        assert retry_clock.pending == 0  # with no time passing
+    finally:
+        manual.stop()
+        cache.stop()
+
+
+@pytest.mark.asyncio
+async def test_an_address_ahead_of_the_announcement_refreshes_once_then_backs_off_and_never_takes_the_body(
+    tmp_path: Path, retry_clock: _RetryClock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(manual_sync_module.random, "random", lambda: 0.5)
+    skill = tmp_path / "SKILL.md"
+    skill.write_bytes(_manual("2.4.1"))
+    server = _TextsServer(_announcing("2.4.2"))  # keeps announcing 2.4.2
+    cache = TextsCache(server, runtime="hermes")
+    address = _ManualServer(offline=False, version="2.4.3")
+    manual = ManualSync(texts=cache, target_path=skill, http_client=address.client)
+    try:
+        await cache.start()
+        await manual.start()
+        await eventually(lambda: server.calls == 2, "the refresh at once")
+        await _settle()
+        assert retry_clock.armed == [5 * _MIN_MS] and len(address.requests) == 1
+
+        # The retry refreshes (the same texts) and syncs; that sync's refusal
+        # asks for no second refresh.
+        retry_clock.advance(5 * _MIN_MS)
+        await eventually(lambda: len(retry_clock.armed) == 2, "the retry")
+        await _settle()
+        assert server.calls == 3 and len(address.requests) == 2
+        assert retry_clock.armed[1] == 10 * _MIN_MS
+        assert manual.result is not None and manual.result.state == "kept" and manual.result.served == "2.4.2"
+        assert skill.read_bytes() == _manual("2.4.1")
+    finally:
+        manual.stop()
+        cache.stop()
+
+
+@pytest.mark.asyncio
+async def test_a_retry_whose_refresh_finds_the_texts_unchanged_still_syncs(
+    tmp_path: Path, retry_clock: _RetryClock
+) -> None:
+    skill = tmp_path / "SKILL.md"
+    skill.write_bytes(_manual("2.4.1"))
+    server = _TextsServer(_announcing("2.4.2"))
+    cache = TextsCache(server, runtime="hermes")
+    changes: list[str] = []
+    cache.on_change(lambda texts, source: changes.append(source))
+    address = _ManualServer(offline=True, version="2.4.2")
+    manual = ManualSync(texts=cache, target_path=skill, http_client=address.client)
+    try:
+        await cache.start()
+        await manual.start()
+        address.offline = False
+        retry_clock.advance(6 * _MIN_MS)
+        await eventually(lambda: manual.result is not None and manual.result.state == "updated", "the retry")
+        assert skill.read_bytes() == _manual("2.4.2")
+        assert server.calls == 2 and len(address.requests) == 2
+        assert changes == ["server"]  # the start only: the retry's refresh changed nothing
+    finally:
+        manual.stop()
+        cache.stop()
+
+
+@pytest.mark.asyncio
+async def test_a_failed_refresh_lets_the_retry_go_on_and_a_failing_cache_is_left_to_its_own_backoff(
+    tmp_path: Path, retry_clock: _RetryClock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(manual_sync_module.random, "random", lambda: 0.5)
+    skill = tmp_path / "SKILL.md"
+    skill.write_bytes(_manual("2.4.1"))
+    server = _TextsServer(_announcing("2.4.2"))
+    cache = TextsCache(server, runtime="hermes")
+    address = _ManualServer(offline=True, version="2.4.2")
+    manual = ManualSync(texts=cache, target_path=skill, http_client=address.client)
+    try:
+        await cache.start()
+        await manual.start()
+
+        server.down = True
+        retry_clock.advance(5 * _MIN_MS)
+        await eventually(lambda: len(retry_clock.armed) == 2, "the first retry")
+        assert server.calls == 2 and cache.last_error == "503"  # the refresh, failed
+        assert len(address.requests) == 2  # the retry went on with the texts in hand
+
+        # The cache is failing: the next retry asks it nothing and syncs
+        # against what it holds.
+        address.offline = False
+        retry_clock.advance(10 * _MIN_MS)
+        await eventually(lambda: manual.result is not None and manual.result.state == "updated", "the second retry")
+        assert server.calls == 2
+        assert skill.read_bytes() == _manual("2.4.2")
+    finally:
+        manual.stop()
+        cache.stop()
+
+
+@pytest.mark.asyncio
+async def test_a_retrys_refresh_joins_the_caches_fetch_in_flight(tmp_path: Path, retry_clock: _RetryClock) -> None:
+    skill = tmp_path / "SKILL.md"
+    skill.write_bytes(_manual("2.4.1"))
+    server = _TextsServer(_announcing("2.4.2"))
+    cache = TextsCache(server, runtime="hermes")
+    address = _ManualServer(offline=True, version="2.4.2")
+    manual = ManualSync(texts=cache, target_path=skill, http_client=address.client)
+    try:
+        await cache.start()
+        await manual.start()
+
+        server.hold = asyncio.Event()
+        in_flight = asyncio.ensure_future(cache.refresh())  # the cache's own fetch, not answered yet
+        await eventually(lambda: server.calls == 2, "the cache's fetch")
+        address.offline = False
+        retry_clock.advance(6 * _MIN_MS)
+        await _settle()
+        assert server.calls == 2  # joined, not a second fetch
+        assert len(address.requests) == 1  # and it waits for that answer before it syncs
+        server.release()
+        assert await in_flight is True
+        await eventually(lambda: manual.result is not None and manual.result.state == "updated", "the retry")
+        assert server.calls == 2
+    finally:
+        manual.stop()
+        cache.stop()
+
+
+@pytest.mark.asyncio
+async def test_stop_during_the_retrys_refresh_syncs_nothing_after_it(tmp_path: Path, retry_clock: _RetryClock) -> None:
+    skill = tmp_path / "SKILL.md"
+    skill.write_bytes(_manual("2.4.1"))
+    server = _TextsServer(_announcing("2.4.2"))
+    cache = TextsCache(server, runtime="hermes")
+    address = _ManualServer(offline=True, version="2.4.3")
+    manual = ManualSync(texts=cache, target_path=skill, http_client=address.client)
+    try:
+        await cache.start()
+        await manual.start()
+
+        server.hold = asyncio.Event()
+        server.manual = _announcing("2.4.3")
+        retry_clock.advance(6 * _MIN_MS)
+        await eventually(lambda: server.calls == 2, "the retry's refresh")
+        manual.stop()
+        server.release()
+        await eventually(lambda: _announced_version(cache) == "2.4.3", "the refresh")
+        await _settle()
+        assert len(address.requests) == 1 and retry_clock.pending == 0
+        assert manual.result is not None and manual.result.served == "2.4.2" and manual.result.state == "kept"
+        assert skill.read_bytes() == _manual("2.4.1")
+    finally:
+        manual.stop()
+        cache.stop()
+
+    # And a stop with the retry still pending: the texts are not even asked.
+    other = _TextsServer(_announcing("2.4.2"))
+    other_cache = TextsCache(other, runtime="hermes")
+    pending = ManualSync(texts=other_cache, target_path=skill, http_client=address.client)
+    try:
+        await other_cache.start()
+        await pending.start()
+        assert retry_clock.pending == 1
+        pending.stop()
+        retry_clock.advance(2 * 60 * _MIN_MS)
+        await _settle()
+        assert other.calls == 1
+    finally:
+        pending.stop()
+        other_cache.stop()
+
+
 # ─────────────── probe_hosted_tools ───────────────
 
 
