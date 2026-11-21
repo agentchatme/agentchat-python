@@ -9,8 +9,9 @@ announces one, the sha256 of its bytes say what is placed.
 
 Every path is "never worse than before": offline, an error answer, a body
 over the size cap, a body that is not the agentchat skill at the announced
-version (or hash) — the existing file stays exactly as it is, and the next
-texts refresh tries again. This package bundles no manual (every text is
+version (or hash) — the existing file stays exactly as it is, and
+:class:`ManualSync` tries again on its own (after 5 min, doubling to 1 h)
+until the file is current. This package bundles no manual (every text is
 served): an integration that wants a first-install fallback passes its own
 ``fallback`` bytes, written only when no file exists and nothing verified
 could be had, or when they are the announced manual.
@@ -39,9 +40,10 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import hashlib
+import random
 import re
 import time
-from collections.abc import Mapping
+from collections.abc import Coroutine, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Literal
@@ -50,6 +52,8 @@ from urllib.parse import urljoin, urlsplit
 import httpx
 
 from ._files import write_atomic
+from .coalescer import TimerHandle, _loop_timer
+from .texts_cache import TEXTS_RETRY_MAX_MS, TEXTS_RETRY_MS
 
 MANUAL_SKILL_NAME = "agentchat"
 """The skill name every runtime sees: ``<skills dir>/agentchat/SKILL.md``."""
@@ -64,6 +68,11 @@ _LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "::1", "[::1]"})
 _REDIRECT_STATUSES = frozenset({301, 302, 303, 307, 308})
 _SHA256_HEX = re.compile(r"^[0-9a-f]{64}$")
 _FIELD_RE = re.compile(r"^([A-Za-z0-9_-]+):[ \t]*(.*?)[ \t]*$")
+_RETRY_JITTER = 0.2
+"""After a sync that left the file not the announced manual,
+:class:`ManualSync` tries again on the texts cache's own retry cadence
+(``TEXTS_RETRY_MS``, doubling to ``TEXTS_RETRY_MAX_MS``), each wait spread
+±20 % so a fleet that failed together does not retry together."""
 
 ManualSyncState = Literal["current", "updated", "kept", "fallback", "failed"]
 """
@@ -297,9 +306,16 @@ class ManualSync:
     the skill file (``<skills dir>/agentchat/SKILL.md``; the integration
     knows where). :meth:`start` syncs once and then on every texts change
     (the texts' own cadence: daily, sooner while the server does not
-    answer). Calls are serialised and run in a worker thread; :meth:`stop`
-    stops following. ``on_result`` hears every result that is up to date and
-    every failure once per condition.
+    answer). While a sync has left the file not the announced manual
+    (offline, an error answer, a body that failed a check, a write that
+    failed), it is tried again on its own after 5 min, doubling to 1 h
+    (±20 %), until one is current: the texts may not change again for a day
+    or more. A texts change syncs at once and starts the backoff over. Calls
+    are serialised and run in a worker thread; :meth:`stop` stops following
+    and cancels a pending retry. The retry is a timer on the running loop
+    (``call_later``), so it never keeps the process alive. ``on_result``
+    hears every result that is up to date and every failure once per
+    condition.
     """
 
     def __init__(
@@ -323,8 +339,14 @@ class ManualSync:
         self._lock = asyncio.Lock()
         self._unsubscribe: Callable[[], None] | None = None
         self._stopped = False
+        self._following = False
         self._last_error: str | None = None
         self._last: ManualSyncResult | None = None
+        self._misses = 0
+        """Syncs in a row, since the last current one or texts change, that
+        left the file not the announced manual."""
+        self._retry: TimerHandle | None = None
+        self._background: set[asyncio.Future[Any]] = set()
 
     @property
     def result(self) -> ManualSyncResult | None:
@@ -332,18 +354,20 @@ class ManualSync:
         return self._last
 
     async def start(self) -> ManualSyncResult | None:
-        """Sync now, then follow every texts change. Returns the first result."""
+        """Sync now, then follow every texts change, and retry while the
+        file is not current. Returns the first result."""
         self._stopped = False
+        self._following = True
         if self._unsubscribe is None:
             on_change = getattr(self.texts, "on_change", None)
             if callable(on_change):
-                self._unsubscribe = on_change(
-                    lambda texts, _source=None: asyncio.ensure_future(self.sync(texts))
-                )
+                self._unsubscribe = on_change(self._texts_changed)
         return await self.sync()
 
     def stop(self) -> None:
         self._stopped = True
+        self._following = False
+        self._cancel_retry()
         if self._unsubscribe is not None:
             self._unsubscribe()
             self._unsubscribe = None
@@ -351,6 +375,16 @@ class ManualSync:
     async def sync(self, served: Any = None) -> ManualSyncResult | None:
         """One serialised sync against ``served`` (default: the texts in
         hand). ``None`` when nothing is in hand or stopped."""
+        return await self._run(served, announced=False)
+
+    def _texts_changed(self, texts: Any, _source: Any = None) -> asyncio.Future[Any]:
+        # A new announcement: synced at once, the backoff from its start.
+        self._cancel_retry()
+        return self._spawn(self._run(texts, announced=True))
+
+    async def _run(self, served: Any, *, announced: bool) -> ManualSyncResult | None:
+        """:meth:`sync`, under the lock. ``announced``: the texts changed, so
+        the backoff starts over."""
         announcement = _served_of(served if served is not None else self.texts)
         async with self._lock:
             if announcement is None or self._stopped:
@@ -370,7 +404,45 @@ class ManualSync:
                 with contextlib.suppress(Exception):
                     self._on_result(result)
             self._last_error = None if result.up_to_date is True else result.error
+            if announced:
+                self._misses = 0
+            self._schedule_retry(result)
             return result
+
+    def _schedule_retry(self, result: ManualSyncResult) -> None:
+        """After each result: a current one (or nothing announced) ends the
+        retries and resets the backoff; any other arms the next attempt,
+        while following (between :meth:`start` and :meth:`stop`). At most one
+        is pending; it runs under the lock like any sync, against the texts
+        in hand when it fires."""
+        self._cancel_retry()
+        if result.served is None or result.up_to_date is True:
+            self._misses = 0
+            return
+        if not self._following or self._stopped:
+            return
+        self._misses += 1
+        step = min(TEXTS_RETRY_MAX_MS, TEXTS_RETRY_MS * 2 ** min(self._misses - 1, 20))
+        delay_ms = step * (1.0 - _RETRY_JITTER + random.random() * 2.0 * _RETRY_JITTER)
+        self._retry = _loop_timer(delay_ms, self._fire_retry)
+
+    def _fire_retry(self) -> None:
+        self._retry = None
+        if self._following and not self._stopped:
+            self._spawn(self.sync())
+
+    def _cancel_retry(self) -> None:
+        if self._retry is not None:
+            self._retry.cancel()
+            self._retry = None
+
+    def _spawn(self, work: Coroutine[Any, Any, Any]) -> asyncio.Future[Any]:
+        """Run ``work`` on the loop, held until it ends (the loop keeps only
+        a weak reference to a task)."""
+        task = asyncio.ensure_future(work)
+        self._background.add(task)
+        task.add_done_callback(self._background.discard)
+        return task
 
 
 class _Syncer:

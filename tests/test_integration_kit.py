@@ -9,12 +9,14 @@ import json
 import os
 import stat
 import sys
+import threading
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import httpx
 import pytest
 
+import agentchatme.integration.manual_sync as manual_sync_module
 from agentchatme.integration import (
     AgentChatCallCount,
     ManualSync,
@@ -37,6 +39,7 @@ from agentchatme.integration import (
 from agentchatme.types import Texts
 
 from ._texts import texts as texts_body
+from ._wait import eventually
 from .test_realtime import MockWebSocket, _flush
 
 # ─────────────── TurnTracker ───────────────
@@ -419,6 +422,354 @@ async def test_manual_sync_follows_the_texts(tmp_path: Path) -> None:
     finally:
         manual.stop()
         cache.stop()
+
+
+# ─────────────── ManualSync: retries while the file is not current ───────────────
+
+_MIN_MS = 60_000.0
+
+
+class _Due:
+    def __init__(self, at_ms: float, fn: Callable[[], None]) -> None:
+        self.at_ms = at_ms
+        self.fn = fn
+        self.cancelled = False
+
+    def cancel(self) -> None:
+        self.cancelled = True
+
+
+class _RetryClock:
+    """The manual retry's timer (``manual_sync._loop_timer``) on a virtual
+    clock the test advances. Every other timer, and the worker thread a
+    sync runs in, are real."""
+
+    def __init__(self) -> None:
+        self.now_ms = 0.0
+        self.armed: list[float] = []
+        """Every delay armed, in ms, in order."""
+        self._timers: list[_Due] = []
+
+    def __call__(self, delay_ms: float, fn: Callable[[], None]) -> _Due:
+        due = _Due(self.now_ms + delay_ms, fn)
+        self.armed.append(delay_ms)
+        self._timers.append(due)
+        return due
+
+    @property
+    def pending(self) -> int:
+        return sum(1 for due in self._timers if not due.cancelled)
+
+    def advance(self, ms: float) -> None:
+        target = self.now_ms + ms
+        while True:
+            ready = [due for due in self._timers if not due.cancelled and due.at_ms <= target]
+            if not ready:
+                break
+            first = min(ready, key=lambda due: due.at_ms)
+            self._timers.remove(first)
+            self.now_ms = first.at_ms
+            first.fn()
+        self.now_ms = target
+
+
+@pytest.fixture
+def retry_clock(monkeypatch: pytest.MonkeyPatch) -> _RetryClock:
+    clock = _RetryClock()
+    monkeypatch.setattr(manual_sync_module, "_loop_timer", clock)
+    return clock
+
+
+class _Announcing:
+    """A texts source announcing ``manual``; the test fires its change."""
+
+    api_base = "https://api.agentchat.me"
+
+    def __init__(self, manual: dict[str, Any] | None) -> None:
+        self.manual = manual
+        self.listeners: list[Callable[..., Any]] = []
+
+    def current(self) -> dict[str, Any] | None:
+        return None if self.manual is None else {"manual": self.manual}
+
+    def on_change(self, listener: Callable[..., Any]) -> Callable[[], None]:
+        self.listeners.append(listener)
+        return lambda: self.listeners.remove(listener)
+
+    def change(self, manual: dict[str, Any]) -> None:
+        self.manual = manual
+        for listener in list(self.listeners):
+            listener({"manual": manual}, "server")
+
+
+class _ManualServer:
+    """The manual address: offline (a connect error) while ``offline``, else
+    the manual at ``version``."""
+
+    def __init__(self, *, offline: bool = True, version: str = "2.2.2") -> None:
+        self.offline = offline
+        self.version = version
+        self.requests: list[str] = []
+        self.client = httpx.Client(transport=httpx.MockTransport(self._handle))
+
+    def _handle(self, request: httpx.Request) -> httpx.Response:
+        self.requests.append(str(request.url))
+        if self.offline:
+            raise httpx.ConnectError("offline", request=request)
+        return httpx.Response(200, content=_manual(self.version))
+
+
+@pytest.mark.asyncio
+async def test_an_offline_start_is_retried_until_the_manual_is_current_with_no_texts_change(
+    tmp_path: Path, retry_clock: _RetryClock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(manual_sync_module.random, "random", lambda: 0.5)  # no jitter: the steps exactly
+    announced = texts_body(manual=_served(_manual("2.2.2")), runtime="hermes")
+    texts_file = tmp_path / "texts.json"
+    texts_file.write_text(
+        json.dumps({"version": 1, "runtime": "hermes", "fetched_at": "2026-11-01T00:00:00.000Z", "texts": announced})
+    )
+    skill = tmp_path / "SKILL.md"
+    skill.write_bytes(_manual("2.2.1"))
+    # The API is offline at start, then answers the same texts it announced before.
+    client = _AsyncTextsClient([OSError("offline"), announced])
+    client.base_url = "https://api.agentchat.me"
+    cache = TextsCache(client, runtime="hermes", file_path=texts_file)
+    changes: list[str] = []
+    cache.on_change(lambda texts, source: changes.append(source))
+    server = _ManualServer(offline=True)
+    results: list[str] = []
+    manual = ManualSync(
+        texts=cache, target_path=skill, http_client=server.client,
+        on_result=lambda r: results.append(f"{r.state}:{r.error or ''}"),
+    )
+    try:
+        await cache.start()
+        assert cache.source == "cache"
+        first = await manual.start()
+        assert first is not None and first.state == "kept" and first.up_to_date is False
+        assert first.version == "2.2.1" and first.served == "2.2.2"
+        assert skill.read_bytes() == _manual("2.2.1")  # never worse than before
+        assert retry_clock.armed == [5 * _MIN_MS]
+
+        # The texts come back unchanged: no change event, so only the retry can help.
+        assert await cache.refresh() is True
+        assert cache.source == "server" and changes == ["cache"]
+
+        retry_clock.advance(5 * _MIN_MS - 1)
+        assert len(server.requests) == 1
+        retry_clock.advance(1)
+        await eventually(lambda: len(retry_clock.armed) == 2, "the first retry")
+        assert len(server.requests) == 2 and manual.result is not first
+        assert manual.result is not None and manual.result.state == "kept"
+        assert retry_clock.armed[1] == 10 * _MIN_MS
+
+        # Online again: the next retry places the announced manual.
+        server.offline = False
+        retry_clock.advance(10 * _MIN_MS - 1)
+        assert len(server.requests) == 2
+        retry_clock.advance(1)
+        await eventually(lambda: manual.result is not None and manual.result.state == "updated", "the second retry")
+        assert skill.read_bytes() == _manual("2.2.2")
+        assert manual.result is not None and manual.result.up_to_date is True
+        assert changes == ["cache"]
+        assert results == ["kept:offline", "updated:"]  # the repeated failure said once
+        assert retry_clock.pending == 0  # current: nothing more is tried
+    finally:
+        manual.stop()
+        cache.stop()
+
+
+@pytest.mark.asyncio
+async def test_repeated_failures_back_off_5_10_20_40_60_60_minutes_within_the_jitter_band(
+    tmp_path: Path, retry_clock: _RetryClock
+) -> None:
+    skill = tmp_path / "SKILL.md"
+    skill.write_bytes(_manual("2.2.1"))
+    server = _ManualServer(offline=True)
+    results: list[str] = []
+    manual = ManualSync(
+        texts=_Announcing(_served(_manual("2.2.2"))), target_path=skill, http_client=server.client,
+        on_result=lambda r: results.append(r.state),
+    )
+    try:
+        await manual.start()
+        for i, minutes in enumerate([5, 10, 20, 40, 60, 60]):
+            assert len(retry_clock.armed) == i + 1 and retry_clock.pending == 1
+            delay = retry_clock.armed[i]
+            assert minutes * _MIN_MS * 0.8 <= delay <= minutes * _MIN_MS * 1.2
+            retry_clock.advance(delay - 1)
+            assert len(server.requests) == i + 1
+            retry_clock.advance(1)
+            await eventually(lambda i=i: len(retry_clock.armed) == i + 2, f"retry {i + 1}")
+            assert len(server.requests) == i + 2
+        assert results == ["kept"]  # one report for one condition, as before
+    finally:
+        manual.stop()
+
+
+@pytest.mark.parametrize(("random_value", "delay_ms"), [(0.0, 4 * _MIN_MS), (0.999999, 5 * _MIN_MS * (0.8 + 0.999999 * 0.4))])
+@pytest.mark.asyncio
+async def test_the_retry_jitter_spans_0_8_to_1_2_of_the_step(
+    tmp_path: Path, retry_clock: _RetryClock, monkeypatch: pytest.MonkeyPatch, random_value: float, delay_ms: float
+) -> None:
+    monkeypatch.setattr(manual_sync_module.random, "random", lambda: random_value)
+    server = _ManualServer(offline=True)
+    manual = ManualSync(texts=_Announcing(_served(_manual("2.2.2"))), target_path=tmp_path / "S.md", http_client=server.client)
+    try:
+        await manual.start()
+        assert retry_clock.armed == [pytest.approx(delay_ms)]
+    finally:
+        manual.stop()
+
+
+@pytest.mark.asyncio
+async def test_a_success_stops_the_manual_retries(tmp_path: Path, retry_clock: _RetryClock) -> None:
+    skill = tmp_path / "SKILL.md"
+    skill.write_bytes(_manual("2.2.1"))
+    server = _ManualServer(offline=True)
+    manual = ManualSync(texts=_Announcing(_served(_manual("2.2.2"))), target_path=skill, http_client=server.client)
+    try:
+        await manual.start()
+        assert retry_clock.pending == 1
+        server.offline = False
+        retry_clock.advance(6 * _MIN_MS)
+        await eventually(lambda: manual.result is not None and manual.result.state == "updated", "the retry")
+        assert skill.read_bytes() == _manual("2.2.2")
+        assert retry_clock.pending == 0 and len(retry_clock.armed) == 1
+        retry_clock.advance(24 * 60 * _MIN_MS)
+        assert len(server.requests) == 2
+    finally:
+        manual.stop()
+
+
+@pytest.mark.asyncio
+async def test_a_texts_change_during_the_backoff_syncs_at_once_and_starts_the_backoff_over(
+    tmp_path: Path, retry_clock: _RetryClock
+) -> None:
+    skill = tmp_path / "SKILL.md"
+    skill.write_bytes(_manual("2.2.1"))
+    texts = _Announcing(_served(_manual("2.2.2")))
+    server = _ManualServer(offline=True)
+    manual = ManualSync(texts=texts, target_path=skill, http_client=server.client)
+    try:
+        await manual.start()
+        # Two retries fail: the third waits about 20 min.
+        for i in range(2):
+            retry_clock.advance(retry_clock.armed[i])
+            await eventually(lambda i=i: len(retry_clock.armed) == i + 2, f"retry {i + 1}")
+        assert retry_clock.armed[2] >= 16 * _MIN_MS
+
+        # A new announcement, still offline: synced now, with no time passing,
+        # and the backoff is back at 5 min.
+        server.version = "2.2.3"
+        texts.change(_served(_manual("2.2.3"), version="2.2.3"))
+        await eventually(lambda: len(retry_clock.armed) == 4, "the change's sync")
+        assert len(server.requests) == 4
+        assert retry_clock.pending == 1  # the 20 min retry was cancelled, not added to
+        assert 4 * _MIN_MS <= retry_clock.armed[3] <= 6 * _MIN_MS
+        assert manual.result is not None and manual.result.served == "2.2.3" and manual.result.state == "kept"
+
+        # Online again: the retry places the new announcement.
+        server.offline = False
+        retry_clock.advance(retry_clock.armed[3])
+        await eventually(lambda: manual.result is not None and manual.result.state == "updated", "the retry")
+        assert skill.read_bytes() == _manual("2.2.3")
+        assert retry_clock.pending == 0
+    finally:
+        manual.stop()
+
+
+@pytest.mark.asyncio
+async def test_stop_cancels_the_pending_retry_and_a_sync_in_flight_at_stop_arms_none(
+    tmp_path: Path, retry_clock: _RetryClock
+) -> None:
+    skill = tmp_path / "SKILL.md"
+    skill.write_bytes(_manual("2.2.1"))
+    server = _ManualServer(offline=True)
+    manual = ManualSync(texts=_Announcing(_served(_manual("2.2.2"))), target_path=skill, http_client=server.client)
+    await manual.start()
+    assert retry_clock.pending == 1
+    manual.stop()
+    assert retry_clock.pending == 0
+    retry_clock.advance(2 * 60 * _MIN_MS)
+    assert len(server.requests) == 1
+    assert await manual.sync() is None
+
+    # A download still in flight when stop() is called arms nothing after it.
+    release = threading.Event()
+    seen: list[str] = []
+
+    def blocked(request: httpx.Request) -> httpx.Response:
+        seen.append(str(request.url))
+        release.wait(5)
+        raise httpx.ConnectError("offline", request=request)
+
+    slow = httpx.Client(transport=httpx.MockTransport(blocked))
+    other = ManualSync(texts=_Announcing(_served(_manual("2.2.2"))), target_path=skill, http_client=slow)
+    first = asyncio.ensure_future(other.start())
+    try:
+        await eventually(lambda: len(seen) == 1, "the download")
+        other.stop()
+    finally:
+        release.set()
+    await first
+    assert retry_clock.pending == 0 and len(retry_clock.armed) == 1  # the first instance's only
+    retry_clock.advance(2 * 60 * _MIN_MS)
+    assert len(seen) == 1
+
+
+@pytest.mark.asyncio
+async def test_nothing_announced_or_not_following_arms_no_retry(tmp_path: Path, retry_clock: _RetryClock) -> None:
+    server = _ManualServer(offline=True)
+    none = ManualSync(texts=_Announcing(None), target_path=tmp_path / "S.md", http_client=server.client)
+    try:
+        assert await none.start() is None
+        assert retry_clock.armed == [] and server.requests == []
+    finally:
+        none.stop()
+
+    # sync() without start(): one attempt, nothing followed.
+    once = ManualSync(texts=_Announcing(_served(_manual("2.2.2"))), target_path=tmp_path / "S.md", http_client=server.client)
+    result = await once.sync()
+    assert result is not None and result.state == "failed" and result.up_to_date is False
+    assert retry_clock.armed == [] and len(server.requests) == 1
+
+
+def test_a_pending_manual_retry_does_not_keep_the_loop_alive(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    real = manual_sync_module._loop_timer
+    handles: list[Any] = []
+
+    def spy(delay_ms: float, fn: Callable[[], None]) -> Any:
+        handle = real(delay_ms, fn)
+        handles.append(handle)
+        return handle
+
+    monkeypatch.setattr(manual_sync_module, "_loop_timer", spy)
+    server = _ManualServer(offline=True)
+
+    async def main() -> None:
+        manual = ManualSync(texts=_Announcing(_served(_manual("2.2.2"))), target_path=tmp_path / "S.md", http_client=server.client)
+        first = await manual.start()
+        assert first is not None and first.up_to_date is False
+        # Left pending on purpose: no stop().
+
+    # asyncio.run in a thread of its own, as a process's main would: it
+    # returns with the 4-6 min retry still pending, and this thread's event
+    # loop state is left alone for the tests after this one.
+    errors: list[Exception] = []
+
+    def run() -> None:
+        try:
+            asyncio.run(main())
+        except Exception as err:
+            errors.append(err)
+
+    thread = threading.Thread(target=run)
+    thread.start()
+    thread.join(10)
+    assert not thread.is_alive() and errors == []
+    assert len(handles) == 1 and isinstance(handles[0], asyncio.TimerHandle) and not handles[0].cancelled()
 
 
 # ─────────────── probe_hosted_tools ───────────────
