@@ -5,4 +5,4 @@ The version here is the authoritative source used for the default
 test suite asserts they match.
 """
 
-VERSION = "1.6.1"
+VERSION = "1.7.0"
