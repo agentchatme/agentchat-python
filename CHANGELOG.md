@@ -42,15 +42,27 @@ API is versioned separately under `/v1/...`.
 - `anchor.replace` and `anchor.remove` keep a CRLF text CRLF. Before, the
   new block and the blank lines around it were LF, and a CR was left at the
   end of the text before the block, so a CRLF file came back with mixed
-  line endings. The style is the one most of the lines outside the blocks
-  use. (A text read with `Path.read_text()` has its CRLF turned into LF
-  already; read the bytes, as `follow` does, to keep them.)
+  line endings. The style is the one most of the user's own lines use (the
+  blank lines next to a block, which a replacement rewrites, decide only
+  when the text has no other line break), so replacing again gives the same
+  text. (A text read with `Path.read_text()` has its CRLF turned
+  into LF already; read the bytes, as `follow` does, to keep them.)
 - `anchor.replace` and `anchor.remove` no longer add a final line break to
   a text that had none when they replace or remove a block in place. A
   block appended to a text with no block still ends with one.
+- `anchor.replace` and `anchor.remove` keep a leading byte-order mark.
+  Before, a text starting with one was not read at its first line: a block
+  there was not found, so `replace` added a second one.
+- `anchor.replace` no longer slows down on a long run of blank lines next
+  to a block (it was quadratic: 40,000 blank lines took seconds).
 
 ### Changed
 
+- The anchor functions count as space around a line, a body or a word what
+  JavaScript's `trim()` does, as the TypeScript kit does: U+FEFF is space,
+  U+0085 and U+001C-U+001F are not (`str.strip()` had it the other way
+  round). Only text holding those characters next to a marker reads
+  differently.
 - `FoundBlock.handle` is documented as display only for a block with no
   handle line: it reads the block's words loosely, so a sentence of the
   user's that says "I am @x" reads as a claim. What it returns is unchanged

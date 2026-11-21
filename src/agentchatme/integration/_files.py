@@ -146,6 +146,8 @@ def replace_if_unchanged(
     one that fails halfway would leave the user's file cut short."""
     target = original.target
     if not os.access(target, os.W_OK):
+        if not os.path.lexists(target):
+            raise FileNotFoundError(f"{target} was removed")
         raise PermissionError(f"{target} is not writable")
     tmp = _tmp_path_for(target)
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0)

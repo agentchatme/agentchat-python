@@ -434,6 +434,31 @@ def test_follow_a_file_removed_meanwhile_is_not_re_created(file: Path) -> None:
     assert list(file.parent.iterdir()) == []
 
 
+def test_follow_a_file_removed_between_the_read_and_the_write_is_absent(file: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    write(file, around(block(served())))
+    real = anchor.read_for_replace
+    calls = [0]
+
+    def read_then_remove(path: str | Path) -> Any:
+        calls[0] += 1
+        original = real(path)
+        if calls[0] == 1:
+            file.unlink()
+        return original
+
+    monkeypatch.setattr(anchor, "read_for_replace", read_then_remove)
+    assert follow(file).outcome == "absent"
+    assert list(file.parent.iterdir()) == []
+
+
+def test_follow_options_an_untyped_caller_got_wrong_are_a_failure(file: Path) -> None:
+    write(file, around(block(served())))
+    before = snapshot(file)
+    assert anchor.follow(file, handle=None, identity_line=NEW_LINE).outcome == "failed"  # type: ignore[arg-type]
+    assert anchor.follow(file, handle=HANDLE, identity_line=None).outcome == "failed"  # type: ignore[arg-type]
+    assert snapshot(file) == before
+
+
 def test_follow_a_hook_that_raises_aborts_the_write(file: Path) -> None:
     write(file, around(block(served())))
     before = snapshot(file)

@@ -60,6 +60,21 @@ LEGACY_START_MARKER = "<!-- agentchat-skill:start -->"
 LEGACY_END_MARKER = "<!-- agentchat-skill:end -->"
 
 _HANDLE_PLACEHOLDER = "<handle>"
+# What counts as space around a line, a body or a word: JavaScript's ``trim()``
+# and ``\s`` set, so this kit and the TypeScript one read the same text the
+# same way (``str.strip()`` alone differs: it keeps U+FEFF and strips
+# U+001C-U+001F and U+0085).
+_WS = "\t\n\x0b\x0c\r \u00a0\u1680" + "".join(chr(c) for c in range(0x2000, 0x200B)) + "\u2028\u2029\u202f\u205f\u3000\ufeff"
+_WS_CLASS = r"[\t\n\x0b\x0c\r \u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000\ufeff]"
+_WS_RUN = re.compile(_WS_CLASS + "+")
+
+
+def _trim(text: str) -> str:
+    return text.strip(_WS)
+
+
+def _words(text: str) -> list[str]:
+    return [word for word in _WS_RUN.split(text) if word]
 _HANDLE_LINE_RE = re.compile(r"^<!-- agentchat:handle @?([A-Za-z0-9][A-Za-z0-9_-]*) -->$")
 _HANDLE_CAPTURE = r"@?([A-Za-z0-9][A-Za-z0-9_-]*)"
 # Wordings earlier releases wrote without a handle line.
@@ -72,10 +87,10 @@ _OLD_WORDINGS = (
 def normalize_handle(handle: str) -> str:
     """Handles are canonical lowercase on the wire; a leading ``@`` is
     display only."""
-    trimmed = handle.strip()
+    trimmed = _trim(handle)
     if trimmed.startswith("@"):
         trimmed = trimmed[1:]
-    return trimmed.strip().lower()
+    return _trim(trimmed).lower()
 
 
 def handle_line(handle: str) -> str:
@@ -101,10 +116,10 @@ def render(texts: Any, handle: str) -> str:
     bare = normalize_handle(handle)
     if not bare:
         raise ValueError("anchor.render: the handle is empty")
-    line = _texts_field(texts, "identity_line").strip()
+    line = _trim(_texts_field(texts, "identity_line"))
     if not _names_handle(line, bare):
         template = _texts_field(texts, "identity_line_template")
-        line = template.replace(_HANDLE_PLACEHOLDER, bare).strip() if _HANDLE_PLACEHOLDER in template else ""
+        line = _trim(template.replace(_HANDLE_PLACEHOLDER, bare)) if _HANDLE_PLACEHOLDER in template else ""
     if not _names_handle(line, bare):
         raise ValueError(f"anchor.render: no served identity text names @{bare}")
     return "\n".join([START_MARKER, handle_line(bare), line, END_MARKER])
@@ -148,13 +163,13 @@ def find(text: str, *, template: str | None = None) -> FoundBlock | None:
     marked = False
     kept: list[str] = []
     for line in inner.split("\n"):
-        match = _HANDLE_LINE_RE.match(line.strip()) if not marked else None
+        match = _HANDLE_LINE_RE.match(_trim(line)) if not marked else None
         if match:
             marked = True
             handle = match.group(1).lower()
             continue
         kept.append(line)
-    body = "\n".join(kept).strip()
+    body = _trim("\n".join(kept))
     if handle is None:
         handle = _handle_from_wording(body, template)
     return FoundBlock(
@@ -165,26 +180,33 @@ def find(text: str, *, template: str | None = None) -> FoundBlock | None:
 def replace(text: str, block: str) -> str:
     """``text`` with ``block`` in place of the first block (current or
     legacy) and every other block removed; appended after one blank line
-    when there is none. Idempotent. The text's line breaks are kept: CRLF
-    when most of the user's own lines end so (the block's lines then too),
-    LF otherwise. A block replaced in place keeps whether the text ends with
-    a line break; an appended one always ends with one."""
-    spans = _blocks_of(text)
+    when there is none. Idempotent. The text's line breaks are kept
+    (:func:`_line_break_of`): a CRLF text stays CRLF, the block's lines
+    included. A block replaced in place keeps whether the text ends with a
+    line break; an appended one always ends with one. A leading byte-order
+    mark is kept."""
+    bom = "\ufeff" if text.startswith("\ufeff") else ""
+    body = text[len(bom) :]
+    spans = _blocks_of(body)
     if not spans:
-        eol = _line_break_of(text)
-        trimmed = _TRAILING_BREAKS.sub("", text)
+        cut = _trailing_breaks_at(body)
+        own = body[:cut]
+        eol = _line_break_of([own], [body[cut:]], body)
         fenced = _BREAK.sub(eol, block)
-        return f"{fenced}{eol}" if not trimmed else f"{trimmed}{eol}{eol}{fenced}{eol}"
-    return _rebuild(text, spans, block)
+        return bom + (f"{fenced}{eol}" if not own else f"{own}{eol}{eol}{fenced}{eol}")
+    return bom + _rebuild(body, spans, block)
 
 
 def remove(text: str) -> str:
     """``text`` without any block (current or legacy); unchanged when there
-    is none. Line breaks as :func:`replace` keeps them."""
-    spans = _blocks_of(text)
+    is none. Line breaks and a leading byte-order mark as :func:`replace`
+    keeps them."""
+    bom = "\ufeff" if text.startswith("\ufeff") else ""
+    body = text[len(bom) :]
+    spans = _blocks_of(body)
     if not spans:
         return text
-    return _rebuild(text, spans, None)
+    return bom + _rebuild(body, spans, None)
 
 
 # ─── Whose block it is, and bringing this agent's to the served line ────────
@@ -482,7 +504,7 @@ def _lines_of(text: str) -> list[_Line]:
                 start=at,
                 end=end,
                 next=len(text) + 1 if nl == -1 else nl + 1,
-                trimmed=text[at:end].strip(),
+                trimmed=_trim(text[at:end]),
             )
         )
         if nl == -1:
@@ -519,42 +541,77 @@ def _blocks_of(text: str) -> list[_Span]:
 
 
 _BREAK = re.compile(r"\r?\n")
-_LEADING_BREAKS = re.compile(r"\A(?:\r?\n)+")
-_TRAILING_BREAKS = re.compile(r"(?:\r?\n)+\Z")
 
 
-def _count_breaks(part: str) -> tuple[int, int]:
-    crlf = part.count("\r\n")
-    return crlf, part.count("\n") - crlf
+def _trailing_breaks_at(text: str) -> int:
+    """Where the run of line breaks (LF or CRLF, any mix) that ends ``text``
+    starts. Linear, unlike a regex anchored at the end, which is quadratic
+    on a long run."""
+    at = len(text)
+    while at > 0 and text[at - 1] == "\n":
+        at -= 1
+        if at > 0 and text[at - 1] == "\r":
+            at -= 1
+    return at
 
 
-def _line_break_of(text: str, spans: list[_Span] | None = None) -> str:
-    """The text's line break: CRLF when more of its lines end with CRLF than
-    with a bare LF, else LF (a text with no line break, a tie). Only the text
-    outside ``spans`` is counted when it has a line break: the blocks are
-    replaced, and one an earlier release wrote with LF into a CRLF file must
-    not decide the file's style."""
-    crlf = lf = 0
+def _leading_breaks_end(text: str) -> int:
+    """Where the text after the run of line breaks that starts ``text`` begins."""
     at = 0
-    for start, end in [*((s.start, s.end) for s in spans or []), (len(text), len(text))]:
-        c, n = _count_breaks(text[at:start])
-        crlf, lf = crlf + c, lf + n
-        # A span ends before its end marker's ``\n``, after a CR: that break is the line's CRLF.
-        at = end - 1 if end > 0 and text[end - 1] == "\r" else end
-    if crlf + lf == 0:
-        crlf, lf = _count_breaks(text)
-    return "\r\n" if crlf > lf else "\n"
+    while True:
+        if text.startswith("\n", at):
+            at += 1
+        elif text.startswith("\r\n", at):
+            at += 2
+        else:
+            return at
+
+
+def _majority(parts: list[str]) -> str | None:
+    """CRLF when more of the line breaks in ``parts`` are CRLF than bare LF,
+    LF on a tie; ``None`` when they hold none."""
+    crlf = sum(part.count("\r\n") for part in parts)
+    every = sum(part.count("\n") for part in parts)
+    if every == 0:
+        return None
+    return "\r\n" if crlf > every - crlf else "\n"
+
+
+def _line_break_of(own: list[str], runs: list[str], whole: str) -> str:
+    """The text's line break, by majority (a tie is LF), counted first over
+    the user's own text (``own``: everything outside the blocks but the line
+    breaks next to them); when that holds none, over those line breaks
+    (``runs``, which :func:`replace` normalises to one blank line); when
+    there are none either, over the whole text. The blocks are replaced, so
+    a block an earlier release wrote with LF into a CRLF file does not decide
+    the style; and the runs, which a replacement rewrites, decide only when
+    nothing else can, so replacing again gives the same text."""
+    return _majority(own) or _majority(runs) or _majority([whole]) or "\n"
 
 
 def _rebuild(text: str, spans: list[_Span], replacement: str | None) -> str:
-    first, last = spans[0], spans[-1]
-    eol = _line_break_of(text, spans)
-    parts: list[str] = [_TRAILING_BREAKS.sub("", text[: first.start])]
-    if replacement is not None:
-        parts.append(_BREAK.sub(eol, replacement))
-    for previous, current in zip(spans, spans[1:]):
-        parts.append(_TRAILING_BREAKS.sub("", _LEADING_BREAKS.sub("", text[previous.end : current.start])))
-    parts.append(_LEADING_BREAKS.sub("", text[last.end :]))
+    # The user's text between the blocks, without the line breaks next to them (``runs``).
+    own: list[str] = []
+    runs: list[str] = []
+    before = text[: spans[0].start]
+    cut = _trailing_breaks_at(before)
+    own.append(before[:cut])
+    runs.append(before[cut:])
+    for i, span in enumerate(spans):
+        nxt = spans[i + 1].start if i + 1 < len(spans) else len(text)
+        part = text[span.end : nxt]
+        lead = _leading_breaks_end(part)
+        # A span ends before its end marker's ``\n``, after a CR: that break is the line's CRLF.
+        runs.append(("\r" if lead > 0 and span.end > 0 and text[span.end - 1] == "\r" else "") + part[:lead])
+        rest = part[lead:]
+        if i + 1 == len(spans):
+            own.append(rest)  # the text after the last block keeps its own last line breaks
+        else:
+            trail = _trailing_breaks_at(rest)
+            own.append(rest[:trail])
+            runs.append(rest[trail:])
+    eol = _line_break_of(own, runs, text)
+    parts = [own[0], *([_BREAK.sub(eol, replacement)] if replacement is not None else []), *own[1:]]
     kept = [part for part in parts if part]
     if not kept:
         return ""
@@ -572,7 +629,7 @@ def _names_handle(line: str, bare: str, flags: int = 0) -> bool:
 
 def _normalized(text: str) -> str:
     """Line endings read as LF, the space around it trimmed: how a block's body is compared."""
-    return text.replace("\r\n", "\n").strip()
+    return _trim(text.replace("\r\n", "\n"))
 
 
 # A handle as the server writes it into a served text: canonical, lower-case.
@@ -587,7 +644,7 @@ def _filled_handle(body: str, template: str) -> str | None:
         return None
     head, *rest = shape.split(_HANDLE_PLACEHOLDER)
     pattern = re.escape(head) + _SERVED_HANDLE
-    pattern += "".join(("" if i == 0 else r"\1") + re.escape(part) for i, part in enumerate(rest))
+    pattern += "".join(("" if i == 0 else r"(?:\1)") + re.escape(part) for i, part in enumerate(rest))
     match = re.fullmatch(pattern, body)
     return match.group(1) if match else None
 
@@ -638,7 +695,7 @@ def _decide_or_raise(
         return leave("failed", bare, f"the served identity line is empty; nothing in {where} is followed")
     if not _names_handle(line, bare):
         return leave("failed", bare, f"the served identity line does not name @{bare}; nothing is written to {where}")
-    if any(part.strip() in _MARKER_LINES for part in line.split("\n")):
+    if any(_trim(part) in _MARKER_LINES for part in line.split("\n")):
         return leave("failed", bare, f"the served identity line holds an AgentChat marker line; nothing is written to {where}")
     served_template = template if isinstance(template, str) else None
     found = find(text, template=served_template)
@@ -685,18 +742,18 @@ def _template_pattern(template: str | None) -> re.Pattern[str] | None:
     if not template or _HANDLE_PLACEHOLDER not in template:
         return None
     index = template.index(_HANDLE_PLACEHOLDER)
-    head = template[:index].split()
-    tail = template[index + len(_HANDLE_PLACEHOLDER) :].split()
+    head = _words(template[:index])
+    tail = _words(template[index + len(_HANDLE_PLACEHOLDER) :])
     if head:
-        words = r"\s+".join(re.escape(word) for word in head)
+        words = (_WS_CLASS + "+").join(re.escape(word) for word in head)
         # ``@`` closes the head when the template writes ``@<handle>``; the
         # capture takes an optional one, so drop a trailing ``@``.
         if words.endswith("@"):
             words = words[:-1]
-        return re.compile(rf"{words}\s*{_HANDLE_CAPTURE}")
+        return re.compile(f"{words}{_WS_CLASS}*{_HANDLE_CAPTURE}")
     if tail:
-        words = r"\s+".join(re.escape(word) for word in tail[:3])
-        return re.compile(rf"{_HANDLE_CAPTURE}\s*{words}")
+        words = (_WS_CLASS + "+").join(re.escape(word) for word in tail[:3])
+        return re.compile(f"{_HANDLE_CAPTURE}{_WS_CLASS}*{words}")
     return None
 
 
@@ -706,7 +763,7 @@ def _handle_from_wording(body: str, template: str | None) -> str | None:
     if from_template is not None:
         patterns.append(from_template)
     patterns.extend(_OLD_WORDINGS)
-    flat = " ".join(body.split())
+    flat = " ".join(_words(body))
     for pattern in patterns:
         match = pattern.search(flat) or pattern.search(body)
         if match and match.group(1):
