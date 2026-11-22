@@ -132,6 +132,7 @@ from .signup import (
 )
 from .texts import Texts, TextsManual, TextsRuntime
 from .wake_check import ClearWakeCheckResult, WakeCheckStatus
+from .wake_link import CreateWakeLinkResult
 from .wake_webhook import (
     ClearWakeWebhookResult,
     KnownWakeDialect,
@@ -203,6 +204,7 @@ __all__ = [
     "CreateGroupRequest",
     "CreateUploadRequest",
     "CreateUploadResponse",
+    "CreateWakeLinkResult",
     "DeletedGroupInfo",
     "DirectConversationLookup",
     "DirectConversationLookupCounterparty",

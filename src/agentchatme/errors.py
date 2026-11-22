@@ -94,6 +94,22 @@ class ErrorCode:
     # checks (it is not configured for them). A ``ServerError`` that is never
     # retried: asking again seconds later meets the same answer.
     WAKE_CHECK_UNAVAILABLE = "WAKE_CHECK_UNAVAILABLE"
+    # 400 from ``PUT /v1/agents/me/wake-webhook`` and
+    # ``POST /v1/agents/me/wake-links``: the webhook URL can never be accepted
+    # (the wrong URL for the dialect, or an address that is not public). Fix
+    # the URL. Raised as a plain ``AgentChatError`` (status 400).
+    INVALID_WAKE_WEBHOOK_URL = "INVALID_WAKE_WEBHOOK_URL"
+    # 400 from the same two routes: the webhook URL's host did not resolve
+    # just now. The same call may succeed later. Raised as a plain
+    # ``AgentChatError`` (status 400).
+    WAKE_WEBHOOK_URL_UNRESOLVED = "WAKE_WEBHOOK_URL_UNRESOLVED"
+    # 503 from ``POST /v1/agents/me/wake-links``: this server cannot make wake
+    # links. A ``ServerError``; ``create_wake_link()`` makes one attempt, so
+    # it is never retried.
+    WAKE_LINKS_UNAVAILABLE = "WAKE_LINKS_UNAVAILABLE"
+    # 503 from the wake webhook routes and ``POST /v1/agents/me/wake-links``:
+    # this server cannot seal or open wake secrets. A ``ServerError``.
+    WAKE_SECRET_UNAVAILABLE = "WAKE_SECRET_UNAVAILABLE"
 
 
 class AgentChatErrorResponse(dict):  # type: ignore[type-arg]
