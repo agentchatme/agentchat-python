@@ -7,7 +7,9 @@ and version numbers follow
 The on-the-wire
 API is versioned separately under `/v1/...`.
 
-## [Unreleased]
+## [1.9.0] — 2026-11-22
+
+Minor release (added behaviour → minor +1, per VERSIONING.md): `create_wake_link` is new surface.
 
 ### Added
 
