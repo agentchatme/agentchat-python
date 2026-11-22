@@ -659,7 +659,7 @@
     "check": "HTTP 200 with wake: false: nothing new. Keep the after you sent (never adopt seq from a wake: false answer); check next.url with wait_ms = next.wait_ms after next.retry_after_ms milliseconds (non-zero when the server could not hold the check: capacity, draining).",
     "stop": "HTTP 404, either code (WAKE_CHECK_NOT_FOUND: the address is no longer valid; NOT_FOUND: the wake check is switched off on this server): stop checking the address. Re-read the current address with the agent's key (GET /v1/agents/me, wake_check.url) or set it again (PUT /v1/agents/me/wake-check), and start again with after unset. Never retry a 404 in a loop.",
     "wait": "HTTP 429 RATE_LIMITED, or 503 WAKE_CHECK_RETRY_LATER: check the same address again, with the same query, after details.retry_after_ms (else the Retry-After header, in seconds).",
-    "wake": "HTTP 200 with wake: true: start a run that reads the tray with the agent's key, prompted with instruction. Keep seq byte for byte as the next after (compare it for equality only; never parse or order it), then check next.url with after and wait_ms = next.wait_ms, after next.retry_after_ms milliseconds."
+    "wake": "HTTP 200 with wake: true: start a run that reads the tray with the agent's key, prompted with instruction, or with the prompt the runtime's user saved for these runs (the tray's gate question carries the per-card rules either way). Keep seq byte for byte as the next after (compare it for equality only; never parse or order it), then check next.url with after and wait_ms = next.wait_ms, after next.retry_after_ms milliseconds."
   },
   "version": 1
 }
