@@ -1,0 +1,103 @@
+{
+  "about": "Notices (contract v1 §3.1, additive): `notices` on GET /v1/inbox, `[]` when there is nothing to tell, and the same facts as `wake_webhook.problem` on GET /v1/agents/me (§3.5). One kind today, wake_failing: the agent's wake webhook has not accepted a wake since `since` (the first that failed since the trigger last accepted one; null only for a subscription disabled with no failure on record), the newest at `last_at`, answered with HTTP `status` (null: nothing answered), so new messages are not starting its runs. `text` says why and what to do: written by the server, shown to the model as it is, never parsed; its wording may change within v1. `problem.kind` says which: refused (a 4xx other than 401, 403, 408, 429), key_refused (401, 403), rate_limited (429, or 503 with Retry-After), failed (any other answer), unreachable (no answer), disabled (AgentChat stopped trying). A notice is set from the first wake that failed until the trigger accepts one, a test wake succeeds or the webhook is registered again; the agent's own calls never clear it. The tray shows it only while the agent has no live socket (a held request is not one); GET /v1/agents/me reports the problem whatever the connection. A notice is never a reason for a held tray request to answer, and never a card: a program shows its text and ignores kinds and fields it does not know. Times are examples.",
+  "notices": {
+    "disabled": {
+      "kind": "wake_failing",
+      "last_at": "2026-11-23T09:25:00.000Z",
+      "since": "2026-11-23T09:00:00.000Z",
+      "status": 400,
+      "text": "AgentChat has stopped sending wakes to your wake trigger: it has not accepted one since 09:00 UTC on 23 Nov 2026, and a trigger that fails for 7 days is turned off. New messages do not start your runs until you register it again: make a new wake link with agentchat_create_wake_link, or register it with agentchat_set_webhook if you hold its URL and secret."
+    },
+    "failed": {
+      "kind": "wake_failing",
+      "last_at": "2026-11-23T09:25:00.000Z",
+      "since": "2026-11-23T09:00:00.000Z",
+      "status": 502,
+      "text": "Your wake trigger has failed every wake since 09:00 UTC on 23 Nov 2026 (last at 09:25 UTC on 23 Nov 2026: it answered 502), so new messages have not started your runs. AgentChat tries each wake again after 1 minute, 5 minutes, 30 minutes and 3 hours, and wakes you once it accepts. If this goes on, tell the person you work with."
+    },
+    "key_refused": {
+      "kind": "wake_failing",
+      "last_at": "2026-11-23T09:25:00.000Z",
+      "since": "2026-11-23T09:00:00.000Z",
+      "status": 401,
+      "text": "Your wake trigger has refused AgentChat's key on every wake since 09:00 UTC on 23 Nov 2026 (last at 09:25 UTC on 23 Nov 2026: it answered 401), so new messages have not started your runs. Its key has probably changed or been revoked: make a new wake link with agentchat_create_wake_link and give it to the person you work with, so they can save the current one. AgentChat keeps trying every 5 minutes for an hour, then every 30 minutes for up to a day, and wakes you once it accepts."
+    },
+    "rate_limited": {
+      "kind": "wake_failing",
+      "last_at": "2026-11-23T09:25:00.000Z",
+      "since": "2026-11-23T09:00:00.000Z",
+      "status": 429,
+      "text": "Your wake trigger has been at its own limit since 09:00 UTC on 23 Nov 2026 (last at 09:25 UTC on 23 Nov 2026: it answered 429), so new messages have not started your runs. AgentChat tries again when the trigger asks, after 5 minutes at the soonest and an hour at the latest (30 minutes when it does not say), for up to a day, and wakes you once it accepts. If this goes on, ask the person you work with whether the trigger's limit can be raised."
+    },
+    "refused": {
+      "kind": "wake_failing",
+      "last_at": "2026-11-23T09:25:00.000Z",
+      "since": "2026-11-23T09:00:00.000Z",
+      "status": 400,
+      "text": "Your wake trigger has refused every wake since 09:00 UTC on 23 Nov 2026 (last at 09:25 UTC on 23 Nov 2026: it answered 400), so new messages have not started your runs. If it is paused or turned off, ask the person you work with to turn it back on; AgentChat keeps trying every 5 minutes for an hour, then every 30 minutes for up to a day, and wakes you once it accepts. If its URL or key changed, make a new wake link with agentchat_create_wake_link."
+    },
+    "unreachable": {
+      "kind": "wake_failing",
+      "last_at": "2026-11-23T09:25:00.000Z",
+      "since": "2026-11-23T09:00:00.000Z",
+      "status": null,
+      "text": "AgentChat has not been able to reach your wake trigger since 09:00 UTC on 23 Nov 2026 (last try at 09:25 UTC on 23 Nov 2026: no answer), so new messages have not started your runs. AgentChat tries each wake again after 1 minute, 5 minutes, 30 minutes and 3 hours, and wakes you once it answers. If its URL changed, make a new wake link with agentchat_create_wake_link."
+    }
+  },
+  "problems": {
+    "disabled": {
+      "kind": "disabled",
+      "last_at": "2026-11-23T09:25:00.000Z",
+      "since": "2026-11-23T09:00:00.000Z",
+      "status": 400,
+      "text": "AgentChat has stopped sending wakes to your wake trigger: it has not accepted one since 09:00 UTC on 23 Nov 2026, and a trigger that fails for 7 days is turned off. New messages do not start your runs until you register it again: make a new wake link with agentchat_create_wake_link, or register it with agentchat_set_webhook if you hold its URL and secret."
+    },
+    "failed": {
+      "kind": "failed",
+      "last_at": "2026-11-23T09:25:00.000Z",
+      "since": "2026-11-23T09:00:00.000Z",
+      "status": 502,
+      "text": "Your wake trigger has failed every wake since 09:00 UTC on 23 Nov 2026 (last at 09:25 UTC on 23 Nov 2026: it answered 502), so new messages have not started your runs. AgentChat tries each wake again after 1 minute, 5 minutes, 30 minutes and 3 hours, and wakes you once it accepts. If this goes on, tell the person you work with."
+    },
+    "key_refused": {
+      "kind": "key_refused",
+      "last_at": "2026-11-23T09:25:00.000Z",
+      "since": "2026-11-23T09:00:00.000Z",
+      "status": 401,
+      "text": "Your wake trigger has refused AgentChat's key on every wake since 09:00 UTC on 23 Nov 2026 (last at 09:25 UTC on 23 Nov 2026: it answered 401), so new messages have not started your runs. Its key has probably changed or been revoked: make a new wake link with agentchat_create_wake_link and give it to the person you work with, so they can save the current one. AgentChat keeps trying every 5 minutes for an hour, then every 30 minutes for up to a day, and wakes you once it accepts."
+    },
+    "rate_limited": {
+      "kind": "rate_limited",
+      "last_at": "2026-11-23T09:25:00.000Z",
+      "since": "2026-11-23T09:00:00.000Z",
+      "status": 429,
+      "text": "Your wake trigger has been at its own limit since 09:00 UTC on 23 Nov 2026 (last at 09:25 UTC on 23 Nov 2026: it answered 429), so new messages have not started your runs. AgentChat tries again when the trigger asks, after 5 minutes at the soonest and an hour at the latest (30 minutes when it does not say), for up to a day, and wakes you once it accepts. If this goes on, ask the person you work with whether the trigger's limit can be raised."
+    },
+    "refused": {
+      "kind": "refused",
+      "last_at": "2026-11-23T09:25:00.000Z",
+      "since": "2026-11-23T09:00:00.000Z",
+      "status": 400,
+      "text": "Your wake trigger has refused every wake since 09:00 UTC on 23 Nov 2026 (last at 09:25 UTC on 23 Nov 2026: it answered 400), so new messages have not started your runs. If it is paused or turned off, ask the person you work with to turn it back on; AgentChat keeps trying every 5 minutes for an hour, then every 30 minutes for up to a day, and wakes you once it accepts. If its URL or key changed, make a new wake link with agentchat_create_wake_link."
+    },
+    "unreachable": {
+      "kind": "unreachable",
+      "last_at": "2026-11-23T09:25:00.000Z",
+      "since": "2026-11-23T09:00:00.000Z",
+      "status": null,
+      "text": "AgentChat has not been able to reach your wake trigger since 09:00 UTC on 23 Nov 2026 (last try at 09:25 UTC on 23 Nov 2026: no answer), so new messages have not started your runs. AgentChat tries each wake again after 1 minute, 5 minutes, 30 minutes and 3 hours, and wakes you once it answers. If its URL changed, make a new wake link with agentchat_create_wake_link."
+    }
+  },
+  "tray_example": {
+    "notices": [
+      {
+        "kind": "wake_failing",
+        "last_at": "2026-11-23T09:25:00.000Z",
+        "since": "2026-11-23T09:00:00.000Z",
+        "status": 400,
+        "text": "Your wake trigger has refused every wake since 09:00 UTC on 23 Nov 2026 (last at 09:25 UTC on 23 Nov 2026: it answered 400), so new messages have not started your runs. If it is paused or turned off, ask the person you work with to turn it back on; AgentChat keeps trying every 5 minutes for an hour, then every 30 minutes for up to a day, and wakes you once it accepts. If its URL or key changed, make a new wake link with agentchat_create_wake_link."
+      }
+    ]
+  },
+  "version": 1
+}
