@@ -34,6 +34,14 @@ from .claim import (
     KnownContainsSecretKind,
     ReleaseClaimResult,
 )
+from .connection import (
+    AgentConnection,
+    ConnectorSignupConnect,
+    ConnectorSignupStatus,
+    EndConnectionResult,
+    RegisterFinish,
+    RegisterStatusResult,
+)
 from .contact import (
     AddContactRequest,
     BlockedAgent,
@@ -178,6 +186,7 @@ __all__ = [
     "Agent",
     # claim
     "AgentClaim",
+    "AgentConnection",
     "AgentConversationContext",
     "AgentConversationContextCounterparty",
     "AgentConversationContextDirectState",
@@ -193,6 +202,8 @@ __all__ = [
     "ClearWakeCheckResult",
     "ClearWakeWebhookResult",
     "ClientAction",
+    "ConnectorSignupConnect",
+    "ConnectorSignupStatus",
     "Contact",
     "ContainsSecretKind",
     # conversation
@@ -209,6 +220,7 @@ __all__ = [
     "DirectConversationLookup",
     "DirectConversationLookupCounterparty",
     "DismissInviteResult",
+    "EndConnectionResult",
     "Group",
     "GroupDetail",
     "GroupInvitation",
@@ -258,7 +270,9 @@ __all__ = [
     "ProcessingFailureEvidence",
     "ProcessingFailureOutcome",
     "RecoverRequest",
+    "RegisterFinish",
     "RegisterRequest",
+    "RegisterStatusResult",
     "ReleaseClaimResult",
     # decision
     "ReplyDecision",

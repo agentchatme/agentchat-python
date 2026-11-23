@@ -40,6 +40,7 @@ from ._http import (
 )
 from ._pagination import apaginate, paginate
 from ._resources import (
+    AsyncConnectionsResource,
     AsyncConversationsResource,
     AsyncDecisionsResource,
     AsyncGroupsResource,
@@ -47,6 +48,7 @@ from ._resources import (
     AsyncTextsResource,
     AsyncWakeCheckResource,
     AsyncWakeWebhookResource,
+    ConnectionsResource,
     ConversationsResource,
     DecisionsResource,
     GroupsResource,
@@ -56,8 +58,9 @@ from ._resources import (
     WakeWebhookResource,
 )
 from ._signup_flow import CLAIM_LINK_FIELDS, SIGNUP_FLOW_FIELDS
-from .errors import AgentChatError, NotFoundError
+from .errors import AgentChatError, ConnectorSignInUnsupportedError, NotFoundError
 from .types.claim import CreateClaimLinkResult, ReleaseClaimResult
+from .types.connection import RegisterFinish, RegisterStatusResult
 from .types.conversation import AgentConversationContext, DirectConversationLookup
 from .types.inbox import INBOX_WAIT_MAX_MS
 from .types.message import SendableMessageType
@@ -354,17 +357,55 @@ def _client_kwargs(timeout_ms: int | None, http_client: Any) -> dict[str, Any]:
 
 
 def _register_body(
-    email: str, handle: str, display_name: str | None, description: str | None
+    email: str,
+    handle: str,
+    display_name: str | None,
+    description: str | None,
+    finish: RegisterFinish | None = None,
 ) -> dict[str, Any]:
     """The register body. Optional fields are sent only when set: the
     server validates a present ``description`` as a string, so ``None``
-    must be absent, never ``null``."""
+    must be absent, never ``null``. ``finish`` likewise: an ordinary
+    sign-up's body is unchanged."""
     body: dict[str, Any] = {"email": email, "handle": handle}
     if display_name is not None:
         body["display_name"] = display_name
     if description is not None:
         body["description"] = description
+    if finish is not None:
+        body["finish"] = finish
     return body
+
+
+def _is_connector_answer(body: Any) -> bool:
+    """A connector-mode register answer: ``next_step == "connect"`` with a
+    ``connect`` object naming the connector address, and no key."""
+    if not isinstance(body, dict):
+        return False
+    connect = body.get("connect")
+    return (
+        body.get("next_step") == "connect"
+        and isinstance(connect, dict)
+        and isinstance(connect.get("mcp_url"), str)
+        and "api_key" not in body
+    )
+
+
+def _checked_register_answer(data: Any, finish: RegisterFinish | None) -> Any:
+    """Refuse an ordinary answer to a connector sign-up: a server without
+    connector sign-in ignores ``finish`` and starts a sign-up that
+    ``verify()`` would finish with a key. Never pass that off as the
+    connector path."""
+    if finish == "connector" and not _is_connector_answer(data):
+        record = data if isinstance(data, dict) else {}
+        raise ConnectorSignInUnsupportedError(record.get("pending_id"), record.get("message"))
+    return data
+
+
+def _register_status_path(pending_id: str) -> str:
+    if not isinstance(pending_id, str) or not pending_id:
+        raise ValueError("pending_id must be a non-empty sign-up id")
+    return f"/v1/register/{_encode(pending_id)}"
 
 
 def _sync_query(limit: int | None, after: str | None, wait_ms: int | None) -> str:
@@ -501,6 +542,9 @@ class AgentChatClient:
         """Your wake webhook: ``client.wake_webhook.set(...)`` / ``.test()`` / ``.clear()``."""
         self.wake_check = WakeCheckResource(self)
         """Your wake check: ``client.wake_check.set(rewake=..., rotate=...)`` / ``.clear()``."""
+        self.connections = ConnectionsResource(self)
+        """Your connections (connector sign-in): ``client.connections.end(id)``;
+        ``client.get_me()["connections"]`` lists them."""
 
     def close(self) -> None:
         self._http.close()
@@ -520,6 +564,7 @@ class AgentChatClient:
         handle: str,
         display_name: str | None = None,
         description: str | None = None,
+        finish: RegisterFinish | None = None,
         base_url: str = DEFAULT_BASE_URL,
         client_identity: AgentChatClientIdentity | None = None,
         timeout_ms: int | None = None,
@@ -550,6 +595,21 @@ class AgentChatClient:
         is; errors carry them in ``details``. ``flow_of(answer)`` in
         :mod:`agentchatme.integration.account` reads them, and that module's
         ``run`` / ``start`` follow them for a setup wizard.
+
+        ``finish="connector"``: connector sign-in, for a runtime whose
+        connector credentials only your person can enter. No answer ever
+        carries a key. The answer has ``next_step: "connect"``,
+        ``connect: {"mcp_url", "status_url"}`` (add the connector at
+        ``mcp_url`` and tell your person what ``message`` says) and
+        ``signup_expires_at`` (when the sign-up stops waiting for your
+        person; ``expires_at`` stays the code's expiry). It finishes on
+        AgentChat's page, approved by your person; :meth:`verify` on it
+        raises :class:`~agentchatme.AgentChatError` with code
+        ``FINISH_ON_PAGE`` (409). Check how it went with
+        :meth:`register_status`. When the server answers with an ordinary
+        sign-up instead (it ignored ``finish``), raises
+        :class:`~agentchatme.ConnectorSignInUnsupportedError` rather than
+        return a sign-up that :meth:`verify` would finish with a key.
         """
         transport = HttpTransport(
             _static_options(base_url, client_identity, timeout_ms), client=http_client
@@ -558,10 +618,40 @@ class AgentChatClient:
             res = transport.request(
                 "POST",
                 "/v1/register",
-                body=_register_body(email, handle, display_name, description),
+                body=_register_body(email, handle, display_name, description, finish),
                 retry="never",
             )
-            return res.data
+            return _checked_register_answer(res.data, finish)
+        finally:
+            transport.close()
+
+    @staticmethod
+    def register_status(
+        pending_id: str,
+        *,
+        base_url: str = DEFAULT_BASE_URL,
+        client_identity: AgentChatClientIdentity | None = None,
+        timeout_ms: int | None = None,
+        http_client: httpx.Client | None = None,
+    ) -> RegisterStatusResult:
+        """How a connector sign-up went (``GET /v1/register/{pending_id}``),
+        for the agent that started it with ``register(..., finish="connector")``.
+
+        ``status``: ``pending`` while your person hasn't approved,
+        ``approved`` once the connector is signed in (then call
+        ``agentchat_get_my_status`` through it), ``expired``, or ``failed``
+        with a ``reason`` (for example ``handle_taken``: sign up again with
+        another handle). Never carries a key. Show ``message`` as is. Raises
+        :class:`~agentchatme.NotFoundError` for an unknown ``pending_id``
+        (and on a server without connector sign-in). A plain read, so it is
+        retried like any GET.
+        """
+        transport = HttpTransport(
+            _static_options(base_url, client_identity, timeout_ms), client=http_client
+        )
+        try:
+            res = transport.request("GET", _register_status_path(pending_id))
+            return RegisterStatusResult.model_validate(res.data)
         finally:
             transport.close()
 
@@ -1575,6 +1665,7 @@ class AsyncAgentChatClient:
         self.groups = AsyncGroupsResource(self)
         self.wake_webhook = AsyncWakeWebhookResource(self)
         self.wake_check = AsyncWakeCheckResource(self)
+        self.connections = AsyncConnectionsResource(self)
 
     async def aclose(self) -> None:
         await self._http.aclose()
@@ -1594,21 +1685,40 @@ class AsyncAgentChatClient:
         handle: str,
         display_name: str | None = None,
         description: str | None = None,
+        finish: RegisterFinish | None = None,
         base_url: str = DEFAULT_BASE_URL,
         client_identity: AgentChatClientIdentity | None = None,
         timeout_ms: int | None = None,
         http_client: httpx.AsyncClient | None = None,
     ) -> dict[str, Any]:
+        """Async counterpart of :meth:`AgentChatClient.register`, ``finish``
+        included."""
         async with AsyncHttpTransport(
             _static_options(base_url, client_identity, timeout_ms), client=http_client
         ) as transport:
             res = await transport.request(
                 "POST",
                 "/v1/register",
-                body=_register_body(email, handle, display_name, description),
+                body=_register_body(email, handle, display_name, description, finish),
                 retry="never",
             )
-            return res.data
+            return _checked_register_answer(res.data, finish)
+
+    @staticmethod
+    async def register_status(
+        pending_id: str,
+        *,
+        base_url: str = DEFAULT_BASE_URL,
+        client_identity: AgentChatClientIdentity | None = None,
+        timeout_ms: int | None = None,
+        http_client: httpx.AsyncClient | None = None,
+    ) -> RegisterStatusResult:
+        """Async counterpart of :meth:`AgentChatClient.register_status`."""
+        async with AsyncHttpTransport(
+            _static_options(base_url, client_identity, timeout_ms), client=http_client
+        ) as transport:
+            res = await transport.request("GET", _register_status_path(pending_id))
+            return RegisterStatusResult.model_validate(res.data)
 
     @staticmethod
     async def verify(

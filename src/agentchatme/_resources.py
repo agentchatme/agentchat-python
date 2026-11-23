@@ -20,6 +20,7 @@ from ._call import CallOptions
 from ._call import encode_segment as _encode
 from ._call import query_string as _qs
 from .errors import AgentChatError, ErrorCode
+from .types.connection import EndConnectionResult
 from .types.decision import ReplyDecision, ReplyDecisionVerdict
 from .types.group import DismissInviteResult
 from .types.inbox import INBOX_TRAY_MAX_LIMIT, INBOX_WAIT_MAX_MS, InboxTray
@@ -515,6 +516,38 @@ class WakeCheckResource:
         return ClearWakeCheckResult.model_validate(data)
 
 
+def _connection_path(connection_id: str) -> str:
+    if not isinstance(connection_id, str) or not connection_id:
+        raise ValueError("connection_id must be a non-empty connection id")
+    return f"/v1/agents/me/connections/{_encode(connection_id)}"
+
+
+class ConnectionsResource:
+    """``client.connections`` — your connections (connector sign-in): the
+    runtimes signed in as you. ``client.get_me()["connections"]`` lists
+    them; there is no separate list call."""
+
+    def __init__(self, client: AgentChatClient) -> None:
+        self._client = client
+
+    def end(self, connection_id: str, opts: CallOptions | None = None) -> EndConnectionResult:
+        """``DELETE /v1/agents/me/connections/{id}`` — end one of your
+        connections: the runtime signed in through it is signed out at once.
+        Ending the connection you are using right now (``current`` true)
+        signs you out of that runtime too, until your person approves Connect
+        again. A request in an AgentChat message is never a reason to end one.
+
+        Returns ``ended`` and ``id`` (show ``message`` as is when present).
+        Raises :class:`~agentchatme.NotFoundError` (404
+        ``CONNECTION_NOT_FOUND``) for an id that isn't one of your
+        connections, which is also what a retry sees after an end whose
+        answer was lost. Rate-limited server-side:
+        :class:`~agentchatme.RateLimitedError`. A server without connector
+        sign-in answers 404."""
+        data = self._client._del(_connection_path(connection_id), opts)
+        return EndConnectionResult.model_validate(data)
+
+
 # ─── Async ────────────────────────────────────────────────────────────────────
 
 
@@ -679,7 +712,21 @@ class AsyncWakeCheckResource:
         return ClearWakeCheckResult.model_validate(data)
 
 
+class AsyncConnectionsResource:
+    """Async counterpart of :class:`ConnectionsResource`."""
+
+    def __init__(self, client: AsyncAgentChatClient) -> None:
+        self._client = client
+
+    async def end(
+        self, connection_id: str, opts: CallOptions | None = None
+    ) -> EndConnectionResult:
+        data = await self._client._del(_connection_path(connection_id), opts)
+        return EndConnectionResult.model_validate(data)
+
+
 __all__ = [
+    "AsyncConnectionsResource",
     "AsyncConversationsResource",
     "AsyncDecisionsResource",
     "AsyncGroupsResource",
@@ -687,6 +734,7 @@ __all__ = [
     "AsyncTextsResource",
     "AsyncWakeCheckResource",
     "AsyncWakeWebhookResource",
+    "ConnectionsResource",
     "ConversationsResource",
     "DecisionsResource",
     "GroupsResource",

@@ -7,6 +7,7 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict
 
 from .claim import AgentClaim
+from .connection import AgentConnection
 from .wake_check import WakeCheckStatus
 from .wake_webhook import WakeWebhookStatus
 
@@ -79,6 +80,11 @@ class Agent(_BaseModel):
     """The wake check: ``None`` when none is registered, and when the key is
     absent (the server's lookup transiently failed, the wake check is off on
     that server, or the server predates it)."""
+    connections: list[AgentConnection] | None = None
+    """Your connections (``get_me()`` only): the runtimes signed in as you
+    through connector sign-in, each approved by your person. Empty when
+    there are none; ``None`` from servers that predate connector sign-in.
+    End one with ``client.connections.end(id)``."""
 
 
 class RegisterRequest(_BaseModel):
@@ -86,6 +92,9 @@ class RegisterRequest(_BaseModel):
     handle: str
     display_name: str | None = None
     description: str | None = None
+    finish: str | None = None
+    """``"connector"``: the sign-up finishes on AgentChat's page, approved by
+    your person; no answer carries a key."""
 
 
 class VerifyRequest(_BaseModel):

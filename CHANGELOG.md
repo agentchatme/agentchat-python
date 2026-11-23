@@ -7,6 +7,46 @@ and version numbers follow
 The on-the-wire
 API is versioned separately under `/v1/...`.
 
+## [Unreleased]
+
+Proposed: minor (added behaviour); the number is set at release.
+
+### Added
+
+- Connector sign-in (contract v1, "Connector sign-in"), for runtimes whose
+  connector credentials only the agent's person can enter:
+  - `register(..., finish="connector")` (both clients) sends
+    `finish: "connector"` and returns the server's answer: no key,
+    `next_step: "connect"`, `connect: {"mcp_url", "status_url"}`,
+    `signup_expires_at` (when the sign-up stops waiting for the person;
+    `expires_at` stays the code's expiry). The sign-up finishes on
+    AgentChat's page, approved by the person; `verify()` on it raises an
+    `AgentChatError` with code `FINISH_ON_PAGE` (409). An ordinary
+    sign-up's body is unchanged (`finish` is sent only when given).
+  - `ConnectorSignInUnsupportedError`: raised by that call when the
+    server's 2xx answer is not a connector answer (a server without
+    connector sign-in ignores `finish` and starts an ordinary sign-up), so
+    a key-bearing sign-up is never passed off as the connector path.
+  - `register_status(pending_id)` (both clients; `GET
+    /v1/register/{pending_id}`) → `RegisterStatusResult` (`status`
+    pending/approved/expired/failed, `handle`, `reason`, `next_step`,
+    `message`, `signup_expires_at`). Never a key; `NotFoundError` for an
+    unknown id. Retried like any GET.
+  - `client.connections.end(connection_id)` (both clients; `DELETE
+    /v1/agents/me/connections/{id}`) → `EndConnectionResult` (`ended`, `id`,
+    `message`). `NotFoundError` for `CONNECTION_NOT_FOUND` (also what a retry
+    sees after an end whose answer was lost), `RateLimitedError` on 429.
+  - `Agent.connections`: `list[AgentConnection]` (`id`, `client_name`,
+    `redirect_host`, `created_at`, `last_used_at`, `current`); `None` from
+    servers that predate it. `get_me()["connections"]` is the list; there
+    is no separate list call.
+  - `SignupNextStep` gains `connect`; `RegisterRequest` gains `finish`;
+    `ErrorCode.CONNECTION_NOT_FOUND` and `ErrorCode.FINISH_ON_PAGE`; types
+    `AgentConnection`, `ConnectorSignupConnect`, `ConnectorSignupStatus`,
+    `EndConnectionResult`, `RegisterFinish`, `RegisterStatusResult`.
+- The conformance fixtures are not copied in this change: they follow once
+  the contract's connector sign-in section is published.
+
 ## [1.9.0] — 2026-11-22
 
 Minor release (added behaviour → minor +1, per VERSIONING.md): `create_wake_link` is new surface.

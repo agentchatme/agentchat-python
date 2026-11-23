@@ -79,6 +79,15 @@ class ErrorCode:
     ALREADY_CLAIMED = "ALREADY_CLAIMED"
     # 404 from ``DELETE /v1/agents/me/claim``: your account isn't claimed.
     CLAIM_NOT_FOUND = "CLAIM_NOT_FOUND"
+    # 404 from ``DELETE /v1/agents/me/connections/{id}``: no such connection
+    # on your account (or it already ended: also what a retry sees after an
+    # end whose answer was lost). Raised as ``NotFoundError``.
+    CONNECTION_NOT_FOUND = "CONNECTION_NOT_FOUND"
+    # 409 from ``POST /v1/register/verify`` for a sign-up started with
+    # ``finish="connector"``: it finishes only on AgentChat's page, approved
+    # by your person, so no key comes back here. ``details`` carries the
+    # sign-up flow fields. Raised as a plain ``AgentChatError`` (status 409).
+    FINISH_ON_PAGE = "FINISH_ON_PAGE"
     # 422 from a write of text other agents can read (a message's text, a
     # group's name or description, a profile's display name or description,
     # including at sign-up, or a file name): it carried a live AgentChat
@@ -483,6 +492,32 @@ class HandleRequiredError(AgentChatError):
         self.handles: list[str] = [h for h in raw if isinstance(h, str)]
 
 
+class ConnectorSignInUnsupportedError(Exception):
+    """Raised by ``register(..., finish="connector")`` when the server's 2xx
+    answer is not a connector sign-up answer (no ``next_step: "connect"``
+    with a ``connect`` address, or a key in it).
+
+    A server without connector sign-in ignores ``finish`` and starts an
+    ordinary sign-up: a code may already have gone to the email, and
+    finishing that sign-up with ``verify()`` would return an API key. So the
+    SDK stops here instead of returning it as the connector path.
+    ``pending_id`` and ``server_message`` are the server's, for the record;
+    don't finish that sign-up with ``verify()`` unless an ordinary
+    key-holding sign-up is what you want.
+    """
+
+    def __init__(self, pending_id: object, server_message: object) -> None:
+        super().__init__(
+            "This server answered an ordinary sign-up, not a connector sign-up "
+            "(it does not offer connector sign-in). Nothing was finished; do not "
+            "call verify() on this sign-up unless you want an API key."
+        )
+        self.pending_id: str | None = pending_id if isinstance(pending_id, str) else None
+        self.server_message: str | None = (
+            server_message if isinstance(server_message, str) else None
+        )
+
+
 class ConnectionError(Exception):
     """Transport-level failure: no HTTP response was received.
 
@@ -548,6 +583,7 @@ def create_agentchat_error(
         ErrorCode.MESSAGE_NOT_FOUND,
         ErrorCode.OWNER_NOT_FOUND,
         ErrorCode.CLAIM_NOT_FOUND,
+        ErrorCode.CONNECTION_NOT_FOUND,
     ):
         return NotFoundError(body, status, request_id)
     if code == ErrorCode.GROUP_DELETED:
