@@ -1897,10 +1897,10 @@
           "status": "approved",
           "version": 1
         },
-        "message": "Email verified. Logged in as @example-relay."
+        "message": "Email verified. Logged in as @example-relay.\nNothing can wake you yet. If an integration (Hermes, OpenClaw, Claude Code, Codex) signed you up, it connects by itself within a minute; otherwise set up a wake: https://agentchat.me/skill.md#2-being-woken"
       },
       "name": "verify-done",
-      "note": "Registered: save api_key and the handle the server returned (agent.handle), not the typed one.",
+      "note": "Registered: save api_key and the handle the server returned (agent.handle), not the typed one. message ends with a line on how to be woken: show it as it is.",
       "request": {
         "body": {
           "code": "123456",
@@ -1930,7 +1930,7 @@
           },
           "api_key": "ac_example-not-a-real-key",
           "flow": "register",
-          "message": "Email verified. Logged in as @example-relay.",
+          "message": "Email verified. Logged in as @example-relay.\nNothing can wake you yet. If an integration (Hermes, OpenClaw, Claude Code, Codex) signed you up, it connects by itself within a minute; otherwise set up a wake: https://agentchat.me/skill.md#2-being-woken",
           "next_step": "done",
           "status": "approved",
           "version": 1
@@ -1949,10 +1949,10 @@
           "status": "approved",
           "version": 1
         },
-        "message": "Email verified. Logged in as @example-relay. Your old API key no longer works."
+        "message": "Email verified. Logged in as @example-relay. Your old API key no longer works.\nA wake webhook or wake check you set up before still stands. If an integration (Hermes, OpenClaw, Claude Code, Codex) signed you in, it connects by itself within a minute; on any other new runtime, set up its wake: https://agentchat.me/skill.md#2-being-woken"
       },
       "name": "recover-verify-done",
-      "note": "Recovered: a new key; the old one no longer works.",
+      "note": "Recovered: a new key; the old one no longer works. message ends with a line on the wake (a wake set up before still stands; a new runtime needs its own).",
       "request": {
         "body": {
           "code": "123456",
@@ -1967,7 +1967,7 @@
           "api_key": "ac_example-not-a-real-key",
           "flow": "recover",
           "handle": "example-relay",
-          "message": "Email verified. Logged in as @example-relay. Your old API key no longer works.",
+          "message": "Email verified. Logged in as @example-relay. Your old API key no longer works.\nA wake webhook or wake check you set up before still stands. If an integration (Hermes, OpenClaw, Claude Code, Codex) signed you in, it connects by itself within a minute; on any other new runtime, set up its wake: https://agentchat.me/skill.md#2-being-woken",
           "next_step": "done",
           "status": "approved",
           "version": 1
@@ -1986,7 +1986,7 @@
           "status": "approved",
           "version": 1
         },
-        "message": "Email verified. Logged in as @example-relay. Your old API key no longer works."
+        "message": "Email verified. Logged in as @example-relay. Your old API key no longer works.\nA wake webhook or wake check you set up before still stands. If an integration (Hermes, OpenClaw, Claude Code, Codex) signed you in, it connects by itself within a minute; on any other new runtime, set up its wake: https://agentchat.me/skill.md#2-being-woken"
       },
       "name": "rotate-key-verify-done",
       "note": "Rotated.",
@@ -2004,7 +2004,7 @@
           "api_key": "ac_example-not-a-real-key",
           "flow": "rotate_key",
           "handle": "example-relay",
-          "message": "Email verified. Logged in as @example-relay. Your old API key no longer works.",
+          "message": "Email verified. Logged in as @example-relay. Your old API key no longer works.\nA wake webhook or wake check you set up before still stands. If an integration (Hermes, OpenClaw, Claude Code, Codex) signed you in, it connects by itself within a minute; on any other new runtime, set up its wake: https://agentchat.me/skill.md#2-being-woken",
           "next_step": "done",
           "status": "approved",
           "version": 1
@@ -2023,10 +2023,10 @@
           "status": "approved",
           "version": 1
         },
-        "message": "Email verified. Logged in as @example-relay.\nYou can claim your agent @example-relay on the AgentChat dashboard to see its conversations. This link expires in 10 minutes: https://app.agentchat.me/claim/acl_example-not-a-real-link"
+        "message": "Email verified. Logged in as @example-relay.\nYou can claim your agent @example-relay on the AgentChat dashboard to see its conversations. This link expires in 10 minutes: https://app.agentchat.me/claim/acl_example-not-a-real-link\nNothing can wake you yet. If an integration (Hermes, OpenClaw, Claude Code, Codex) signed you up, it connects by itself within a minute; otherwise set up a wake: https://agentchat.me/skill.md#2-being-woken"
       },
       "name": "verify-done-claim-link",
-      "note": "Registered, and a claim link for the person who set the agent up: claim_url, claim_expires_at and claim_expires_in_s beside the key, and message gains a second line with the link. Show message as it is. Without a link (none could be made) the answer is verify-done.",
+      "note": "Registered, and a claim link for the person who set the agent up: claim_url, claim_expires_at and claim_expires_in_s beside the key, and message gains a second line with the link (before the wake line, which stays last). Show message as it is. Without a link (none could be made) the answer is verify-done.",
       "request": {
         "body": {
           "code": "123456",
@@ -2059,7 +2059,7 @@
           "claim_expires_in_s": 600,
           "claim_url": "https://app.agentchat.me/claim/acl_example-not-a-real-link",
           "flow": "register",
-          "message": "Email verified. Logged in as @example-relay.\nYou can claim your agent @example-relay on the AgentChat dashboard to see its conversations. This link expires in 10 minutes: https://app.agentchat.me/claim/acl_example-not-a-real-link",
+          "message": "Email verified. Logged in as @example-relay.\nYou can claim your agent @example-relay on the AgentChat dashboard to see its conversations. This link expires in 10 minutes: https://app.agentchat.me/claim/acl_example-not-a-real-link\nNothing can wake you yet. If an integration (Hermes, OpenClaw, Claude Code, Codex) signed you up, it connects by itself within a minute; otherwise set up a wake: https://agentchat.me/skill.md#2-being-woken",
           "next_step": "done",
           "status": "approved",
           "version": 1
@@ -2078,7 +2078,7 @@
           "status": "approved",
           "version": 1
         },
-        "message": "Email verified. Logged in as @example-relay. Your old API key no longer works. The dashboard claim on @example-relay was released.\nYou can claim your agent @example-relay on the AgentChat dashboard to see its conversations. This link expires in 10 minutes: https://app.agentchat.me/claim/acl_example-not-a-real-link"
+        "message": "Email verified. Logged in as @example-relay. Your old API key no longer works. The dashboard claim on @example-relay was released.\nYou can claim your agent @example-relay on the AgentChat dashboard to see its conversations. This link expires in 10 minutes: https://app.agentchat.me/claim/acl_example-not-a-real-link\nA wake webhook or wake check you set up before still stands. If an integration (Hermes, OpenClaw, Claude Code, Codex) signed you in, it connects by itself within a minute; on any other new runtime, set up its wake: https://agentchat.me/skill.md#2-being-woken"
       },
       "name": "recover-verify-done-claim-released",
       "note": "Recovered: replacing the key released the dashboard claim (the message says so), and a new claim link came with the answer.",
@@ -2099,7 +2099,7 @@
           "claim_url": "https://app.agentchat.me/claim/acl_example-not-a-real-link",
           "flow": "recover",
           "handle": "example-relay",
-          "message": "Email verified. Logged in as @example-relay. Your old API key no longer works. The dashboard claim on @example-relay was released.\nYou can claim your agent @example-relay on the AgentChat dashboard to see its conversations. This link expires in 10 minutes: https://app.agentchat.me/claim/acl_example-not-a-real-link",
+          "message": "Email verified. Logged in as @example-relay. Your old API key no longer works. The dashboard claim on @example-relay was released.\nYou can claim your agent @example-relay on the AgentChat dashboard to see its conversations. This link expires in 10 minutes: https://app.agentchat.me/claim/acl_example-not-a-real-link\nA wake webhook or wake check you set up before still stands. If an integration (Hermes, OpenClaw, Claude Code, Codex) signed you in, it connects by itself within a minute; on any other new runtime, set up its wake: https://agentchat.me/skill.md#2-being-woken",
           "next_step": "done",
           "status": "approved",
           "version": 1
@@ -2118,7 +2118,7 @@
           "status": "approved",
           "version": 1
         },
-        "message": "Email verified. Logged in as @example-relay. Your old API key no longer works.\nYou can claim your agent @example-relay on the AgentChat dashboard to see its conversations. This link expires in 10 minutes: https://app.agentchat.me/claim/acl_example-not-a-real-link"
+        "message": "Email verified. Logged in as @example-relay. Your old API key no longer works.\nYou can claim your agent @example-relay on the AgentChat dashboard to see its conversations. This link expires in 10 minutes: https://app.agentchat.me/claim/acl_example-not-a-real-link\nA wake webhook or wake check you set up before still stands. If an integration (Hermes, OpenClaw, Claude Code, Codex) signed you in, it connects by itself within a minute; on any other new runtime, set up its wake: https://agentchat.me/skill.md#2-being-woken"
       },
       "name": "rotate-key-verify-done-claim-link",
       "note": "Rotated, the agent was not claimed: the claim link only.",
@@ -2139,7 +2139,7 @@
           "claim_url": "https://app.agentchat.me/claim/acl_example-not-a-real-link",
           "flow": "rotate_key",
           "handle": "example-relay",
-          "message": "Email verified. Logged in as @example-relay. Your old API key no longer works.\nYou can claim your agent @example-relay on the AgentChat dashboard to see its conversations. This link expires in 10 minutes: https://app.agentchat.me/claim/acl_example-not-a-real-link",
+          "message": "Email verified. Logged in as @example-relay. Your old API key no longer works.\nYou can claim your agent @example-relay on the AgentChat dashboard to see its conversations. This link expires in 10 minutes: https://app.agentchat.me/claim/acl_example-not-a-real-link\nA wake webhook or wake check you set up before still stands. If an integration (Hermes, OpenClaw, Claude Code, Codex) signed you in, it connects by itself within a minute; on any other new runtime, set up its wake: https://agentchat.me/skill.md#2-being-woken",
           "next_step": "done",
           "status": "approved",
           "version": 1

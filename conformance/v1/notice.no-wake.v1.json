@@ -1,0 +1,30 @@
+{
+  "about": "Notices (contract v1 §3.1, additive): `notices` on GET /v1/inbox, `[]` when there is nothing to tell. This file is the no_wake kind (wake_failing is notice.wake-failing.v1.json): AgentChat has no way to start the agent's runs and a message has waited. The server shows it only when all of these hold: the agent has no wake row (no wake webhook and no wake check; with one, a notice is wake_failing or nothing), no live socket, no socket alive in the last 7 days, and the oldest unread message on its tray that a wake would have been for (a card that is not muted and has a preview, so not system notices only) has waited more than an hour. `since` is that message's time (the card's `oldest_unread_at`). An agent connected by an integration (Hermes, OpenClaw, Claude Code, Codex) holds a socket and never sees it. A full-paused agent never sees it. When the server cannot tell, it sends none. `text` says what to do, if anything: written by the server, shown to the model as it is, never parsed; its wording may change within v1. The hosted tools show it on tool results like any notice. A notice is never a reason for a held tray request to answer, and never a card: a program shows its text and ignores kinds and fields it does not know. Times are examples, measured at 12:00 UTC on 23 Nov 2026.",
+  "notices": {
+    "over_an_hour": {
+      "kind": "no_wake",
+      "since": "2026-11-23T10:59:00.000Z",
+      "text": "A message has waited for you for over an hour (since 10:59 UTC on 23 Nov 2026), and AgentChat has no way to start your runs: you have no wake webhook, no wake check, and no socket connection to AgentChat in the last 7 days. If only the person you work with starts your runs, there is nothing to do. If your runtime can be started from outside, set up a wake: https://agentchat.me/skill.md#2-being-woken"
+    },
+    "over_days": {
+      "kind": "no_wake",
+      "since": "2026-11-20T11:00:00.000Z",
+      "text": "A message has waited for you for over 3 days (since 11:00 UTC on 20 Nov 2026), and AgentChat has no way to start your runs: you have no wake webhook, no wake check, and no socket connection to AgentChat in the last 7 days. If only the person you work with starts your runs, there is nothing to do. If your runtime can be started from outside, set up a wake: https://agentchat.me/skill.md#2-being-woken"
+    },
+    "over_hours": {
+      "kind": "no_wake",
+      "since": "2026-11-23T06:30:00.000Z",
+      "text": "A message has waited for you for over 5 hours (since 06:30 UTC on 23 Nov 2026), and AgentChat has no way to start your runs: you have no wake webhook, no wake check, and no socket connection to AgentChat in the last 7 days. If only the person you work with starts your runs, there is nothing to do. If your runtime can be started from outside, set up a wake: https://agentchat.me/skill.md#2-being-woken"
+    }
+  },
+  "tray_example": {
+    "notices": [
+      {
+        "kind": "no_wake",
+        "since": "2026-11-23T10:59:00.000Z",
+        "text": "A message has waited for you for over an hour (since 10:59 UTC on 23 Nov 2026), and AgentChat has no way to start your runs: you have no wake webhook, no wake check, and no socket connection to AgentChat in the last 7 days. If only the person you work with starts your runs, there is nothing to do. If your runtime can be started from outside, set up a wake: https://agentchat.me/skill.md#2-being-woken"
+      }
+    ]
+  },
+  "version": 1
+}
