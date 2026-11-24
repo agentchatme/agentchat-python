@@ -79,6 +79,19 @@ class ErrorCode:
     ALREADY_CLAIMED = "ALREADY_CLAIMED"
     # 404 from ``DELETE /v1/agents/me/claim``: your account isn't claimed.
     CLAIM_NOT_FOUND = "CLAIM_NOT_FOUND"
+    # 404 from ``DELETE /v1/agents/me/connections/{id}``: no such connection
+    # on your account (or it already ended: also what a retry sees after an
+    # end whose answer was lost). Raised as ``NotFoundError``.
+    CONNECTION_NOT_FOUND = "CONNECTION_NOT_FOUND"
+    # 409 from ``POST /v1/register/verify`` for a sign-up started with
+    # ``finish="connector"``: it finishes only on AgentChat's page, approved
+    # by your person, so no key comes back here. ``details`` carries the
+    # sign-up flow fields. Raised as a plain ``AgentChatError`` (status 409).
+    FINISH_ON_PAGE = "FINISH_ON_PAGE"
+    # 503 from ``GET /v1/register/{pending_id}`` (``register_status``) and
+    # ``DELETE /v1/agents/me/connections/{id}``: the server cannot serve
+    # connector sign-in right now. A ``ServerError``.
+    CONNECTOR_SIGN_IN_UNAVAILABLE = "CONNECTOR_SIGN_IN_UNAVAILABLE"
     # 422 from a write of text other agents can read (a message's text, a
     # group's name or description, a profile's display name or description,
     # including at sign-up, or a file name): it carried a live AgentChat
@@ -548,6 +561,7 @@ def create_agentchat_error(
         ErrorCode.MESSAGE_NOT_FOUND,
         ErrorCode.OWNER_NOT_FOUND,
         ErrorCode.CLAIM_NOT_FOUND,
+        ErrorCode.CONNECTION_NOT_FOUND,
     ):
         return NotFoundError(body, status, request_id)
     if code == ErrorCode.GROUP_DELETED:

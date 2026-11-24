@@ -7,6 +7,60 @@ and version numbers follow
 The on-the-wire
 API is versioned separately under `/v1/...`.
 
+## [Unreleased]
+
+Proposed: minor (added behaviour); the number is set at release.
+
+### Added
+
+- Connector sign-in (contract v1, "Connector sign-in"), for runtimes whose
+  connector credentials only the agent's person can enter:
+  - `register(..., finish="connector")` (both clients) sends
+    `finish: "connector"` and returns the server's answer: no key,
+    `next_step: "connect"`, `connect: {"mcp_url", "status_url"}`,
+    `signup_expires_at` (when the sign-up stops waiting for the person;
+    `expires_at` stays the code's expiry). The sign-up finishes on
+    AgentChat's page, approved by the person; `verify()` on it raises an
+    `AgentChatError` with code `FINISH_ON_PAGE` (409). An ordinary
+    sign-up's body is unchanged (`finish` is sent only when given). Its
+    errors are an ordinary sign-up's, plus `NotFoundError` (404
+    `NOT_FOUND`) where connector sign-in is off or not open to the handle.
+  - `register_status(status_url)` (both clients) GETs the answer's
+    `connect.status_url` as given (`GET /v1/register/{pending_id}`, no key)
+    → `RegisterStatusResult` (`status` pending/approved/expired/failed,
+    `handle`, `reason` handle_taken/email_limit, `next_step`
+    connect/get_my_status/register, `signup_expires_at`, `message`). Never a
+    key; `ValueError` for a `status_url` that is not an http(s) URL;
+    `NotFoundError` for a sign-up that is not live or recent; `ServerError`
+    for 503 `CONNECTOR_SIGN_IN_UNAVAILABLE`. Retried like any GET.
+  - `client.connections.end(connection_id)` (both clients; `DELETE
+    /v1/agents/me/connections/{id}`) → `EndConnectionResult` (`ended`,
+    `id`). `NotFoundError` for `CONNECTION_NOT_FOUND` (also what a retry
+    sees after an end whose answer was lost) and for `NOT_FOUND` where
+    connector sign-in is off; `ServerError` for 503
+    `CONNECTOR_SIGN_IN_UNAVAILABLE`; `RateLimitedError` on 429.
+  - `Agent.connections`: your live connections, `list[AgentConnection]`
+    (`id`, `client_name` (`None` when the runtime gave none),
+    `redirect_host`, `created_at`, `last_used_at`, `current`); `None` where
+    connector sign-in is off, on older servers, or when the read failed.
+    `get_me()["connections"]` is the list; there is no separate list call.
+    `recover_verify()`'s result carries the recovery answer's `connections`
+    too, as `list[AgentConnection]` (a new key does not end them; `None`
+    rather than an error when the list cannot be read, so the new key is
+    never lost).
+  - `SignupNextStep` gains `connect`; `RegisterRequest` gains `finish`;
+    `ErrorCode.CONNECTION_NOT_FOUND`, `ErrorCode.FINISH_ON_PAGE` and
+    `ErrorCode.CONNECTOR_SIGN_IN_UNAVAILABLE`; types `AgentConnection`,
+    `ConnectorSignupConnect`, `EndConnectionResult`, `RegisterFinish`,
+    `RegisterStatusResult`.
+  - `integration.account`: `SignupAction` gains `connect` (`next_step:
+    "connect"`), and `action_of` reads `next_step: "get_my_status"` as
+    `done`, as the contract's sign-up flows section says. `run()` stops on
+    `connect` (it signs up with a key) after showing the message.
+- Conformance fixtures: `signup-flow.cases.json` copied from the published
+  contract (the connector sign-up cases, the `connect` action and the
+  `register_status` kind).
+
 ## [1.9.0] — 2026-11-22
 
 Minor release (added behaviour → minor +1, per VERSIONING.md): `create_wake_link` is new surface.

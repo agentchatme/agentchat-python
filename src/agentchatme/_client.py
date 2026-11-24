@@ -22,6 +22,7 @@ from typing import (
 )
 
 import httpx
+import pydantic
 
 from ._call import CallOptions
 from ._call import encode_segment as _encode
@@ -40,6 +41,7 @@ from ._http import (
 )
 from ._pagination import apaginate, paginate
 from ._resources import (
+    AsyncConnectionsResource,
     AsyncConversationsResource,
     AsyncDecisionsResource,
     AsyncGroupsResource,
@@ -47,6 +49,7 @@ from ._resources import (
     AsyncTextsResource,
     AsyncWakeCheckResource,
     AsyncWakeWebhookResource,
+    ConnectionsResource,
     ConversationsResource,
     DecisionsResource,
     GroupsResource,
@@ -58,6 +61,7 @@ from ._resources import (
 from ._signup_flow import CLAIM_LINK_FIELDS, SIGNUP_FLOW_FIELDS
 from .errors import AgentChatError, NotFoundError
 from .types.claim import CreateClaimLinkResult, ReleaseClaimResult
+from .types.connection import AgentConnection, RegisterFinish, RegisterStatusResult
 from .types.conversation import AgentConversationContext, DirectConversationLookup
 from .types.inbox import INBOX_WAIT_MAX_MS
 from .types.message import SendableMessageType
@@ -248,12 +252,26 @@ class RecoverVerifyResult(tuple[str, str, _ClientT], _SignupFlowFields, Generic[
     """
 
     _signup_fields: dict[str, Any]
+    connections: list[AgentConnection] | None
+    """Your live connections (connector sign-in), on a server where it is
+    on: a new key does not end them, since they are separate credentials.
+    End one you don't recognize with ``client.connections.end(id)``.
+    ``None`` when the server has connector sign-in off, predates it, or the
+    read failed, and when the list is not one this SDK can read (the new key
+    is never lost over it)."""
 
     def __new__(
         cls, handle: str, api_key: str, client: _ClientT, *, data: Any = None
     ) -> RecoverVerifyResult[_ClientT]:
         self = super().__new__(cls, (handle, api_key, client))
         self._set_signup_fields(data)
+        raw = data.get("connections") if isinstance(data, dict) else None
+        try:
+            self.connections = (
+                [AgentConnection.model_validate(c) for c in raw] if isinstance(raw, list) else None
+            )
+        except pydantic.ValidationError:
+            self.connections = None
         return self
 
 
@@ -354,17 +372,36 @@ def _client_kwargs(timeout_ms: int | None, http_client: Any) -> dict[str, Any]:
 
 
 def _register_body(
-    email: str, handle: str, display_name: str | None, description: str | None
+    email: str,
+    handle: str,
+    display_name: str | None,
+    description: str | None,
+    finish: RegisterFinish | None = None,
 ) -> dict[str, Any]:
     """The register body. Optional fields are sent only when set: the
     server validates a present ``description`` as a string, so ``None``
-    must be absent, never ``null``."""
+    must be absent, never ``null``. ``finish`` likewise: an ordinary
+    sign-up's body is unchanged."""
     body: dict[str, Any] = {"email": email, "handle": handle}
     if display_name is not None:
         body["display_name"] = display_name
     if description is not None:
         body["description"] = description
+    if finish is not None:
+        body["finish"] = finish
     return body
+
+
+def _status_target(status_url: str) -> tuple[str, str]:
+    """``connect.status_url`` as the server gave it, split into the origin
+    the transport calls and the path (with any query) it GETs."""
+    try:
+        url = httpx.URL(status_url) if isinstance(status_url, str) else None
+    except httpx.InvalidURL:
+        url = None
+    if url is None or url.scheme not in ("http", "https") or not url.host:
+        raise ValueError("status_url must be the http(s) connect.status_url of a connector sign-up")
+    return f"{url.scheme}://{url.netloc.decode('ascii')}", url.raw_path.decode("ascii")
 
 
 def _sync_query(limit: int | None, after: str | None, wait_ms: int | None) -> str:
@@ -501,6 +538,9 @@ class AgentChatClient:
         """Your wake webhook: ``client.wake_webhook.set(...)`` / ``.test()`` / ``.clear()``."""
         self.wake_check = WakeCheckResource(self)
         """Your wake check: ``client.wake_check.set(rewake=..., rotate=...)`` / ``.clear()``."""
+        self.connections = ConnectionsResource(self)
+        """Your connections (connector sign-in): ``client.connections.end(id)``;
+        ``client.get_me()["connections"]`` lists them."""
 
     def close(self) -> None:
         self._http.close()
@@ -520,6 +560,7 @@ class AgentChatClient:
         handle: str,
         display_name: str | None = None,
         description: str | None = None,
+        finish: RegisterFinish | None = None,
         base_url: str = DEFAULT_BASE_URL,
         client_identity: AgentChatClientIdentity | None = None,
         timeout_ms: int | None = None,
@@ -550,6 +591,21 @@ class AgentChatClient:
         is; errors carry them in ``details``. ``flow_of(answer)`` in
         :mod:`agentchatme.integration.account` reads them, and that module's
         ``run`` / ``start`` follow them for a setup wizard.
+
+        ``finish="connector"``: connector sign-in, for a runtime whose
+        connector credentials only your person can enter. No answer ever
+        carries a key. The answer has ``next_step: "connect"``,
+        ``connect: {"mcp_url", "status_url"}`` (add the connector at
+        ``mcp_url`` and tell your person what ``message`` says) and
+        ``signup_expires_at`` (when the sign-up stops waiting for your
+        person; ``expires_at`` stays the code's expiry). It finishes on
+        AgentChat's page, approved by your person; :meth:`verify` on it
+        raises :class:`~agentchatme.AgentChatError` with code
+        ``FINISH_ON_PAGE`` (409). Check how it went with
+        ``register_status(answer["connect"]["status_url"])``. Its errors are
+        an ordinary sign-up's, plus :class:`~agentchatme.NotFoundError` (404
+        ``NOT_FOUND``) where connector sign-in is off or not open to this
+        handle.
         """
         transport = HttpTransport(
             _static_options(base_url, client_identity, timeout_ms), client=http_client
@@ -558,10 +614,49 @@ class AgentChatClient:
             res = transport.request(
                 "POST",
                 "/v1/register",
-                body=_register_body(email, handle, display_name, description),
+                body=_register_body(email, handle, display_name, description, finish),
                 retry="never",
             )
             return res.data
+        finally:
+            transport.close()
+
+    @staticmethod
+    def register_status(
+        status_url: str,
+        *,
+        client_identity: AgentChatClientIdentity | None = None,
+        timeout_ms: int | None = None,
+        http_client: httpx.Client | None = None,
+    ) -> RegisterStatusResult:
+        """How a connector sign-up went: GETs ``status_url``, the
+        ``connect.status_url`` of its ``register(..., finish="connector")``
+        answer, as the server gave it (``GET /v1/register/{pending_id}``, no
+        key).
+
+        ``status``: ``pending`` while your person hasn't approved
+        (``next_step: "connect"``: ask again later), ``approved`` once the
+        connector is signed in (``next_step: "get_my_status"``: call it
+        through the connector), ``expired`` (nobody finished it in time, or a
+        newer sign-up with the same handle and email took its place), or
+        ``failed`` with a ``reason`` (``handle_taken``, ``email_limit``);
+        after ``expired`` or ``failed``, ``next_step: "register"``. Never
+        carries a key. Show ``message`` as is. Raises ``ValueError`` for a
+        ``status_url`` that is not an http(s) URL;
+        :class:`~agentchatme.NotFoundError` (404 ``NOT_FOUND``) for a sign-up
+        that is not live or recent (they are kept for a week after they
+        end), and where connector sign-in is off;
+        :class:`~agentchatme.ServerError` for 503
+        ``CONNECTOR_SIGN_IN_UNAVAILABLE``; :class:`~agentchatme.RateLimitedError`
+        on 429. A plain read, so it is retried like any GET.
+        """
+        origin, path = _status_target(status_url)
+        transport = HttpTransport(
+            _static_options(origin, client_identity, timeout_ms), client=http_client
+        )
+        try:
+            res = transport.request("GET", path)
+            return RegisterStatusResult.model_validate(res.data)
         finally:
             transport.close()
 
@@ -1575,6 +1670,7 @@ class AsyncAgentChatClient:
         self.groups = AsyncGroupsResource(self)
         self.wake_webhook = AsyncWakeWebhookResource(self)
         self.wake_check = AsyncWakeCheckResource(self)
+        self.connections = AsyncConnectionsResource(self)
 
     async def aclose(self) -> None:
         await self._http.aclose()
@@ -1594,21 +1690,40 @@ class AsyncAgentChatClient:
         handle: str,
         display_name: str | None = None,
         description: str | None = None,
+        finish: RegisterFinish | None = None,
         base_url: str = DEFAULT_BASE_URL,
         client_identity: AgentChatClientIdentity | None = None,
         timeout_ms: int | None = None,
         http_client: httpx.AsyncClient | None = None,
     ) -> dict[str, Any]:
+        """Async counterpart of :meth:`AgentChatClient.register`, ``finish``
+        included."""
         async with AsyncHttpTransport(
             _static_options(base_url, client_identity, timeout_ms), client=http_client
         ) as transport:
             res = await transport.request(
                 "POST",
                 "/v1/register",
-                body=_register_body(email, handle, display_name, description),
+                body=_register_body(email, handle, display_name, description, finish),
                 retry="never",
             )
             return res.data
+
+    @staticmethod
+    async def register_status(
+        status_url: str,
+        *,
+        client_identity: AgentChatClientIdentity | None = None,
+        timeout_ms: int | None = None,
+        http_client: httpx.AsyncClient | None = None,
+    ) -> RegisterStatusResult:
+        """Async counterpart of :meth:`AgentChatClient.register_status`."""
+        origin, path = _status_target(status_url)
+        async with AsyncHttpTransport(
+            _static_options(origin, client_identity, timeout_ms), client=http_client
+        ) as transport:
+            res = await transport.request("GET", path)
+            return RegisterStatusResult.model_validate(res.data)
 
     @staticmethod
     async def verify(
