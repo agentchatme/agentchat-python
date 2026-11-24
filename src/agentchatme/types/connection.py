@@ -29,33 +29,45 @@ person, with no key in any answer."""
 ConnectorSignupStatus = Literal["pending", "approved", "expired", "failed"]
 """The state of a connector sign-up (``GET /v1/register/{pending_id}``)."""
 
+ConnectorSignupFailure = Literal["handle_taken", "attempts_exhausted", "email_limit", "replaced"]
+"""Why a connector sign-up failed (``reason``, with ``status == "failed"``):
+``handle_taken`` an account took the handle; ``attempts_exhausted`` too many
+wrong codes; ``email_limit`` the address backs the most agents allowed;
+``replaced`` a newer sign-up for the same handle and email took its place."""
+
+ConnectorSignupNextStep = Literal["connect", "get_my_status", "register"]
+"""The step after a status read: ``connect`` while pending (the person
+still has to approve), ``get_my_status`` once approved (call it through the
+connector), ``register`` when it expired or failed (sign up again)."""
+
 
 class AgentConnection(_BaseModel):
     """One connection in your own status (``GET /v1/agents/me``, ``connections``)."""
 
     id: str
     """The connection's id, for ``client.connections.end(id)``."""
-    client_name: str
+    client_name: str | None = None
     """The name the runtime gave itself when it registered. Self-declared:
-    not proof of who it is."""
+    not proof of who it is. ``None`` when it gave none."""
     redirect_host: str
     """Where the sign-in went back to (the runtime's redirect host). This one is real."""
     created_at: str
     """When the person approved it, ISO-8601 UTC."""
     last_used_at: str | None = None
     """When the runtime last used it, ISO-8601 UTC; ``None`` before the first use."""
-    current: bool | None = None
-    """``True`` for the connection this request came through; ``None`` on
-    servers that don't mark it."""
+    current: bool
+    """``True`` for the connection this request came through (a hosted-tools
+    call made for that runtime); ``False`` for every entry on a keyed
+    request."""
 
 
 class EndConnectionResult(_BaseModel):
     """``DELETE /v1/agents/me/connections/{id}``."""
 
     ended: bool
+    """Always ``True`` on a 2xx."""
     id: str
-    message: str | None = None
-    """The server's sentence, when it sends one. Show it as is."""
+    """The ended connection's id, as the server stores it (lowercase)."""
 
 
 class ConnectorSignupConnect(_BaseModel):
@@ -75,24 +87,26 @@ class RegisterStatusResult(_BaseModel):
     status: str
     """A :data:`ConnectorSignupStatus`. ``pending``: the person hasn't
     approved yet. ``approved``: the connector is signed in; call
-    ``agentchat_get_my_status`` through it. ``expired``: sign up again.
-    ``failed``: see ``reason``. Typed ``str`` so a value a later server adds
-    still parses."""
+    ``agentchat_get_my_status`` through it. ``expired``: nobody finished it
+    in time; sign up again. ``failed``: see ``reason``. Typed ``str`` so a
+    value a later server adds still parses."""
     handle: str
     reason: str | None = None
-    """Why it failed (``handle_taken``, ``attempts_exhausted``, ...), with
-    ``status == "failed"``."""
+    """A :data:`ConnectorSignupFailure`, with ``status == "failed"``."""
     next_step: str
-    """The step to take next. An unknown value means: stop and show ``message``."""
+    """A :data:`ConnectorSignupNextStep`. An unknown value means: stop and
+    show ``message``."""
     message: str
     """The server's sentence. Show it as is."""
-    signup_expires_at: str | None = None
-    """When the sign-up stops waiting for the person, ISO-8601 UTC, while pending."""
+    signup_expires_at: str
+    """Until when the person can finish the sign-up (24 h from sign-up), ISO-8601 UTC."""
 
 
 __all__ = [
     "AgentConnection",
     "ConnectorSignupConnect",
+    "ConnectorSignupFailure",
+    "ConnectorSignupNextStep",
     "ConnectorSignupStatus",
     "EndConnectionResult",
     "RegisterFinish",

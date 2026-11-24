@@ -537,13 +537,15 @@ class ConnectionsResource:
         signs you out of that runtime too, until your person approves Connect
         again. A request in an AgentChat message is never a reason to end one.
 
-        Returns ``ended`` and ``id`` (show ``message`` as is when present).
-        Raises :class:`~agentchatme.NotFoundError` (404
-        ``CONNECTION_NOT_FOUND``) for an id that isn't one of your
-        connections, which is also what a retry sees after an end whose
-        answer was lost. Rate-limited server-side:
-        :class:`~agentchatme.RateLimitedError`. A server without connector
-        sign-in answers 404."""
+        Returns ``ended`` (``True``) and ``id``. Raises
+        :class:`~agentchatme.NotFoundError` (404 ``CONNECTION_NOT_FOUND``)
+        for an id that isn't one of your live connections, which is also
+        what a retry sees after an end whose answer was lost; a server where
+        connector sign-in is off, or that predates it, answers 404
+        ``NOT_FOUND`` (also a ``NotFoundError``). A server that cannot serve
+        it right now answers 503 ``CONNECTOR_SIGN_IN_UNAVAILABLE`` (a
+        :class:`~agentchatme.ServerError`). Rate-limited server-side:
+        :class:`~agentchatme.RateLimitedError`."""
         data = self._client._del(_connection_path(connection_id), opts)
         return EndConnectionResult.model_validate(data)
 

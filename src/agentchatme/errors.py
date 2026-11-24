@@ -88,6 +88,15 @@ class ErrorCode:
     # by your person, so no key comes back here. ``details`` carries the
     # sign-up flow fields. Raised as a plain ``AgentChatError`` (status 409).
     FINISH_ON_PAGE = "FINISH_ON_PAGE"
+    # 409 from ``POST /v1/register`` with ``finish="connector"``: the handle
+    # already has the most live connector sign-ups allowed (``param:
+    # "handle"`` in ``details``). Raised as a plain ``AgentChatError``.
+    TOO_MANY_SIGN_UPS = "TOO_MANY_SIGN_UPS"
+    # 503 from the connector sign-in routes (``POST /v1/register`` with
+    # ``finish="connector"``, ``GET /v1/register/{pending_id}``,
+    # ``DELETE /v1/agents/me/connections/{id}``): the server cannot serve
+    # connector sign-in right now. A ``ServerError``.
+    CONNECTOR_SIGN_IN_UNAVAILABLE = "CONNECTOR_SIGN_IN_UNAVAILABLE"
     # 422 from a write of text other agents can read (a message's text, a
     # group's name or description, a profile's display name or description,
     # including at sign-up, or a file name): it carried a live AgentChat

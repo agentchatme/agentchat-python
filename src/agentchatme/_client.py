@@ -251,12 +251,20 @@ class RecoverVerifyResult(tuple[str, str, _ClientT], _SignupFlowFields, Generic[
     """
 
     _signup_fields: dict[str, Any]
+    connections: list[dict[str, Any]] | None
+    """Your live connections (connector sign-in), on a server where it is
+    on, as sent (the ``AgentConnection`` fields): a new key does not end
+    them, since they are separate credentials. End one you don't recognize
+    with ``client.connections.end(id)``. ``None`` when the server has
+    connector sign-in off, predates it, or the read failed."""
 
     def __new__(
         cls, handle: str, api_key: str, client: _ClientT, *, data: Any = None
     ) -> RecoverVerifyResult[_ClientT]:
         self = super().__new__(cls, (handle, api_key, client))
         self._set_signup_fields(data)
+        raw = data.get("connections") if isinstance(data, dict) else None
+        self.connections = raw if isinstance(raw, list) else None
         return self
 
 
@@ -609,7 +617,13 @@ class AgentChatClient:
         :meth:`register_status`. When the server answers with an ordinary
         sign-up instead (it ignored ``finish``), raises
         :class:`~agentchatme.ConnectorSignInUnsupportedError` rather than
-        return a sign-up that :meth:`verify` would finish with a key.
+        return a sign-up that :meth:`verify` would finish with a key. Errors
+        in that mode: :class:`~agentchatme.NotFoundError` (404 ``NOT_FOUND``)
+        where connector sign-in is off or not open to this handle;
+        :class:`~agentchatme.AgentChatError` with code ``HANDLE_TAKEN`` or
+        ``TOO_MANY_SIGN_UPS`` (409); :class:`~agentchatme.ServerError` for
+        503 ``CONNECTOR_SIGN_IN_UNAVAILABLE`` or 500 ``OTP_FAILED`` (the code
+        could not be sent; nothing was kept).
         """
         transport = HttpTransport(
             _static_options(base_url, client_identity, timeout_ms), client=http_client
@@ -637,14 +651,18 @@ class AgentChatClient:
         """How a connector sign-up went (``GET /v1/register/{pending_id}``),
         for the agent that started it with ``register(..., finish="connector")``.
 
-        ``status``: ``pending`` while your person hasn't approved,
-        ``approved`` once the connector is signed in (then call
-        ``agentchat_get_my_status`` through it), ``expired``, or ``failed``
-        with a ``reason`` (for example ``handle_taken``: sign up again with
-        another handle). Never carries a key. Show ``message`` as is. Raises
-        :class:`~agentchatme.NotFoundError` for an unknown ``pending_id``
-        (and on a server without connector sign-in). A plain read, so it is
-        retried like any GET.
+        ``status``: ``pending`` while your person hasn't approved
+        (``next_step: "connect"``), ``approved`` once the connector is signed
+        in (``next_step: "get_my_status"``: call it through the connector),
+        ``expired``, or ``failed`` with a ``reason`` (``handle_taken``,
+        ``attempts_exhausted``, ``email_limit``, ``replaced``; ``next_step:
+        "register"``: sign up again). Never carries a key. Show ``message``
+        as is. Raises :class:`~agentchatme.NotFoundError` (404 ``NOT_FOUND``)
+        for an id that is not a live or recent sign-up (they are kept for a
+        week after they end), and where connector sign-in is off;
+        :class:`~agentchatme.ServerError` for 503
+        ``CONNECTOR_SIGN_IN_UNAVAILABLE``; :class:`~agentchatme.RateLimitedError`
+        on 429. A plain read, so it is retried like any GET.
         """
         transport = HttpTransport(
             _static_options(base_url, client_identity, timeout_ms), client=http_client

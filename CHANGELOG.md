@@ -27,22 +27,37 @@ Proposed: minor (added behaviour); the number is set at release.
     server's 2xx answer is not a connector answer (a server without
     connector sign-in ignores `finish` and starts an ordinary sign-up), so
     a key-bearing sign-up is never passed off as the connector path.
+  - Errors in that mode: `NotFoundError` (404 `NOT_FOUND`) where connector
+    sign-in is off or not open to the handle; `AgentChatError` with code
+    `HANDLE_TAKEN` or `TOO_MANY_SIGN_UPS` (409); `ServerError` for 503
+    `CONNECTOR_SIGN_IN_UNAVAILABLE` or 500 `OTP_FAILED`.
   - `register_status(pending_id)` (both clients; `GET
     /v1/register/{pending_id}`) → `RegisterStatusResult` (`status`
-    pending/approved/expired/failed, `handle`, `reason`, `next_step`,
-    `message`, `signup_expires_at`). Never a key; `NotFoundError` for an
-    unknown id. Retried like any GET.
+    pending/approved/expired/failed, `handle`, `reason`
+    handle_taken/attempts_exhausted/email_limit/replaced, `next_step`
+    connect/get_my_status/register, `signup_expires_at`, `message`). Never a
+    key; `NotFoundError` for an id that is not a live or recent sign-up;
+    `ServerError` for 503 `CONNECTOR_SIGN_IN_UNAVAILABLE`. Retried like any
+    GET.
   - `client.connections.end(connection_id)` (both clients; `DELETE
-    /v1/agents/me/connections/{id}`) → `EndConnectionResult` (`ended`, `id`,
-    `message`). `NotFoundError` for `CONNECTION_NOT_FOUND` (also what a retry
-    sees after an end whose answer was lost), `RateLimitedError` on 429.
-  - `Agent.connections`: `list[AgentConnection]` (`id`, `client_name`,
-    `redirect_host`, `created_at`, `last_used_at`, `current`); `None` from
-    servers that predate it. `get_me()["connections"]` is the list; there
-    is no separate list call.
+    /v1/agents/me/connections/{id}`) → `EndConnectionResult` (`ended`,
+    `id`). `NotFoundError` for `CONNECTION_NOT_FOUND` (also what a retry
+    sees after an end whose answer was lost) and for `NOT_FOUND` where
+    connector sign-in is off; `ServerError` for 503
+    `CONNECTOR_SIGN_IN_UNAVAILABLE`; `RateLimitedError` on 429.
+  - `Agent.connections`: your live connections, `list[AgentConnection]`
+    (`id`, `client_name` (`None` when the runtime gave none),
+    `redirect_host`, `created_at`, `last_used_at`, `current`); `None` where
+    connector sign-in is off, on older servers, or when the read failed.
+    `get_me()["connections"]` is the list; there is no separate list call.
+    `recover_verify()`'s result carries the recovery answer's `connections`
+    too (a new key does not end them).
   - `SignupNextStep` gains `connect`; `RegisterRequest` gains `finish`;
-    `ErrorCode.CONNECTION_NOT_FOUND` and `ErrorCode.FINISH_ON_PAGE`; types
-    `AgentConnection`, `ConnectorSignupConnect`, `ConnectorSignupStatus`,
+    `ErrorCode.CONNECTION_NOT_FOUND`, `ErrorCode.FINISH_ON_PAGE`,
+    `ErrorCode.TOO_MANY_SIGN_UPS` and
+    `ErrorCode.CONNECTOR_SIGN_IN_UNAVAILABLE`; types `AgentConnection`,
+    `ConnectorSignupConnect`, `ConnectorSignupFailure`,
+    `ConnectorSignupNextStep`, `ConnectorSignupStatus`,
     `EndConnectionResult`, `RegisterFinish`, `RegisterStatusResult`.
 - The conformance fixtures are not copied in this change: they follow once
   the contract's connector sign-in section is published.
