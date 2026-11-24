@@ -37,9 +37,6 @@ from .claim import (
 from .connection import (
     AgentConnection,
     ConnectorSignupConnect,
-    ConnectorSignupFailure,
-    ConnectorSignupNextStep,
-    ConnectorSignupStatus,
     EndConnectionResult,
     RegisterFinish,
     RegisterStatusResult,
@@ -205,9 +202,6 @@ __all__ = [
     "ClearWakeWebhookResult",
     "ClientAction",
     "ConnectorSignupConnect",
-    "ConnectorSignupFailure",
-    "ConnectorSignupNextStep",
-    "ConnectorSignupStatus",
     "Contact",
     "ContainsSecretKind",
     # conversation

@@ -65,6 +65,7 @@ AccountKind = Literal["register", "recover"]
 
 SignupAction = Literal[
     "done",
+    "connect",
     "ask_code",
     "ask_param",
     "offer_new_code",
@@ -76,7 +77,11 @@ SignupAction = Literal[
 ``param``, ``retry_after_s``, the HTTP status and the step that was called
 (conformance ``signup-flow.cases.json``; :func:`action_of` has the order):
 
-- ``done``: ``next_step: "done"`` (the key is in the body).
+- ``done``: ``next_step: "done"`` (the key is in the body), or
+  ``get_my_status`` (a connector sign-up's status: the connector is signed in).
+- ``connect``: ``next_step: "connect"`` (a connector sign-up): add the
+  connector at ``connect.mcp_url``, show ``message``, then follow
+  ``connect.status_url``. :func:`run` signs up with a key: it stops here.
 - ``ask_code``: a verify step, no ``retry_after_s``.
 - ``ask_param``: a start step with ``param``: re-ask that field, call the
   start step again.
@@ -237,7 +242,8 @@ def action_of(flow: SignupFlow | None, http_status: int, called_step: str) -> Si
     first match wins:
 
     - ``legacy``: no flow object.
-    - ``done``: ``next_step`` is ``done``.
+    - ``done``: ``next_step`` is ``done``, or ``get_my_status``.
+    - ``connect``: ``next_step`` is ``connect``.
     - ``stop``: a ``next_step`` this release does not know, or any 5xx (the
       account may exist after a verify 500: never steer to a second one).
     - ``ask_code``: a verify step, no ``retry_after_s``.
@@ -254,10 +260,12 @@ def action_of(flow: SignupFlow | None, http_status: int, called_step: str) -> Si
     if flow is None:
         return "legacy"
     step = flow.get("next_step")
+    if step in ("done", "get_my_status"):
+        return "done"
+    if step == "connect":
+        return "connect"
     if step not in _KNOWN_STEPS:
         return "stop"
-    if step == "done":
-        return "done"
     if http_status >= 500:
         return "stop"
     wait = whole_seconds(flow.get("retry_after_s"))

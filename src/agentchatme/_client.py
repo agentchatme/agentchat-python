@@ -22,6 +22,7 @@ from typing import (
 )
 
 import httpx
+import pydantic
 
 from ._call import CallOptions
 from ._call import encode_segment as _encode
@@ -58,9 +59,9 @@ from ._resources import (
     WakeWebhookResource,
 )
 from ._signup_flow import CLAIM_LINK_FIELDS, SIGNUP_FLOW_FIELDS
-from .errors import AgentChatError, ConnectorSignInUnsupportedError, NotFoundError
+from .errors import AgentChatError, NotFoundError
 from .types.claim import CreateClaimLinkResult, ReleaseClaimResult
-from .types.connection import RegisterFinish, RegisterStatusResult
+from .types.connection import AgentConnection, RegisterFinish, RegisterStatusResult
 from .types.conversation import AgentConversationContext, DirectConversationLookup
 from .types.inbox import INBOX_WAIT_MAX_MS
 from .types.message import SendableMessageType
@@ -251,12 +252,13 @@ class RecoverVerifyResult(tuple[str, str, _ClientT], _SignupFlowFields, Generic[
     """
 
     _signup_fields: dict[str, Any]
-    connections: list[dict[str, Any]] | None
+    connections: list[AgentConnection] | None
     """Your live connections (connector sign-in), on a server where it is
-    on, as sent (the ``AgentConnection`` fields): a new key does not end
-    them, since they are separate credentials. End one you don't recognize
-    with ``client.connections.end(id)``. ``None`` when the server has
-    connector sign-in off, predates it, or the read failed."""
+    on: a new key does not end them, since they are separate credentials.
+    End one you don't recognize with ``client.connections.end(id)``.
+    ``None`` when the server has connector sign-in off, predates it, or the
+    read failed, and when the list is not one this SDK can read (the new key
+    is never lost over it)."""
 
     def __new__(
         cls, handle: str, api_key: str, client: _ClientT, *, data: Any = None
@@ -264,7 +266,12 @@ class RecoverVerifyResult(tuple[str, str, _ClientT], _SignupFlowFields, Generic[
         self = super().__new__(cls, (handle, api_key, client))
         self._set_signup_fields(data)
         raw = data.get("connections") if isinstance(data, dict) else None
-        self.connections = raw if isinstance(raw, list) else None
+        try:
+            self.connections = (
+                [AgentConnection.model_validate(c) for c in raw] if isinstance(raw, list) else None
+            )
+        except pydantic.ValidationError:
+            self.connections = None
         return self
 
 
@@ -385,35 +392,16 @@ def _register_body(
     return body
 
 
-def _is_connector_answer(body: Any) -> bool:
-    """A connector-mode register answer: ``next_step == "connect"`` with a
-    ``connect`` object naming the connector address, and no key."""
-    if not isinstance(body, dict):
-        return False
-    connect = body.get("connect")
-    return (
-        body.get("next_step") == "connect"
-        and isinstance(connect, dict)
-        and isinstance(connect.get("mcp_url"), str)
-        and "api_key" not in body
-    )
-
-
-def _checked_register_answer(data: Any, finish: RegisterFinish | None) -> Any:
-    """Refuse an ordinary answer to a connector sign-up: a server without
-    connector sign-in ignores ``finish`` and starts a sign-up that
-    ``verify()`` would finish with a key. Never pass that off as the
-    connector path."""
-    if finish == "connector" and not _is_connector_answer(data):
-        record = data if isinstance(data, dict) else {}
-        raise ConnectorSignInUnsupportedError(record.get("pending_id"), record.get("message"))
-    return data
-
-
-def _register_status_path(pending_id: str) -> str:
-    if not isinstance(pending_id, str) or not pending_id:
-        raise ValueError("pending_id must be a non-empty sign-up id")
-    return f"/v1/register/{_encode(pending_id)}"
+def _status_target(status_url: str) -> tuple[str, str]:
+    """``connect.status_url`` as the server gave it, split into the origin
+    the transport calls and the path (with any query) it GETs."""
+    try:
+        url = httpx.URL(status_url) if isinstance(status_url, str) else None
+    except httpx.InvalidURL:
+        url = None
+    if url is None or url.scheme not in ("http", "https") or not url.host:
+        raise ValueError("status_url must be the http(s) connect.status_url of a connector sign-up")
+    return f"{url.scheme}://{url.netloc.decode('ascii')}", url.raw_path.decode("ascii")
 
 
 def _sync_query(limit: int | None, after: str | None, wait_ms: int | None) -> str:
@@ -614,16 +602,10 @@ class AgentChatClient:
         AgentChat's page, approved by your person; :meth:`verify` on it
         raises :class:`~agentchatme.AgentChatError` with code
         ``FINISH_ON_PAGE`` (409). Check how it went with
-        :meth:`register_status`. When the server answers with an ordinary
-        sign-up instead (it ignored ``finish``), raises
-        :class:`~agentchatme.ConnectorSignInUnsupportedError` rather than
-        return a sign-up that :meth:`verify` would finish with a key. Errors
-        in that mode: :class:`~agentchatme.NotFoundError` (404 ``NOT_FOUND``)
-        where connector sign-in is off or not open to this handle;
-        :class:`~agentchatme.AgentChatError` with code ``HANDLE_TAKEN`` or
-        ``TOO_MANY_SIGN_UPS`` (409); :class:`~agentchatme.ServerError` for
-        503 ``CONNECTOR_SIGN_IN_UNAVAILABLE`` or 500 ``OTP_FAILED`` (the code
-        could not be sent; nothing was kept).
+        ``register_status(answer["connect"]["status_url"])``. Its errors are
+        an ordinary sign-up's, plus :class:`~agentchatme.NotFoundError` (404
+        ``NOT_FOUND``) where connector sign-in is off or not open to this
+        handle.
         """
         transport = HttpTransport(
             _static_options(base_url, client_identity, timeout_ms), client=http_client
@@ -635,40 +617,45 @@ class AgentChatClient:
                 body=_register_body(email, handle, display_name, description, finish),
                 retry="never",
             )
-            return _checked_register_answer(res.data, finish)
+            return res.data
         finally:
             transport.close()
 
     @staticmethod
     def register_status(
-        pending_id: str,
+        status_url: str,
         *,
-        base_url: str = DEFAULT_BASE_URL,
         client_identity: AgentChatClientIdentity | None = None,
         timeout_ms: int | None = None,
         http_client: httpx.Client | None = None,
     ) -> RegisterStatusResult:
-        """How a connector sign-up went (``GET /v1/register/{pending_id}``),
-        for the agent that started it with ``register(..., finish="connector")``.
+        """How a connector sign-up went: GETs ``status_url``, the
+        ``connect.status_url`` of its ``register(..., finish="connector")``
+        answer, as the server gave it (``GET /v1/register/{pending_id}``, no
+        key).
 
         ``status``: ``pending`` while your person hasn't approved
-        (``next_step: "connect"``), ``approved`` once the connector is signed
-        in (``next_step: "get_my_status"``: call it through the connector),
-        ``expired``, or ``failed`` with a ``reason`` (``handle_taken``,
-        ``attempts_exhausted``, ``email_limit``, ``replaced``; ``next_step:
-        "register"``: sign up again). Never carries a key. Show ``message``
-        as is. Raises :class:`~agentchatme.NotFoundError` (404 ``NOT_FOUND``)
-        for an id that is not a live or recent sign-up (they are kept for a
-        week after they end), and where connector sign-in is off;
+        (``next_step: "connect"``: ask again later), ``approved`` once the
+        connector is signed in (``next_step: "get_my_status"``: call it
+        through the connector), ``expired`` (nobody finished it in time, or a
+        newer sign-up with the same handle and email took its place), or
+        ``failed`` with a ``reason`` (``handle_taken``, ``email_limit``);
+        after ``expired`` or ``failed``, ``next_step: "register"``. Never
+        carries a key. Show ``message`` as is. Raises ``ValueError`` for a
+        ``status_url`` that is not an http(s) URL;
+        :class:`~agentchatme.NotFoundError` (404 ``NOT_FOUND``) for a sign-up
+        that is not live or recent (they are kept for a week after they
+        end), and where connector sign-in is off;
         :class:`~agentchatme.ServerError` for 503
         ``CONNECTOR_SIGN_IN_UNAVAILABLE``; :class:`~agentchatme.RateLimitedError`
         on 429. A plain read, so it is retried like any GET.
         """
+        origin, path = _status_target(status_url)
         transport = HttpTransport(
-            _static_options(base_url, client_identity, timeout_ms), client=http_client
+            _static_options(origin, client_identity, timeout_ms), client=http_client
         )
         try:
-            res = transport.request("GET", _register_status_path(pending_id))
+            res = transport.request("GET", path)
             return RegisterStatusResult.model_validate(res.data)
         finally:
             transport.close()
@@ -1720,22 +1707,22 @@ class AsyncAgentChatClient:
                 body=_register_body(email, handle, display_name, description, finish),
                 retry="never",
             )
-            return _checked_register_answer(res.data, finish)
+            return res.data
 
     @staticmethod
     async def register_status(
-        pending_id: str,
+        status_url: str,
         *,
-        base_url: str = DEFAULT_BASE_URL,
         client_identity: AgentChatClientIdentity | None = None,
         timeout_ms: int | None = None,
         http_client: httpx.AsyncClient | None = None,
     ) -> RegisterStatusResult:
         """Async counterpart of :meth:`AgentChatClient.register_status`."""
+        origin, path = _status_target(status_url)
         async with AsyncHttpTransport(
-            _static_options(base_url, client_identity, timeout_ms), client=http_client
+            _static_options(origin, client_identity, timeout_ms), client=http_client
         ) as transport:
-            res = await transport.request("GET", _register_status_path(pending_id))
+            res = await transport.request("GET", path)
             return RegisterStatusResult.model_validate(res.data)
 
     @staticmethod

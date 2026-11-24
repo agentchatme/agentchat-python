@@ -17,7 +17,12 @@ from typing import Any
 import httpx
 import pytest
 
-from agentchatme import AgentChatClientIdentity, AgentChatError, create_agentchat_error
+from agentchatme import (
+    AgentChatClient,
+    AgentChatClientIdentity,
+    AgentChatError,
+    create_agentchat_error,
+)
 from agentchatme.integration import account
 from agentchatme.types import SignupFlow
 
@@ -57,7 +62,16 @@ def _expect_flow(actual: SignupFlow | None, expected: dict[str, Any] | None) -> 
 
 def test_names_the_same_actions_steps_and_wait_limit_as_the_sdk() -> None:
     assert DATA["version"] == 1
-    sdk_actions = ["done", "ask_code", "ask_param", "offer_new_code", "wait_then_retry", "stop", "legacy"]
+    sdk_actions = [
+        "done",
+        "ask_code",
+        "ask_param",
+        "offer_new_code",
+        "wait_then_retry",
+        "stop",
+        "legacy",
+        "connect",
+    ]
     assert sorted(DATA["actions"]) == sorted(sdk_actions)
     assert DATA["wait_limit_s"] == account.MAX_WAIT_S
     assert DATA["start_steps"] == {"register": "register", "recover": "recover", "rotate_key": "rotate_key"}
@@ -130,13 +144,21 @@ _LEGACY_READING: dict[str, tuple[str, dict[str, Any]]] = {
     ),
 }
 
-STEP_CASES = [c for c in CASES if c["request"]["kind"] in _STEP_KINDS]
+def _is_connector_call(case: dict[str, Any]) -> bool:
+    """A connector sign-up's own calls: ``AgentChatClient.register(finish=...)``
+    and ``register_status``, below."""
+    request = case["request"]
+    return "finish" in request["body"] or request["kind"] == "register_status"
+
+
+STEP_CASES = [c for c in CASES if c["request"]["kind"] in _STEP_KINDS and not _is_connector_call(c)]
+CONNECTOR_CASES = [c for c in CASES if _is_connector_call(c)]
 
 
 def test_drives_every_register_and_recover_case() -> None:
     # Rotate key is the client's rotate_key / rotate_key_verify.
     assert STEP_CASES
-    rest = [c for c in CASES if c["request"]["kind"] not in _STEP_KINDS]
+    rest = [c for c in CASES if c not in STEP_CASES and not _is_connector_call(c)]
     for case in rest:
         assert case["request"]["kind"].startswith("rotate_key"), case["name"]
 
@@ -221,3 +243,32 @@ def test_start_and_submit_code(case: dict[str, Any]) -> None:
         assert result.flow.get("pending_id") == (
             body.get("pending_id") or (expect["flow"] or {}).get("pending_id")
         )
+
+
+# ─────────────── connector sign-up, against the fixture's responses ───────────────
+
+
+@pytest.mark.parametrize("case", CONNECTOR_CASES, ids=[c["name"] for c in CONNECTOR_CASES])
+def test_connector_sign_up(case: dict[str, Any]) -> None:
+    request = case["request"]
+    seen: list[dict[str, Any]] = []
+    http_client = _client_for(case, seen)
+    outcome: Any
+    try:
+        if request["kind"] == "register_status":
+            outcome = AgentChatClient.register_status(f"{API}{request['path']}", http_client=http_client)
+        else:
+            outcome = AgentChatClient.register(**request["body"], base_url=API, http_client=http_client)
+    except AgentChatError as err:
+        outcome = err
+
+    # The request is the fixture's: one call, the status read with no body.
+    body = None if request["method"] == "GET" else request["body"]
+    assert seen == [{"method": request["method"], "path": request["path"], "body": body}]
+    if _is_error(case):
+        assert isinstance(outcome, AgentChatError)
+        assert (outcome.code, str(outcome)) == (case["expect"]["code"], case["expect"]["message"])
+    elif request["kind"] == "register_status":
+        assert outcome.model_dump(exclude_none=True) == case["response"]["body"]
+    else:
+        assert outcome == case["response"]["body"]

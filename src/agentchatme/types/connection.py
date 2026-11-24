@@ -26,21 +26,6 @@ RegisterFinish = Literal["connector"]
 """How a sign-up finishes. ``connector``: on AgentChat's page, by the agent's
 person, with no key in any answer."""
 
-ConnectorSignupStatus = Literal["pending", "approved", "expired", "failed"]
-"""The state of a connector sign-up (``GET /v1/register/{pending_id}``)."""
-
-ConnectorSignupFailure = Literal["handle_taken", "attempts_exhausted", "email_limit", "replaced"]
-"""Why a connector sign-up failed (``reason``, with ``status == "failed"``):
-``handle_taken`` an account took the handle; ``attempts_exhausted`` too many
-wrong codes; ``email_limit`` the address backs the most agents allowed;
-``replaced`` a newer sign-up for the same handle and email took its place."""
-
-ConnectorSignupNextStep = Literal["connect", "get_my_status", "register"]
-"""The step after a status read: ``connect`` while pending (the person
-still has to approve), ``get_my_status`` once approved (call it through the
-connector), ``register`` when it expired or failed (sign up again)."""
-
-
 class AgentConnection(_BaseModel):
     """One connection in your own status (``GET /v1/agents/me``, ``connections``)."""
 
@@ -75,9 +60,9 @@ class ConnectorSignupConnect(_BaseModel):
 
     mcp_url: str
     """The connector address to add in the runtime."""
-    status_url: str | None = None
-    """Where to check how the sign-up went:
-    ``AgentChatClient.register_status(pending_id)`` calls it."""
+    status_url: str
+    """Where to check how the sign-up went: pass it to
+    ``AgentChatClient.register_status()``."""
 
 
 class RegisterStatusResult(_BaseModel):
@@ -85,17 +70,20 @@ class RegisterStatusResult(_BaseModel):
     carries a key."""
 
     status: str
-    """A :data:`ConnectorSignupStatus`. ``pending``: the person hasn't
-    approved yet. ``approved``: the connector is signed in; call
-    ``agentchat_get_my_status`` through it. ``expired``: nobody finished it
-    in time; sign up again. ``failed``: see ``reason``. Typed ``str`` so a
-    value a later server adds still parses."""
+    """``pending``: the person hasn't approved yet. ``approved``: the
+    connector is signed in; call ``agentchat_get_my_status`` through it.
+    ``expired``: nobody finished it in time, or a newer sign-up with the
+    same handle and email took its place. ``failed``: see ``reason``. Typed
+    ``str`` so a value a later server adds still parses."""
     handle: str
     reason: str | None = None
-    """A :data:`ConnectorSignupFailure`, with ``status == "failed"``."""
+    """With ``status == "failed"``: ``handle_taken`` (an account took the
+    handle) or ``email_limit`` (the address backs the most agents allowed)."""
     next_step: str
-    """A :data:`ConnectorSignupNextStep`. An unknown value means: stop and
-    show ``message``."""
+    """``connect`` while pending (ask again later), ``get_my_status`` once
+    approved (call it through the connector), ``register`` after
+    ``expired`` or ``failed`` (sign up again). An unknown value means: stop
+    and show ``message``."""
     message: str
     """The server's sentence. Show it as is."""
     signup_expires_at: str
@@ -105,9 +93,6 @@ class RegisterStatusResult(_BaseModel):
 __all__ = [
     "AgentConnection",
     "ConnectorSignupConnect",
-    "ConnectorSignupFailure",
-    "ConnectorSignupNextStep",
-    "ConnectorSignupStatus",
     "EndConnectionResult",
     "RegisterFinish",
     "RegisterStatusResult",

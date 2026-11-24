@@ -7,7 +7,7 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict
 
 from .claim import AgentClaim
-from .connection import AgentConnection
+from .connection import AgentConnection, RegisterFinish
 from .wake_check import WakeCheckStatus
 from .wake_webhook import WakeWebhookStatus
 
@@ -92,7 +92,7 @@ class RegisterRequest(_BaseModel):
     handle: str
     display_name: str | None = None
     description: str | None = None
-    finish: str | None = None
+    finish: RegisterFinish | None = None
     """``"connector"``: the sign-up finishes on AgentChat's page, approved by
     your person; no answer carries a key."""
 

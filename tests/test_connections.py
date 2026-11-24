@@ -17,38 +17,16 @@ from agentchatme import (
     AgentChatClient,
     AgentChatError,
     AsyncAgentChatClient,
-    ConnectorSignInUnsupportedError,
     ErrorCode,
     NotFoundError,
     RateLimitedError,
     RetryPolicy,
     ServerError,
 )
-from agentchatme.types import Agent, EndConnectionResult, RegisterStatusResult
+from agentchatme.types import Agent, AgentConnection, EndConnectionResult, RegisterStatusResult
 
 BASE = "https://api.test"
 
-# The shape the server answers in connector mode (placeholders, not real ids).
-CONNECTOR_ANSWER: dict[str, Any] = {
-    "pending_id": "pnd_example",
-    "message": (
-        "We sent a 6-digit code to agent@example.com. Add the connector at "
-        "https://api.agentchat.me/mcp/connector; when your person taps Connect, they enter "
-        "@my-agent and the code on AgentChat's page."
-    ),
-    "version": 1,
-    "flow": "register",
-    "next_step": "connect",
-    "status": "pending",
-    "expires_at": "2026-11-24T10:10:00.000Z",
-    "expires_in_s": 600,
-    "code_length": 6,
-    "connect": {
-        "mcp_url": "https://api.agentchat.me/mcp/connector",
-        "status_url": "https://api.agentchat.me/v1/register/pnd_example",
-    },
-    "signup_expires_at": "2026-11-25T10:00:00.000Z",
-}
 ORDINARY_ANSWER: dict[str, Any] = {
     "pending_id": "pnd_example",
     "message": "We sent a 6-digit code to agent@example.com. It expires in 10 minutes.",
@@ -107,25 +85,8 @@ def _client(**kwargs: Any) -> AgentChatClient:
 
 
 # ─────────────── register(finish="connector") ───────────────
-
-
-@respx.mock
-def test_register_connector_sends_finish_and_returns_the_answer_with_no_key() -> None:
-    seen = _capture(respx.post(f"{BASE}/v1/register"), 201, CONNECTOR_ANSWER)
-    res = AgentChatClient.register(
-        email="agent@example.com", handle="my-agent", finish="connector", base_url=BASE
-    )
-    assert json.loads(seen[0].content) == {
-        "email": "agent@example.com",
-        "handle": "my-agent",
-        "finish": "connector",
-    }
-    assert res["next_step"] == "connect"
-    assert res["connect"]["mcp_url"] == "https://api.agentchat.me/mcp/connector"
-    assert res["connect"]["status_url"] == "https://api.agentchat.me/v1/register/pnd_example"
-    assert res["signup_expires_at"] == "2026-11-25T10:00:00.000Z"
-    assert res["expires_at"] == "2026-11-24T10:10:00.000Z"
-    assert "api_key" not in res
+# The connector answers themselves, and the 404 where it is off, are the
+# contract fixture's cases (test_conformance_signup_flow.py).
 
 
 @respx.mock
@@ -135,36 +96,9 @@ def test_register_leaves_finish_out_of_an_ordinary_body() -> None:
     assert json.loads(seen[0].content) == {"email": "agent@example.com", "handle": "my-agent"}
 
 
-@respx.mock
-def test_register_connector_refuses_an_ordinary_answer() -> None:
-    _capture(respx.post(f"{BASE}/v1/register"), 201, ORDINARY_ANSWER)
-    with pytest.raises(ConnectorSignInUnsupportedError) as caught:
-        AgentChatClient.register(
-            email="agent@example.com", handle="my-agent", finish="connector", base_url=BASE
-        )
-    assert caught.value.pending_id == "pnd_example"
-    assert caught.value.server_message == ORDINARY_ANSWER["message"]
-
-
-@respx.mock
-def test_register_connector_refuses_an_answer_that_carries_a_key() -> None:
-    _capture(
-        respx.post(f"{BASE}/v1/register"), 201, {**CONNECTOR_ANSWER, "api_key": "ac_not_a_real_key"}
-    )
-    with pytest.raises(ConnectorSignInUnsupportedError):
-        AgentChatClient.register(
-            email="agent@example.com", handle="my-agent", finish="connector", base_url=BASE
-        )
-
-
 @pytest.mark.parametrize(
     ("status", "code", "cls"),
-    [
-        (409, "HANDLE_TAKEN", AgentChatError),
-        (409, "TOO_MANY_SIGN_UPS", AgentChatError),
-        (503, "CONNECTOR_SIGN_IN_UNAVAILABLE", ServerError),
-        (500, "OTP_FAILED", ServerError),
-    ],
+    [(409, "HANDLE_TAKEN", AgentChatError), (500, "OTP_FAILED", ServerError)],
 )
 @respx.mock
 def test_register_connector_errors_are_one_attempt_with_their_code(status: int, code: str, cls: type) -> None:
@@ -178,117 +112,71 @@ def test_register_connector_errors_are_one_attempt_with_their_code(status: int, 
 
 
 @respx.mock
-def test_register_connector_surfaces_the_404_of_a_server_where_it_is_off() -> None:
-    _capture(
-        respx.post(f"{BASE}/v1/register"),
-        404,
-        {"code": "NOT_FOUND", "message": "Connector sign-in is not available on this server."},
-    )
+async def test_async_register_connector_sends_finish() -> None:
+    seen = _capture(respx.post(f"{BASE}/v1/register"), 404, {"code": "NOT_FOUND", "message": "x"})
     with pytest.raises(NotFoundError):
-        AgentChatClient.register(
-            email="agent@example.com", handle="my-agent", finish="connector", base_url=BASE
-        )
-
-
-@respx.mock
-def test_verify_on_a_connector_signup_is_finish_on_page() -> None:
-    _capture(
-        respx.post(f"{BASE}/v1/register/verify"),
-        409,
-        {
-            "code": "FINISH_ON_PAGE",
-            "message": "This sign-up finishes on AgentChat's page when your person approves the connector.",
-            "details": {"version": 1, "flow": "register", "next_step": "connect"},
-        },
-    )
-    with pytest.raises(AgentChatError) as caught:
-        AgentChatClient.verify("pnd_example", "123456", base_url=BASE)
-    assert caught.value.code == ErrorCode.FINISH_ON_PAGE == "FINISH_ON_PAGE"
-    assert caught.value.status == 409
-
-
-@respx.mock
-async def test_async_register_connector_and_its_refusal() -> None:
-    route = respx.post(f"{BASE}/v1/register")
-    seen = _capture(route, 201, CONNECTOR_ANSWER)
-    res = await AsyncAgentChatClient.register(
-        email="agent@example.com", handle="my-agent", finish="connector", base_url=BASE
-    )
-    assert json.loads(seen[0].content)["finish"] == "connector"
-    assert res["next_step"] == "connect"
-    _capture(route, 201, ORDINARY_ANSWER)
-    with pytest.raises(ConnectorSignInUnsupportedError):
         await AsyncAgentChatClient.register(
             email="agent@example.com", handle="my-agent", finish="connector", base_url=BASE
         )
+    assert json.loads(seen[0].content)["finish"] == "connector"
 
 
 # ─────────────── register_status ───────────────
 
+STATUS_URL = "https://status.agentchat.test/v1/register/pnd_example"
 APPROVED: dict[str, Any] = {
     "status": "approved",
     "handle": "my-agent",
     "next_step": "get_my_status",
     "signup_expires_at": "2026-11-25T10:00:00.000Z",
-    "message": "Your person approved the connector. Call agentchat_get_my_status through it.",
+    "message": "Done: your connector is signed in as @my-agent.",
 }
 
 
 @respx.mock
-def test_register_status_gets_the_encoded_path_without_a_key() -> None:
-    seen = _capture(respx.get(f"{BASE}/v1/register/pnd_a%2Fb"), 200, APPROVED)
-    res = AgentChatClient.register_status("pnd_a/b", base_url=BASE)
+def test_register_status_gets_the_status_url_as_given_without_a_key() -> None:
+    seen = _capture(respx.get(STATUS_URL), 200, APPROVED)
+    res = AgentChatClient.register_status(STATUS_URL)
     assert isinstance(res, RegisterStatusResult)
     assert (res.status, res.handle, res.next_step) == ("approved", "my-agent", "get_my_status")
-    assert res.signup_expires_at == "2026-11-25T10:00:00.000Z"
+    assert len(seen) == 1
     assert "authorization" not in seen[0].headers
 
 
-@pytest.mark.parametrize("reason", ["handle_taken", "attempts_exhausted", "email_limit", "replaced"])
-@respx.mock
-def test_register_status_passes_each_failure_reason_through(reason: str) -> None:
-    failed = {
-        "status": "failed",
-        "handle": "my-agent",
-        "reason": reason,
-        "next_step": "register",
-        "signup_expires_at": "2026-11-25T10:00:00.000Z",
-        "message": "x",
-    }
-    _capture(respx.get(f"{BASE}/v1/register/pnd_example"), 200, failed)
-    res = AgentChatClient.register_status("pnd_example", base_url=BASE)
-    assert (res.status, res.reason, res.next_step) == ("failed", reason, "register")
+@pytest.mark.parametrize(
+    "status_url", ["", "pnd_example", "/v1/register/pnd_example", "ftp://h/v1/register/p", "https://h:x/p"]
+)
+def test_register_status_refuses_what_is_not_an_http_status_url(status_url: str) -> None:
+    with pytest.raises(ValueError):
+        AgentChatClient.register_status(status_url)
 
 
 @respx.mock
 def test_register_status_unavailable_is_a_server_error() -> None:
     _capture(
-        respx.get(f"{BASE}/v1/register/pnd_example"),
+        respx.get(STATUS_URL),
         503,
         {"code": "CONNECTOR_SIGN_IN_UNAVAILABLE", "message": "Connector sign-in is not available right now."},
     )
     with pytest.raises(ServerError) as caught:
-        AgentChatClient.register_status("pnd_example", base_url=BASE)
+        AgentChatClient.register_status(STATUS_URL)
     assert caught.value.code == ErrorCode.CONNECTOR_SIGN_IN_UNAVAILABLE
 
 
 @respx.mock
-def test_register_status_unknown_id_is_not_found() -> None:
-    _capture(respx.get(f"{BASE}/v1/register/pnd_unknown"), 404, {"code": "NOT_FOUND", "message": "No such sign-up."})
+def test_register_status_unknown_sign_up_is_not_found() -> None:
+    _capture(respx.get(STATUS_URL), 404, {"code": "NOT_FOUND", "message": "No connector sign-up has this id."})
     with pytest.raises(NotFoundError):
-        AgentChatClient.register_status("pnd_unknown", base_url=BASE)
-
-
-def test_register_status_refuses_an_empty_id() -> None:
-    with pytest.raises(ValueError):
-        AgentChatClient.register_status("", base_url=BASE)
+        AgentChatClient.register_status(STATUS_URL)
 
 
 @respx.mock
 async def test_async_register_status() -> None:
-    _capture(respx.get(f"{BASE}/v1/register/pnd_example"), 200, APPROVED)
-    res = await AsyncAgentChatClient.register_status("pnd_example", base_url=BASE)
+    _capture(respx.get(STATUS_URL), 200, APPROVED)
+    res = await AsyncAgentChatClient.register_status(STATUS_URL)
     assert res.status == "approved"
+    with pytest.raises(ValueError):
+        await AsyncAgentChatClient.register_status("pnd_example")
 
 
 # ─────────────── client.connections.end ───────────────
@@ -374,8 +262,7 @@ def test_public_surface() -> None:
     assert callable(client.connections.end)
     assert callable(AgentChatClient.register_status)
     assert callable(AsyncAgentChatClient.register_status)
-    assert agentchatme.ConnectorSignInUnsupportedError is ConnectorSignInUnsupportedError
-    assert "ConnectorSignInUnsupportedError" in agentchatme.__all__
+    assert "AgentConnection" in agentchatme.types.__all__
 
 
 # ─────────────── connections in the recovery answer ───────────────
@@ -391,23 +278,31 @@ RECOVERED: dict[str, Any] = {
 }
 
 
+def _dumped(connections: list[AgentConnection] | None) -> list[dict[str, Any]] | None:
+    return None if connections is None else [c.model_dump() for c in connections]
+
+
 @respx.mock
-def test_recover_verify_passes_connections_through() -> None:
+def test_recover_verify_reads_connections_as_agent_connections() -> None:
     _capture(respx.post(f"{BASE}/v1/agents/recover/verify"), 200, {**RECOVERED, "connections": CONNECTIONS})
     result = AgentChatClient.recover_verify("pnd_example", "123456", base_url=BASE)
     assert result[0] == "my-agent"
-    assert result.connections == CONNECTIONS
+    assert result.connections is not None
+    assert all(isinstance(c, AgentConnection) for c in result.connections)
+    assert _dumped(result.connections) == CONNECTIONS
 
 
+@pytest.mark.parametrize("sent", [None, [{"id": "no-other-fields"}], "not a list"])
 @respx.mock
-def test_recover_verify_connections_is_none_when_not_sent() -> None:
-    _capture(respx.post(f"{BASE}/v1/agents/recover/verify"), 200, RECOVERED)
+def test_recover_verify_connections_none_never_costs_the_key(sent: Any) -> None:
+    body = RECOVERED if sent is None else {**RECOVERED, "connections": sent}
+    _capture(respx.post(f"{BASE}/v1/agents/recover/verify"), 200, body)
     result = AgentChatClient.recover_verify("pnd_example", "123456", base_url=BASE)
-    assert result.connections is None
+    assert (result[1], result.connections) == ("ac_not_a_real_key", None)
 
 
 @respx.mock
-async def test_async_recover_verify_passes_connections_through() -> None:
+async def test_async_recover_verify_reads_connections() -> None:
     _capture(respx.post(f"{BASE}/v1/agents/recover/verify"), 200, {**RECOVERED, "connections": CONNECTIONS})
     result = await AsyncAgentChatClient.recover_verify("pnd_example", "123456", base_url=BASE)
-    assert result.connections == CONNECTIONS
+    assert _dumped(result.connections) == CONNECTIONS
