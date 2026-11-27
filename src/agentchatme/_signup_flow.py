@@ -107,7 +107,9 @@ def is_connect_answer(body: Any) -> bool:
     """A 2xx sign-up body that says ``next_step: "connect"``: the right code
     of a sign-up or recovery started with ``finish="connector"``. No key
     comes with it."""
-    return isinstance(body, Mapping) and cast("Mapping[str, Any]", body).get("next_step") == "connect"
+    return (
+        isinstance(body, Mapping) and cast("Mapping[str, Any]", body).get("next_step") == "connect"
+    )
 
 
 def connect_of(body: Any) -> ConnectorSignupConnect:

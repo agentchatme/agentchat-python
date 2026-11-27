@@ -417,7 +417,11 @@ async def test_a_connect_answer_the_sdk_cannot_use_raises_a_plain_error(
         AgentChatClient.recover_verify("pnd_example", "123456", finish=finish, base_url=BASE)
     assert type(caught.value) is AgentChatError
     assert (caught.value.code, caught.value.status) == ("INTERNAL_ERROR", 200)
-    assert caught.value.details == answer
+    # The body is kept, under details["body"]; the error has no flow, so it is
+    # never followed as a connect answer.
+    assert caught.value.details == {"body": answer}
+    assert account.flow_of(caught.value) is None
+    assert account.action_of(account.flow_of(caught.value), 200, "recover_verify") == "legacy"
     with pytest.raises(AgentChatError) as caught_async:
         await AsyncAgentChatClient.recover_verify("pnd_example", "123456", finish=finish, base_url=BASE)
     assert type(caught_async.value) is AgentChatError
@@ -429,13 +433,18 @@ async def test_a_connect_answer_the_sdk_cannot_use_raises_a_plain_error(
 async def test_an_answer_without_a_key_raises_a_plain_error_never_a_key_error(
     name: str, path: str, _connect: Any, answer: dict[str, Any], _cls: Any, finish: Any
 ) -> None:
+    # A done answer (201 on register) without its key.
     keyless = {k: v for k, v in answer.items() if k != "api_key"}
-    _capture(respx.post(f"{BASE}{path}"), 200, keyless)
+    _capture(respx.post(f"{BASE}{path}"), 201, keyless)
     with pytest.raises(AgentChatError) as caught:
         getattr(AgentChatClient, name)("pnd_example", "123456", finish=finish, base_url=BASE)
     assert type(caught.value) is AgentChatError
-    assert caught.value.code == "INTERNAL_ERROR"
+    assert (caught.value.code, caught.value.status) == ("INTERNAL_ERROR", 201)
     assert "no API key" in str(caught.value)
+    # No flow on the error: never read as done.
+    assert caught.value.details == {"body": keyless}
+    assert account.flow_of(caught.value) is None
+    assert account.action_of(account.flow_of(caught.value), 201, name) == "legacy"
     with pytest.raises(AgentChatError) as caught_async:
         await getattr(AsyncAgentChatClient, name)("pnd_example", "123456", finish=finish, base_url=BASE)
     assert type(caught_async.value) is AgentChatError
@@ -451,6 +460,18 @@ def test_a_recovered_key_is_kept_when_the_answer_names_no_handle() -> None:
     handle, api_key, client = AgentChatClient.recover_verify("pnd_example", "123456", base_url=BASE)
     assert (handle, api_key) == ("", "ac_not_a_real_key")
     client.close()
+
+
+@respx.mock
+async def test_a_connect_answer_without_a_message_has_an_empty_message() -> None:
+    quiet = {k: v for k, v in RECOVER_CONNECT.items() if k != "message"}
+    _capture(respx.post(f"{BASE}/v1/agents/recover/verify"), 200, quiet)
+    result = AgentChatClient.recover_verify("pnd_example", "123456", finish="connector", base_url=BASE)
+    assert isinstance(result, ConnectorVerifyResult)
+    assert result.message == ""
+    with pytest.raises(ConnectorSignupError) as caught:
+        await AsyncAgentChatClient.recover_verify("pnd_example", "123456", base_url=BASE)
+    assert (caught.value.message, str(caught.value), caught.value.result.message) == ("", "", "")
 
 
 @respx.mock
@@ -529,6 +550,22 @@ def test_kit_connect_answer_without_an_address_or_handle_stops(_why: str, answer
     flow: Any = {"version": 1, "flow": "recover", "next_step": "recover_verify", "pending_id": "pnd_example"}
     result = account.submit_code(flow, "123456", **KIT)
     assert (result.action, result.connect, result.handle) == ("stop", None, None)
+
+
+@pytest.mark.parametrize(
+    ("step", "path", "answer", "status"),
+    [
+        ("verify", "/v1/register/verify", REGISTERED, 201),
+        ("recover_verify", "/v1/agents/recover/verify", RECOVERED_DONE, 200),
+    ],
+)
+@respx.mock
+def test_kit_done_answer_without_a_key_stops(step: str, path: str, answer: dict[str, Any], status: int) -> None:
+    keyless = {k: v for k, v in answer.items() if k != "api_key"}
+    _capture(respx.post(f"{BASE}{path}"), status, keyless)
+    flow: Any = {"version": 1, "flow": answer["flow"], "next_step": step, "pending_id": "pnd_example"}
+    result = account.submit_code(flow, "123456", **KIT)
+    assert (result.action, result.api_key, result.handle, result.connect) == ("stop", None, None, None)
 
 
 def test_kit_action_of_no_longer_reads_get_my_status_as_done() -> None:

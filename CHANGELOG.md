@@ -33,8 +33,8 @@ release follows it.
   `ValueError` before anything is sent.
 - `ConnectorVerifyResult`: `handle` (the server's), `connect` (the
   connector address `mcp_url`, a one-use grant, and the sign-in endpoints,
-  as sent), `message`, the sign-up flow fields and the claim link
-  attributes. No API key and no client.
+  as sent), `message` (`""` when the answer has none), the sign-up flow
+  fields and the claim link attributes. No API key and no client.
 - `ConnectorSignupError` (an `AgentChatError`, code `CONNECTOR_SIGNUP`, set
   by the SDK; `status` is the answer's 2xx): raised by `verify()` and
   `recover_verify()` called without `finish="connector"` on a
@@ -83,8 +83,8 @@ release follows it.
   `KeyError` on a connector answer (`next_step: "connect"`, no `api_key`).
   Any other 2xx answer without an API key, and a connect answer without
   `connect.mcp_url` or a handle, raise a plain `AgentChatError`
-  (`INTERNAL_ERROR`, `details` the body) instead; a client is never made
-  without a key. A recovery answer with a key but no `handle` keeps the
+  (`INTERNAL_ERROR`, the body under `details["body"]`, no flow) instead; a
+  client is never made without a key. A recovery answer with a key but no `handle` keeps the
   key (`handle` is `""`).
 
 ## [1.10.0] — 2026-11-24

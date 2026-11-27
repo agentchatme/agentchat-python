@@ -527,7 +527,7 @@ class ConnectorSignupError(AgentChatError):
         fields: Mapping[str, Any] = getattr(result, "_signup_fields", None) or {}
         details = {name: value for name, value in fields.items() if name != "message"}
         super().__init__(
-            {"code": "CONNECTOR_SIGNUP", "message": result.message or "", "details": details},
+            {"code": "CONNECTOR_SIGNUP", "message": result.message, "details": details},
             status,
             request_id,
         )

@@ -304,6 +304,8 @@ class ConnectorVerifyResult(_SignupFlowFields):
     ``handle`` on a recovery), not the one typed."""
     connect: ConnectorSignupConnect
     """The connector address (``mcp_url``) and sign-in endpoints, as sent."""
+    message: str
+    """The server's sentence, to show as is; ``""`` when the answer has none."""
 
     def __init__(
         self, handle: str, connect: ConnectorSignupConnect, *, data: Any = None
@@ -311,6 +313,8 @@ class ConnectorVerifyResult(_SignupFlowFields):
         self.handle = handle
         self.connect = connect
         self._set_signup_fields(data)
+        sent = self._signup_fields.get("message")
+        self.message = sent if isinstance(sent, str) else ""
 
     def __repr__(self) -> str:
         # The address is a one-use grant: kept out of logs.
@@ -443,13 +447,15 @@ def _checked_finish(finish: Any) -> None:
 
 def _malformed(call: str, res: HttpResponse, what: str) -> AgentChatError:
     """A 2xx sign-up answer the SDK cannot use: a plain ``AgentChatError``
-    (``INTERNAL_ERROR``), as for any malformed answer. ``details`` keeps the
-    body, so nothing it did carry is lost."""
+    (``INTERNAL_ERROR``), as for any malformed answer. The body is kept under
+    ``details["body"]``, so nothing it did carry is lost, and ``details``
+    itself has no flow: ``flow_of`` reads none from the error, so the answer
+    is never followed as if it were usable."""
     return AgentChatError(
         {
             "code": "INTERNAL_ERROR",
             "message": f"AgentChat SDK: {call}: the server answered status {res.status} {what}",
-            "details": res.data if isinstance(res.data, dict) else None,
+            "details": {"body": res.data},
         },
         res.status,
         request_id=res.request_id,
@@ -772,8 +778,9 @@ class AgentChatClient:
 
         A 2xx answer the SDK cannot use (no API key on an ordinary answer;
         no ``connect.mcp_url`` or handle on a connect answer) raises a
-        plain :class:`~agentchatme.AgentChatError` (``INTERNAL_ERROR``,
-        ``details`` the body): a client is never made without a key.
+        plain :class:`~agentchatme.AgentChatError` (``INTERNAL_ERROR``, the
+        body under ``details["body"]``, no flow): a client is never made
+        without a key.
         """
         _checked_finish(finish)
         transport = HttpTransport(
