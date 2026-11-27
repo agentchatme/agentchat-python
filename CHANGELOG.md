@@ -155,6 +155,36 @@ release follows it.
   client is never made without a key. A recovery answer with a key but no `handle` keeps the
   key (`handle` is `""`).
 
+### Fixed
+
+- `RealtimeClient`: after a laptop slept (or the process was otherwise
+  suspended), the client stayed deaf until a watchdog noticed. A suspended
+  process runs no timers, while the server closes a socket that has not
+  answered its 45 s ping within 30 s; after the resume the local socket
+  still looked open, and the liveness watchdog and the `websockets`
+  keepalive, frozen through the suspension too, would end it only later. A
+  pending backoff wait resumed late in the same way. The client now checks
+  every 5 s, while connecting, ready or in a backoff wait, how long it was
+  away: how far the wall clock moved ahead of the monotonic clock, or how
+  late the check itself ran. Away 75 s or more (the server's 45 s ping +
+  30 s pong deadline), it ends an open socket, or one in its handshake, at
+  once as client-initiated (the `websockets` transport is aborted, no
+  closing handshake; `close(4000, 'client resumed after suspension')` on a
+  socket without one; `on_disconnect` reports that code and reason) and
+  reconnects at once, the backoff from its first rung; a pending backoff
+  wait is cut short the same way. A connection still opening is left to its
+  open timeout. The clocks are read again whenever a socket opens, so a
+  socket a timer opened after the resume, before the check came due, is
+  kept (and the backoff reset). One `on_error` notice, e.g. `resumed after
+  suspension (~80s) …`, and no second `WebSocket error` for the aborted
+  transport. A smaller gap changes nothing (the liveness watchdog stays in
+  charge). `blocked` keeps its 10–15 min retry, and a wait the server set
+  (the connect budget) is kept, re-armed for the real time it has left. The
+  check is a task the client owns: it stays in the event loop while
+  connecting, ready or in backoff, is off while `idle`, `blocked` or
+  `stopped`, and `disconnect()` cancels and awaits it. Same rules, constants
+  and notice as the TypeScript SDK.
+
 ## [1.10.0] — 2026-11-24
 
 Minor release (added behaviour → minor +1, per VERSIONING.md): connector sign-in is new surface.

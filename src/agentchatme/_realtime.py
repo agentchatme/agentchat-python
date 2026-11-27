@@ -46,6 +46,15 @@ OpenClaw plugin's socket, which Hermes and OpenClaw now get through here):
    socket opening, and a ready socket must show an inbound frame or answer
    a ping within ``liveness_timeout_ms``; a tripped watchdog closes the
    socket as client-initiated (rule 2) and reconnects.
+6. Suspension: a process suspended (a laptop asleep) for at least the
+   server's heartbeat deadline (45 s ping + 30 s pong = 75 s) has lost its
+   socket on the server's side, while its own watchdogs stood still. A check
+   every 5 s, and every socket opening, reads how long the process was away
+   (the wall clock's lead over the monotonic clock, or the check's own
+   lateness); that long ends the socket at once as client-initiated and
+   reconnects now, the backoff from its first rung, or cuts a pending
+   backoff wait short the same way. ``blocked`` keeps its slow retry, and a
+   connect-budget wait is re-armed for the real time it has left.
 
 Guest mode: the client keeps no process-wide state. Several instances run
 side by side in one loop, and :meth:`RealtimeClient.disconnect` releases
@@ -176,6 +185,30 @@ _DEFAULT_HANDSHAKE_TIMEOUT_MS = 15_000
 # answering pings at the transport yet delivers nothing, and for injected
 # transports without a keepalive.
 _DEFAULT_LIVENESS_TIMEOUT_MS = 100_000
+
+# The server's heartbeat: it pings every 45 s and closes a socket whose pong
+# has not arrived 30 s later. A process that could not answer for 45 + 30 =
+# 75 s has therefore lost its socket on the server's side, whatever the local
+# TCP stack still believes (nothing arrived to tell it).
+_SERVER_PING_INTERVAL_S = 45.0
+_SERVER_PONG_TIMEOUT_S = 30.0
+_SERVER_HEARTBEAT_DEADLINE_S = _SERVER_PING_INTERVAL_S + _SERVER_PONG_TIMEOUT_S
+
+# Cadence of the suspension check. A suspended process (a laptop asleep, a
+# paused VM or container, a stopped process) runs no timers, but the wall
+# clock keeps moving; the first reading after the resume (this check, or a
+# socket opening) finds it far ahead (see RealtimeClient._time_away). Away at
+# least _SERVER_HEARTBEAT_DEADLINE_S, the socket is certainly dead and is
+# replaced at once — without it, the watchdogs and the library keepalive,
+# themselves frozen through the suspension, would notice only later (the
+# liveness deadline: up to 100 s of awake time). Less (a GC pause, a busy
+# event loop) changes nothing: the liveness watchdog stays in charge.
+_SUSPENSION_CHECK_INTERVAL_S = 5.0
+
+# The states the suspension check runs in: a socket opening or open, or a
+# backoff wait before the next one. Off while ``blocked`` (its slow retry
+# keeps its own cadence), ``idle`` (nothing to keep) and ``stopped``.
+_SUSPENSION_WATCH_STATES: frozenset[str] = frozenset({"connecting", "ready", "backoff"})
 
 
 def _keepalive_kwargs(connect_fn: Any) -> dict[str, float]:
@@ -817,6 +850,24 @@ class RealtimeClient:
         # The wait used by the reconnect and blocked-retry timers. Tests swap
         # it for a controllable clock; everything else sleeps for real.
         self._sleep: Callable[[float], Awaitable[None]] = _default_sleep
+        # The suspension check (see _SUSPENSION_CHECK_INTERVAL_S): an owned
+        # task while connecting, ready or in backoff.
+        self._suspension_task: asyncio.Task[None] | None = None
+        # Both clocks at the previous suspension reading (see _time_away).
+        self._last_wall_reading = 0.0
+        self._last_mono_reading = 0.0
+        # The close in progress is the one the suspension check asked for:
+        # the recv loop's close handling reconnects at once.
+        self._resumed_from_suspension = False
+        # Wall-clock end of the pending backoff when the server set its
+        # length (the connect budget); None for an ordinary backoff step. A
+        # suspension never cuts a wait the server asked for short of this; it
+        # re-arms it for the real time left.
+        self._reconnect_not_before: float | None = None
+        # The clocks the suspension check reads. Tests swap them to model a
+        # suspension (the wall clock jumps while no timer runs).
+        self._wall_clock: Callable[[], float] = time.time
+        self._monotonic_clock: Callable[[], float] = time.monotonic
         # Message-id dedup shared by the live and drain paths. Survives
         # reconnects deliberately: redelivery across connections is exactly
         # the duplicate source it exists to absorb.
@@ -952,7 +1003,9 @@ class RealtimeClient:
         self._ack_negotiated = False
         self._negotiated = frozenset()
         self._close_initiated_locally = False
+        self._resumed_from_suspension = False
         self._hello_sent = False
+        self._check_at_new_socket()
 
         hello = json.dumps(
             {
@@ -1223,6 +1276,152 @@ class RealtimeClient:
         future.add_done_callback(_consume_future)
         return False
 
+    # ─── Suspension check ────────────────────────────────────────────
+
+    def _watch_for_suspension(self, state: RealtimeState) -> None:
+        """Run the suspension check while there is a connection to keep (see
+        ``_SUSPENSION_WATCH_STATES``); stop it otherwise."""
+        task = self._suspension_task
+        if not self._disposed and state in _SUSPENSION_WATCH_STATES:
+            if task is None or task.done():
+                self._time_away()  # the first reading
+                self._suspension_task = self._spawn(self._suspension_watch())
+            return
+        self._suspension_task = None
+        if task is not None and task is not asyncio.current_task():
+            task.cancel()
+
+    def _time_away(self) -> float:
+        """How long the process was away since the previous reading, in
+        seconds; takes a new one. Through a suspension the monotonic clock
+        (the loop's timers run on it) stands still on most systems while the
+        wall clock moves on: the wall clock's lead is the time away, wherever
+        the reading falls. Where the monotonic clock runs on (a stopped
+        process, some VMs) or the loop was starved, the overdue check runs
+        late instead: its lateness past the check's schedule."""
+        wall = self._wall_clock()
+        mono = self._monotonic_clock()
+        wall_s = wall - self._last_wall_reading
+        mono_s = mono - self._last_mono_reading
+        self._last_wall_reading = wall
+        self._last_mono_reading = mono
+        # A monotonic clock that went backward is not one (a test's fake
+        # clock installed mid-run): its lead says nothing.
+        lead_s = wall_s - mono_s if mono_s >= 0 else 0.0
+        return max(lead_s, wall_s - _SUSPENSION_CHECK_INTERVAL_S)
+
+    async def _suspension_watch(self) -> None:
+        """Check every ``_SUSPENSION_CHECK_INTERVAL_S`` how long the process
+        was away (see :meth:`_time_away`)."""
+        me = asyncio.current_task()
+        try:
+            while self._suspension_task is me:
+                await asyncio.sleep(_SUSPENSION_CHECK_INTERVAL_S)
+                away_s = self._time_away()
+                if away_s >= _SERVER_HEARTBEAT_DEADLINE_S and self._suspension_task is me:
+                    await self._resume_after_suspension(away_s)
+        except asyncio.CancelledError:
+            return
+
+    def _check_at_new_socket(self) -> None:
+        """A socket was just opened. After a resume, a timer due before the
+        check (a backoff step) may open it first: reading the clocks here
+        keeps the check from taking it for one that lived through the
+        suspension, and the suspension is handled here. The notice is
+        spawned: a slow ``on_error`` handler must never hold the HELLO back
+        past the server's 5 s HELLO deadline."""
+        away_s = self._time_away()
+        if away_s < _SERVER_HEARTBEAT_DEADLINE_S:
+            return
+        self._reconnect_attempts = 0
+        self._spawn(self._announce_resume(away_s))
+
+    async def _resume_after_suspension(self, away_s: float) -> None:
+        """The process was away for at least ``_SERVER_HEARTBEAT_DEADLINE_S``:
+        the server has closed the socket by now, though nothing arrived here
+        to say so. Whatever comes next starts the backoff from its first rung
+        (the network is often back seconds after a wake). The socket is ended
+        at once as a client close and the client reconnects now; a pending
+        backoff wait is cut short the same way. A wait the server set (the
+        connect budget) is kept, re-armed for the real time it has left. With
+        ``reconnect=False`` the socket is still ended, and the client goes
+        ``idle`` as after any close. A transport still opening (no socket
+        yet) is left to its own open timeout."""
+        if self._disposed:
+            return
+        self._reconnect_attempts = 0
+        ws = self._ws
+        pending = self._reconnect_task
+        if ws is None and self._state == "backoff" and pending is not None and not pending.done():
+            not_before = self._reconnect_not_before
+            server_wait_left_s = 0.0 if not_before is None else not_before - self._wall_clock()
+            if server_wait_left_s > 0:
+                pending.cancel()
+                self._reconnect_task = asyncio.create_task(self._reconnect_after(server_wait_left_s))
+                return
+        # Announced whatever there is to end: also when an attempt is already
+        # opening (its socket is fresh) or a close is being handled.
+        await self._announce_resume(away_s)
+        if self._disposed:
+            return
+        if ws is not None and self._ws is ws:
+            if self._last_connect_monotonic is not None:
+                # The connection lived through the suspension: by the wall
+                # clock far longer than a rapid reconnect, though the
+                # monotonic clock may have stood still.
+                self._last_connect_monotonic = None
+                self._rapid_reconnects = 0
+            # The recv loop's close handling then skips the backoff wait.
+            self._resumed_from_suspension = True
+            self._close_initiated_locally = True
+            self._spawn(
+                self._end_socket_now(ws, _CLIENT_CLOSE_CODE, "client resumed after suspension")
+            )
+            return
+        await self._skip_backoff_wait()
+
+    async def _announce_resume(self, away_s: float) -> None:
+        await self._emit_error(
+            _RealtimeConnectionError(
+                f"resumed after suspension (~{int(away_s + 0.5)}s): the server has closed"
+                " the connection by now (it closes one that answers no ping for"
+                f" {int(_SERVER_HEARTBEAT_DEADLINE_S)}s); "
+                + (
+                    "reconnecting now"
+                    if self._opts.reconnect
+                    else "reconnect is off, so call connect() to reopen"
+                )
+            )
+        )
+
+    async def _end_socket_now(self, ws: Any, code: int, reason: str) -> None:
+        """End ``ws`` on the client's own decision without waiting on the
+        peer. A ``websockets`` connection has its transport aborted: no
+        closing handshake that a dead pipe would hold open until the
+        library's close timeout (``terminate()`` in the TypeScript SDK). A
+        socket without one (an injected transport) gets the ordinary close."""
+        self._close_initiated_locally = True
+        abort = getattr(getattr(ws, "transport", None), "abort", None)
+        if callable(abort):
+            with contextlib.suppress(Exception):
+                abort()
+            return
+        await self._close_socket(ws, code, reason)
+
+    async def _skip_backoff_wait(self) -> None:
+        """Make the attempt a pending backoff wait holds now, the backoff
+        from its first rung; never the blocked retry. ``connect()`` cancels
+        the pending timer."""
+        pending = self._reconnect_task
+        if self._disposed or self._state != "backoff" or pending is None or pending.done():
+            return
+        self._reconnect_attempts = 0
+        try:
+            await self.connect()
+        except Exception as err:
+            # connect() already emitted and rescheduled (as in _reconnect_after).
+            _log.debug("realtime reconnect attempt failed: %s", err)
+
     async def _set_state(self, state: RealtimeState) -> None:
         """Record a transition and raise ``on("state")`` for it."""
         previous = self._state
@@ -1230,6 +1429,8 @@ class RealtimeClient:
             return
         _log.debug("realtime state %s -> %s", previous, state)
         self._state = state
+        # Before the observers: one that calls disconnect() stops it again.
+        self._watch_for_suspension(state)
         if self._handlers.get("state"):
             await self._dispatch_local({"type": "state", "state": state, "previous": previous})
 
@@ -1357,9 +1558,12 @@ class RealtimeClient:
         except asyncio.CancelledError:
             raise
         except Exception as err:
-            await self._emit_error(
-                _RealtimeConnectionError(f"WebSocket error: {err}")
-            )
+            # The suspension check aborted this transport itself and said so;
+            # the library's "no close frame" error would only repeat it.
+            if not self._resumed_from_suspension:
+                await self._emit_error(
+                    _RealtimeConnectionError(f"WebSocket error: {err}")
+                )
         finally:
             close_code = 0
             close_reason = ""
@@ -1377,6 +1581,12 @@ class RealtimeClient:
             handshake_done = self._authenticated
             quiet_reconnect = self._quiet_reconnect
             self._quiet_reconnect = None
+            resumed = self._resumed_from_suspension
+            self._resumed_from_suspension = False
+            if resumed and ours:
+                # An aborted transport reports no close of its own (1006):
+                # report the client's, as for any close it decided.
+                close_code, close_reason = _CLIENT_CLOSE_CODE, "client resumed after suspension"
             self._hello_sent = False
 
             if self._handshake_task is not None:
@@ -1468,6 +1678,10 @@ class RealtimeClient:
                     # connect budget: the next HELLO is the evidence (rules 2
                     # and 3), after the server's delay when it gave one.
                     await self._schedule_reconnect(server_delay_ms=rate_limited_ms)
+                    if resumed:
+                        # The suspension check ended this socket (rule 6):
+                        # the attempt goes out now, from the first rung.
+                        await self._skip_backoff_wait()
 
     # ─── Offline drain ───────────────────────────────────────────────
 
@@ -1716,6 +1930,9 @@ class RealtimeClient:
             else self._compute_reconnect_delay_ms(attempt)
         )
         delay_s = delay_ms / 1000.0
+        self._reconnect_not_before = (
+            self._wall_clock() + delay_s if server_delay_ms is not None else None
+        )
         _log.debug("realtime reconnect %d scheduled in %.1fs", attempt, delay_s)
         await self._set_state("backoff")
         if self._disposed or self._connecting or self._ws is not None:
@@ -1938,8 +2155,9 @@ class RealtimeClient:
         Buffered out-of-order envelopes are flushed to handlers first (see
         :meth:`_flush_parked_frames`), then the socket closes, then every
         background task (backoff or blocked-retry timer, handshake and idle
-        watchdogs, stability timer, gap timers, drain) is cancelled **and
-        awaited**, so nothing of this instance survives in the loop. Running
+        watchdogs, suspension check, stability timer, gap timers, drain) is
+        cancelled **and awaited**, so nothing of this instance survives in
+        the loop. Running
         handlers get a short grace (1 s) to finish, then are cancelled. The
         one exception is the ``message.new``, frame or ``on_connect`` handler
         that called this, directly or through a task it started (awaited or
