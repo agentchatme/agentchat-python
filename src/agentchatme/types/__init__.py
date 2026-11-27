@@ -40,7 +40,6 @@ from .connection import (
     ConnectorSignupConnect,
     EndConnectionResult,
     RegisterFinish,
-    RegisterStatusResult,
 )
 from .contact import (
     AddContactRequest,
@@ -101,6 +100,8 @@ from .inbox import (
     InboxTray,
     TrayInvite,
     TrayInviteGroup,
+    TrayNotice,
+    TrayNoticeKind,
 )
 from .message import (
     Message,
@@ -127,6 +128,23 @@ from .processing_failure import (
     ProcessingFailureActionName,
     ProcessingFailureEvidence,
     ProcessingFailureOutcome,
+)
+from .reachability import (
+    LISTENER_REPORT_FRESH_MS,
+    LISTENER_REPORT_RESEND_MS,
+    KnownReachabilityProblemKind,
+    KnownReachabilityState,
+    KnownReachabilityVia,
+    KnownWakeMode,
+    ListenerReasonKind,
+    ListenerReport,
+    ListenerState,
+    Reachability,
+    ReachabilityProblem,
+    ReachabilityProblemKind,
+    ReachabilityState,
+    ReachabilityVia,
+    WakeMode,
 )
 from .signup import (
     SIGNUP_FLOW_VERSION,
@@ -172,6 +190,9 @@ __all__ = [
     "INBOX_TRAY_DEFAULT_LIMIT",
     "INBOX_TRAY_MAX_LIMIT",
     "INBOX_WAIT_MAX_MS",
+    # reachability
+    "LISTENER_REPORT_FRESH_MS",
+    "LISTENER_REPORT_RESEND_MS",
     "MAX_ATTACHMENT_SIZE",
     # signup
     "SIGNUP_FLOW_VERSION",
@@ -244,9 +265,16 @@ __all__ = [
     "InboxMode",
     "InboxTray",
     "KnownContainsSecretKind",
+    "KnownReachabilityProblemKind",
+    "KnownReachabilityState",
+    "KnownReachabilityVia",
     "KnownReplyDecisionCategory",
     "KnownWakeDialect",
+    "KnownWakeMode",
     "KnownWakeReason",
+    "ListenerReasonKind",
+    "ListenerReport",
+    "ListenerState",
     # message
     "Message",
     "MessageContent",
@@ -269,10 +297,14 @@ __all__ = [
     "ProcessingFailureActionName",
     "ProcessingFailureEvidence",
     "ProcessingFailureOutcome",
+    "Reachability",
+    "ReachabilityProblem",
+    "ReachabilityProblemKind",
+    "ReachabilityState",
+    "ReachabilityVia",
     "RecoverRequest",
     "RegisterFinish",
     "RegisterRequest",
-    "RegisterStatusResult",
     "ReleaseClaimResult",
     # decision
     "ReplyDecision",
@@ -297,6 +329,8 @@ __all__ = [
     "TextsRuntime",
     "TrayInvite",
     "TrayInviteGroup",
+    "TrayNotice",
+    "TrayNoticeKind",
     "UpdateAgentRequest",
     "UpdateContactRequest",
     "UpdateGroupRequest",
@@ -305,6 +339,7 @@ __all__ = [
     "WakeConversation",
     "WakeDialect",
     "WakeFrame",
+    "WakeMode",
     "WakePayload",
     "WakeReason",
     "WakeWebhookPayload",

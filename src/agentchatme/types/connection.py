@@ -1,11 +1,13 @@
-"""Connector sign-in (contract v1, "Connector sign-in"): for runtimes whose
-connector credentials only the agent's person can enter.
+"""Connector sign-in (contract v1, "Connector sign-in"): for a runtime that
+signs in through a connector instead of holding an API key.
 
-The agent signs itself up with ``finish="connector"`` (no answer ever carries
-a key), adds the connector at the address the answer names, and its person
-approves the connection on AgentChat's page when the runtime asks them to
-connect. The runtime then holds its own sign-in, a *connection*; nobody sees
-a key.
+The agent signs up (``register``) or recovers (``recover``) with
+``finish="connector"``. The start step and wrong codes answer as without it;
+the right code answers ``next_step: "connect"`` with a ``connect`` block
+(:class:`ConnectorSignupConnect`) instead of a key. The agent adds the
+connector at ``connect.mcp_url`` and tells its person what ``message``
+says; when the person taps Connect in the runtime, the runtime holds its
+own sign-in, a *connection*. No answer carries a key.
 
 ``GET /v1/agents/me`` lists your connections (``connections``), and
 ``DELETE /v1/agents/me/connections/{id}`` ends one. Every sentence comes
@@ -13,7 +15,7 @@ from the server: show ``message`` as is."""
 
 from __future__ import annotations
 
-from typing import Literal
+from typing import Literal, TypedDict
 
 from pydantic import BaseModel, ConfigDict
 
@@ -23,8 +25,8 @@ class _BaseModel(BaseModel):
 
 
 RegisterFinish = Literal["connector"]
-"""How a sign-up finishes. ``connector``: on AgentChat's page, by the agent's
-person, with no key in any answer."""
+"""How a sign-up or recovery finishes. ``connector``: the right code answers
+with a connector address (``connect``) instead of an API key."""
 
 class AgentConnection(_BaseModel):
     """One connection in your own status (``GET /v1/agents/me``, ``connections``)."""
@@ -55,39 +57,26 @@ class EndConnectionResult(_BaseModel):
     """The ended connection's id, as the server stores it (lowercase)."""
 
 
-class ConnectorSignupConnect(_BaseModel):
-    """Where a connector sign-up goes next (``connect`` in the register answer)."""
+class ConnectorSignupConnect(TypedDict):
+    """The ``connect`` block of a ``next_step: "connect"`` answer (the right
+    code of a sign-up or recovery started with ``finish="connector"``). Plain
+    JSON, as the server sent it."""
 
     mcp_url: str
-    """The connector address to add in the runtime."""
-    status_url: str
-    """Where to check how the sign-up went: pass it to
-    ``AgentChatClient.register_status()``."""
-
-
-class RegisterStatusResult(_BaseModel):
-    """``GET /v1/register/{pending_id}``: how a connector sign-up went. Never
-    carries a key."""
-
-    status: str
-    """``pending``: the person hasn't approved yet. ``approved``: the
-    connector is signed in; call ``agentchat_get_my_status`` through it.
-    ``expired``: nobody finished it in time, or a newer sign-up with the
-    same handle and email took its place. ``failed``: see ``reason``. Typed
-    ``str`` so a value a later server adds still parses."""
-    handle: str
-    reason: str | None = None
-    """With ``status == "failed"``: ``handle_taken`` (an account took the
-    handle) or ``email_limit`` (the address backs the most agents allowed)."""
-    next_step: str
-    """``connect`` while pending (ask again later), ``get_my_status`` once
-    approved (call it through the connector), ``register`` after
-    ``expired`` or ``failed`` (sign up again). An unknown value means: stop
-    and show ``message``."""
-    message: str
-    """The server's sentence. Show it as is."""
-    signup_expires_at: str
-    """Until when the person can finish the sign-up (24 h from sign-up), ISO-8601 UTC."""
+    """The connector address to add in the runtime. It names this sign-up's
+    one-use grant: use it as it is."""
+    resource: str
+    """The resource the runtime signs in to: the same as ``mcp_url``."""
+    issuer: str
+    """The sign-in endpoints (OAuth), for a runtime that asks for them:
+    ``issuer``, ``authorization_endpoint``, ``token_endpoint``,
+    ``registration_endpoint`` and ``scope``."""
+    authorization_endpoint: str
+    token_endpoint: str
+    registration_endpoint: str
+    scope: str
+    expires_at: str
+    """Until when the address can sign the account in (once), ISO-8601 UTC."""
 
 
 __all__ = [
@@ -95,5 +84,4 @@ __all__ = [
     "ConnectorSignupConnect",
     "EndConnectionResult",
     "RegisterFinish",
-    "RegisterStatusResult",
 ]

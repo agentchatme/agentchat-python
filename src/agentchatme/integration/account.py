@@ -52,9 +52,11 @@ import httpx
 from .._client import DEFAULT_BASE_URL, _static_options
 from .._client_identity import AgentChatClientIdentity
 from .._http import AsyncHttpTransport, HttpResponse, HttpTransport, HttpTransportOptions
-from .._signup_flow import flow_of, whole_seconds
+from .._signup_flow import connect_of, flow_of, whole_seconds
 from ..errors import AgentChatError, ConnectionError, RateLimitedError
 from ..types.agent import HeardFrom
+from ..types.connection import ConnectorSignupConnect, RegisterFinish
+from ..types.reachability import Reachability, reachability_of
 from ..types.signup import SIGNUP_FLOW_VERSION, SignupFlow
 
 MAX_WAIT_S = 60
@@ -78,11 +80,12 @@ SignupAction = Literal[
 ``param``, ``retry_after_s``, the HTTP status and the step that was called
 (conformance ``signup-flow.cases.json``; :func:`action_of` has the order):
 
-- ``done``: ``next_step: "done"`` (the key is in the body), or
-  ``get_my_status`` (a connector sign-up's status: the connector is signed in).
-- ``connect``: ``next_step: "connect"`` (a connector sign-up): add the
-  connector at ``connect.mcp_url``, show ``message``, then follow
-  ``connect.status_url``. :func:`run` signs up with a key: it stops here.
+- ``done``: ``next_step: "done"`` (the key is in the body).
+- ``connect``: ``next_step: "connect"`` (the right code of a sign-up or
+  recovery started with ``finish="connector"``): the flow is done and no key
+  comes; add the connector from ``connect`` (:attr:`StepResult.connect`) at
+  its ``mcp_url`` and show ``message``. :func:`run` signs up with a key (it
+  never sends ``finish``).
 - ``ask_code``: a verify step, no ``retry_after_s``.
 - ``ask_param``: a start step with ``param``: re-ask that field, call the
   start step again.
@@ -130,6 +133,10 @@ class RegisterInput(_RegisterInputRequired, total=False):
     runtime: str
     heard_from: HeardFrom
     referred_by: str
+    finish: RegisterFinish
+    """``"connector"``: the right code answers ``connect`` (a connector
+    address) instead of a key. Sent only when given. :func:`start` only:
+    :func:`run` ends with a key."""
 
 
 class _RecoverInputRequired(TypedDict):
@@ -141,6 +148,10 @@ class RecoverInput(_RecoverInputRequired, total=False):
     ``handle`` whenever it is known."""
 
     handle: str
+    finish: RegisterFinish
+    """``"connector"``: the right code answers ``connect`` (a connector
+    address) instead of a new key; the key stays as it is. Sent only when
+    given. :func:`start` only: :func:`run` ends with a key."""
 
 
 _REGISTER_OPTIONAL = ("display_name", "description", "runtime", "heard_from", "referred_by")
@@ -206,9 +217,18 @@ class StepResult:
     api_key: str | None = field(default=None, repr=False)
     """On ``done``: the API key. Shown once; save it."""
     handle: str | None = None
-    """On ``done``: the handle the server returned. Save this one, not the typed one."""
+    """On ``done`` and ``connect``: the handle the server returned. Save this
+    one, not the typed one."""
     handles: tuple[str, ...] | None = None
     """``HANDLE_REQUIRED``: the handles on this email (``details.handles``), to choose from."""
+    connect: ConnectorSignupConnect | None = field(default=None, repr=False)
+    """On ``connect``: the connector address (``mcp_url``, a one-use grant)
+    and the sign-in endpoints, as sent. Add the connector from it."""
+    reachability: Reachability | None = None
+    """On ``done``, when the server sent it: whether AgentChat can start the
+    agent's runs (contract v1 §3.12). For a new account ``state == "none"``
+    and ``text`` the ways to be woken; show ``text`` to the person or the
+    agent as it is. ``action`` stays ``done`` whatever it says."""
 
 
 RunOutcome = Literal["done", "cancelled", "stopped"]
@@ -217,8 +237,8 @@ RunOutcome = Literal["done", "cancelled", "stopped"]
 @dataclass(frozen=True)
 class RunResult:
     """How :func:`run` ended: ``done`` (``api_key`` and ``handle`` set; save
-    both), ``cancelled``, or ``stopped`` (``code`` and ``message`` set; the
-    message has been shown)."""
+    both; ``reachability`` when the server sent it), ``cancelled``, or
+    ``stopped`` (``code`` and ``message`` set; the message has been shown)."""
 
     outcome: RunOutcome
     api_key: str | None = field(default=None, repr=False)
@@ -226,6 +246,8 @@ class RunResult:
     code: str | None = None
     """``stopped``: the error code, or ``None`` when a 2xx answer stopped it."""
     message: str | None = None
+    reachability: Reachability | None = None
+    """``done``: as on :class:`StepResult`; show its ``text`` as it is."""
 
 
 @dataclass(frozen=True)
@@ -253,7 +275,7 @@ def action_of(flow: SignupFlow | None, http_status: int, called_step: str) -> Si
     first match wins:
 
     - ``legacy``: no flow object.
-    - ``done``: ``next_step`` is ``done``, or ``get_my_status``.
+    - ``done``: ``next_step`` is ``done``.
     - ``connect``: ``next_step`` is ``connect``.
     - ``stop``: a ``next_step`` this release does not know, or any 5xx (the
       account may exist after a verify 500: never steer to a second one).
@@ -271,7 +293,7 @@ def action_of(flow: SignupFlow | None, http_status: int, called_step: str) -> Si
     if flow is None:
         return "legacy"
     step = flow.get("next_step")
-    if step in ("done", "get_my_status"):
+    if step == "done":
         return "done"
     if step == "connect":
         return "connect"
@@ -466,6 +488,14 @@ def _read(
     # ``done`` means the key is in the body; without one there is nothing to save.
     if action == "done" and (api_key is None or handle is None):
         action = "stop"
+    # ``connect`` means the connector address is in the body; without it (or
+    # the handle) there is nothing to add.
+    connect = connect_of(body) if error is None and action == "connect" else None
+    if action == "connect" and (
+        connect is None or _text(connect.get("mcp_url")) is None or handle is None
+    ):
+        action = "stop"
+        connect = None
     # A code step without a pending id cannot be answered.
     if action == "ask_code" and "pending_id" not in flow:
         action = "stop"
@@ -475,6 +505,11 @@ def _read(
         raw = cast("Mapping[str, Any]", body).get("message") if isinstance(body, Mapping) else None
         message = raw if isinstance(raw, str) else ""
     is_done = action == "done"
+    reachability = (
+        reachability_of(cast("Mapping[str, Any]", body).get("reachability"))
+        if is_done and isinstance(body, Mapping)
+        else None
+    )
     return StepResult(
         flow=flow,
         message=message,
@@ -484,8 +519,10 @@ def _read(
         legacy=legacy,
         code=error.code if error is not None else None,
         api_key=api_key if is_done else None,
-        handle=handle if is_done else None,
+        handle=handle if is_done or action == "connect" else None,
         handles=_handles_of(error),
+        connect=connect,
+        reachability=reachability,
     )
 
 
@@ -496,7 +533,13 @@ def _start_call(kind: Any, input: Any) -> tuple[_Steps, dict[str, Any]]:
     if not isinstance(input, Mapping):
         raise TypeError("integration.account.start: input must be a mapping")
     values = cast("Mapping[str, Any]", input)
-    names = ("email", "handle", *_REGISTER_OPTIONAL) if kind == "register" else ("email", "handle")
+    # `finish` stays out of _REGISTER_OPTIONAL: that tuple is also what run()
+    # sends, and run() takes no finish.
+    names = (
+        ("email", "handle", *_REGISTER_OPTIONAL, "finish")
+        if kind == "register"
+        else ("email", "handle", "finish")
+    )
     # Optional fields are sent only when set: the server validates a present
     # field, so None must be absent, never null.
     return steps, {name: values[name] for name in names if values.get(name) is not None}
@@ -583,7 +626,9 @@ def start(
     """Start a flow: ``register`` sends a code to ``input["email"]`` for a new
     agent ``input["handle"]``; ``recover`` sends a code to the email the
     agent was registered with. One call, never retried (a second code would
-    be sent).
+    be sent). ``input["finish"]`` (``"connector"``) is sent when given: the
+    right code then answers ``connect`` (:attr:`StepResult.connect`)
+    instead of a key.
 
     Returns every answer the server gives; raises
     :class:`~agentchatme.ConnectionError` only when there is no answer
@@ -935,7 +980,12 @@ def _machine(
         next_call: _Next = _STOP
 
         if action == "done":
-            return RunResult(outcome="done", api_key=result.api_key, handle=result.handle)
+            return RunResult(
+                outcome="done",
+                api_key=result.api_key,
+                handle=result.handle,
+                reachability=result.reachability,
+            )
 
         if action == "ask_code":
             expires_at = _expiry_of(flow, received_at)
@@ -992,6 +1042,17 @@ def _run_kind(kind: Any) -> AccountKind:
     raise ValueError(f"integration.account.run: unknown kind {kind!r}")
 
 
+def _run_input(input: Mapping[str, Any] | None) -> Mapping[str, Any] | None:
+    """:func:`run` signs up with a key: it never sends ``finish``, so it
+    refuses an ``input`` that asks for one rather than leave it out."""
+    if isinstance(input, Mapping) and input.get("finish") is not None:
+        raise TypeError(
+            "integration.account.run signs up with a key and never sends finish; "
+            "for finish, call start() and submit_code()"
+        )
+    return input
+
+
 def _labels(overrides: Mapping[str, str] | None) -> AccountLabels:
     chosen = overrides or {}
 
@@ -1040,15 +1101,19 @@ def run(
 
     ``input`` is what is known up front (:class:`RegisterInput` /
     :class:`RecoverInput`); a missing ``email`` (or, to register, ``handle``)
-    is asked first. ``sleep`` takes seconds (default :func:`time.sleep`).
+    is asked first. It ends with a key: an ``input`` with ``finish`` raises
+    ``TypeError`` (use :func:`start` and :func:`submit_code`).
+    ``sleep`` takes seconds (default :func:`time.sleep`).
 
-    Returns ``done`` with ``api_key`` and ``handle`` (save both),
+    Returns ``done`` with ``api_key`` and ``handle`` (save both; show
+    ``reachability.text``, when present, as it is),
     ``cancelled``, or ``stopped`` with ``code`` and ``message`` (the message
     has been shown). Raises :class:`~agentchatme.ConnectionError` when the
     server cannot be reached, ``TypeError`` for an answer the question does
-    not allow, and whatever ``ask`` / ``show`` / ``sleep`` raise.
+    not allow or an ``input`` with ``finish``, and whatever ``ask`` /
+    ``show`` / ``sleep`` raise.
     """
-    machine = _machine(_run_kind(kind), input, _labels(labels))
+    machine = _machine(_run_kind(kind), _run_input(input), _labels(labels))
     pause: Callable[[float], Any] = sleep if sleep is not None else time.sleep
     calls: dict[str, Any] = {
         "client_identity": client_identity,
@@ -1097,7 +1162,7 @@ async def run_async(
     """:func:`run` on an event loop. ``ask``, ``show`` and ``sleep`` may be
     plain functions or coroutine functions; ``sleep`` defaults to
     :func:`asyncio.sleep`."""
-    machine = _machine(_run_kind(kind), input, _labels(labels))
+    machine = _machine(_run_kind(kind), _run_input(input), _labels(labels))
     pause: Callable[[float], Any] = sleep if sleep is not None else asyncio.sleep
     calls: dict[str, Any] = {
         "client_identity": client_identity,

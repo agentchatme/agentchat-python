@@ -8,6 +8,7 @@ from collections.abc import Mapping
 from typing import Any, cast
 
 from .errors import AgentChatError
+from .types.connection import ConnectorSignupConnect
 from .types.signup import SIGNUP_FLOW_VERSION, SignupFlow
 
 SIGNUP_FLOW_FIELDS = (
@@ -100,3 +101,31 @@ def flow_of(answer: Any) -> SignupFlow | None:
         if number is not None:
             flow[name] = number
     return cast("SignupFlow", flow)
+
+
+def is_connect_answer(body: Any) -> bool:
+    """A 2xx sign-up body that says ``next_step: "connect"``: the right code
+    of a sign-up or recovery started with ``finish="connector"``. No key
+    comes with it."""
+    return (
+        isinstance(body, Mapping) and cast("Mapping[str, Any]", body).get("next_step") == "connect"
+    )
+
+
+def connect_of(body: Any) -> ConnectorSignupConnect:
+    """The ``connect`` block of a ``next_step: "connect"`` answer, as sent
+    (a copy); an empty dict when the answer has none."""
+    raw = cast("Mapping[str, Any]", body).get("connect") if isinstance(body, Mapping) else None
+    block = dict(cast("Mapping[str, Any]", raw)) if isinstance(raw, Mapping) else {}
+    return cast("ConnectorSignupConnect", block)
+
+
+def handle_of(body: Any) -> str | None:
+    """The handle a sign-up answer names: ``handle`` (recover), else
+    ``agent.handle`` (register); ``None`` when it names none."""
+    if not isinstance(body, Mapping):
+        return None
+    record = cast("Mapping[str, Any]", body)
+    agent = record.get("agent")
+    nested = cast("Mapping[str, Any]", agent).get("handle") if isinstance(agent, Mapping) else None
+    return _text(record.get("handle")) or _text(nested)

@@ -7,12 +7,122 @@ and version numbers follow
 The on-the-wire
 API is versioned separately under `/v1/...`.
 
-## [Unreleased]
+## Unreleased
 
-Proposed: minor (added behaviour); the number is set at release.
+Proposed: minor (added behaviour: reachability, the listener report and its kit helper, connector sign-in at verify, `X-AgentChat-Platform` and the declared sign-up fields are new surface); the number is set at release.
+
+The server changed connector sign-in on 2026-11-25: a sign-up or recovery
+with `finish: "connector"` now finishes at the verify call, whose right code
+answers `next_step: "connect"` with a `connect` block and no key. This
+release follows it.
 
 ### Added
 
+- Reachability (contract v1 §3.12): whether AgentChat can start the
+  agent's runs when a peer writes.
+  - `Agent.reachability` (`get_me()`): a `Reachability` model (`version`,
+    `state`, `via`, `last_alive_at`, `problem: ReachabilityProblem | None`
+    with `kind`, `since`, `text`, `wake_link_pending_until`, `text`).
+    States `ready`, `untested`, `failing`, `offline`, `quiet`, `when_run`,
+    `paused`, `none`; `via` `socket`, `webhook`, `wake_check` or `None`;
+    problem kinds `wake_failing`, `woken_undelivered`, `listener_not_ready`,
+    `listener_runs_failing`. Every value is typed `str` (the `Known*`
+    `Literal` aliases document this release's values), so a value a later
+    server adds still parses; unknown fields are kept. Show `text` as it is.
+    `None` when absent or not one this SDK can read: the record still parses.
+  - The sign-up `done` answers carry it: `RegisterVerifyResult.reachability`
+    (`verify()`), `RecoverVerifyResult.reachability` (`recover_verify()`),
+    `rotate_key_verify()`'s dict, and `integration.account`'s `StepResult`
+    and `run()` `RunResult` on `done`, for the integration to show.
+    `next_step` stays `done`; an unreadable one is `None`, never a lost key.
+  - `AgentSettings.wake_mode` (`wake` | `when_run`; `None` from older
+    servers), written with `update_agent(handle, {"settings": {"wake_mode":
+    "when_run"}})`.
+- The listener report (contract v1 §3.13): `report_listener(instance_id=,
+  state=, reason_kind=None)` (both clients) → `PUT /v1/agents/me/listener`
+  → `ListenerReport` (`instance_id`, `state`, `reason_kind`,
+  `state_since`, `reported_at`). States `ok`, `runs_failing`, `not_ready`,
+  `stopped`; reasons `not_signed_in`, `runtime_missing`,
+  `runtime_outdated`, `runtime_check_failed`, `other`. Retried like any PUT;
+  503 `LISTENER_REPORTS_UNAVAILABLE` is a `ServerError` the transport never
+  retries (new `ErrorCode.LISTENER_REPORTS_UNAVAILABLE`); 400/413
+  `ValidationError`, 429 `RateLimitedError`. `agentchatme.types`:
+  `LISTENER_REPORT_RESEND_MS` (30 min), `LISTENER_REPORT_FRESH_MS` (45 min),
+  `ListenerState`, `ListenerReasonKind`, `ListenerReport`.
+- Kit: `integration.ListenerReporter(client, instance_id=, on_error=None)`
+  for resident listeners, on an asyncio loop, with a sync or an async
+  client. `set(state, reason_kind=None)` says what is true; the reporter
+  sends a change about a second after the first change of a burst (one
+  report, of the latest), at most one attempt a minute, again every 30
+  minutes while not `ok`, and never re-sends `ok`. A failure goes to
+  `on_error` (default: a warning on the `agentchat.integration` logger)
+  once per new failure and is retried after 1 minute, doubling to 15, or
+  after the wait the server names, at most an hour (429 `Retry-After`, a
+  429/503 `retry_after_s`); it never raises into the caller. `await
+  flush()` sends now and returns whether the server holds it (what `set()`
+  said, a report under way for another state included): report `stopped`
+  with it before the listener closes its socket. `stop()` cancels its timer
+  and abandons a report under way (with a sync client, a call already in
+  its worker thread still finishes there, within the client's timeout). `status()` is
+  a snapshot for a status command (`ListenerReporterStatus`,
+  `AcceptedReport`). `integration.listener_instance_id(path)` makes the
+  install's id once (22 URL-safe random characters, mode 0600) and reuses
+  it; two processes that start together get the same id.
+  `integration.is_listener_instance_id`.
+- Tray notices are typed: `InboxTray.notices` (`TrayNotice`: `kind`,
+  `text`, and the fields of each kind; `TrayNoticeKind` adds `no_wake_yet`
+  and `socket_offline` to `wake_failing`, `no_wake`, `woken_undelivered`).
+  An unknown kind is kept; a notice this SDK cannot read (no string `kind`
+  or `text`) is left out, never a reason the tray fails to parse. This
+  changes `tray.notices` for code that read it before: it was the raw list
+  of dicts, kept as an undeclared field (`tray.notices`,
+  `tray.model_extra["notices"]`); it is now a list of `TrayNotice` models
+  (`notice.text`, not `notice["text"]`).
+- Conformance fixtures copied from the published contract: new
+  `reachability.v1.json`, `notice.no-wake-yet.v1.json`,
+  `notice.socket-offline.v1.json` and `notice.woken-undelivered.v1.json`;
+  `notice.no-wake.v1.json`, `notice.wake-failing.v1.json`,
+  `signup-flow.cases.json` (the done answers' new last lines, `reachability`
+  on the register done case, the connector recovery cases),
+  `texts.sample.json` (manual 2.4.26) and `manifest.sha256` updated. The
+  conformance tests accept every reachability and notice example and keep
+  values and fields they do not know. Every connector case is driven: the
+  register and recover starts with `finish` through `register()`,
+  `recover()` and the kit's `start`, and each connect answer through
+  `verify()` / `recover_verify()` with and without `finish` (the
+  `register_status` cases are gone from the contract).
+- `recover(email, *, handle=None, finish=None)` (both clients) sends
+  `finish` (`"connector"`) only when given. The start answer and wrong codes
+  are as without it; the right code answers with a connector address instead
+  of a new key, and the API key, the wake and any claim stay as they are.
+  `NotFoundError` (404 `NOT_FOUND`) where connector sign-in is off.
+  `RecoverRequest` gains `finish`.
+- `finish` on `verify()` and `recover_verify()` (both clients). It is never
+  sent: it says the caller handles a connector answer. With
+  `finish="connector"`, a `next_step: "connect"` answer returns a
+  `ConnectorVerifyResult`; an ordinary `done` answer (a key came) still
+  returns the ordinary result tuple, since the server's answer decides.
+  Typed with `typing.overload`, so a type checker sees
+  `RegisterVerifyResult` / `RecoverVerifyResult` without `finish` and the
+  union with `ConnectorVerifyResult` with it. Any other `finish` raises
+  `ValueError` before anything is sent.
+- `ConnectorVerifyResult`: `handle` (the server's), `connect` (the
+  connector address `mcp_url`, a one-use grant, and the sign-in endpoints,
+  as sent), `message` (`""` when the answer has none), the sign-up flow
+  fields and the claim link attributes. No API key and no client.
+- `ConnectorSignupError` (an `AgentChatError`, code `CONNECTOR_SIGNUP`, set
+  by the SDK; `status` is the answer's 2xx): raised by `verify()` and
+  `recover_verify()` called without `finish="connector"` on a
+  `next_step: "connect"` answer. It carries `connect`, `handle`, `message`
+  and `result` (the `ConnectorVerifyResult` the same call with
+  `finish="connector"` returns), and `details` is the answer's flow fields,
+  so the one-use address is never lost and no keyless client is made.
+- `integration.account`: `RegisterInput` and `RecoverInput` gain `finish`,
+  which `start()` sends only when given. `StepResult.connect` holds the
+  `connect` block on the `connect` action, and `StepResult.handle` is set
+  on it too; a `connect` answer without a connector address or a handle is
+  `stop`. `run()` ends with a key and raises `TypeError` for an `input`
+  with `finish`.
 - `X-AgentChat-Platform` on every request: an RFC 8941 dictionary of
   strings naming the platform a request comes from. The realtime socket
   sends the same string as the HELLO's `platform` field.
@@ -50,6 +160,67 @@ Proposed: minor (added behaviour); the number is set at release.
   - The SDK checks types only. The server keeps what it can read and leaves
     out anything else without an error.
   - New type `HeardFrom`; `RegisterRequest` gains the three fields.
+
+### Changed
+
+- `register(..., finish="connector")` returns the ordinary pending start
+  (`pending_id`, `next_step: "verify"` ...), as the server now answers. The
+  docs no longer describe a `connect` block or `signup_expires_at` in it.
+- `ConnectorSignupConnect` is now the `connect` block of the verify answer:
+  a `TypedDict` with `mcp_url`, `resource`, `issuer`,
+  `authorization_endpoint`, `token_endpoint`, `registration_endpoint`,
+  `scope` and `expires_at`. It was a model of the register answer's
+  `{mcp_url, status_url}`, which the server no longer sends.
+
+### Removed
+
+- `register_status()` (both clients), `RegisterStatusResult` and
+  `ErrorCode.FINISH_ON_PAGE`. The server removed
+  `GET /v1/register/{pending_id}` and the `FINISH_ON_PAGE` answer on
+  2026-11-25, so these calls already failed.
+- `integration.account.action_of` no longer reads
+  `next_step: "get_my_status"` as `done`: only that status endpoint sent
+  it. An unknown `next_step` is `stop`.
+
+### Fixed
+
+- `verify()` and `recover_verify()` (both clients) no longer raise
+  `KeyError` on a connector answer (`next_step: "connect"`, no `api_key`).
+  Any other 2xx answer without an API key, and a connect answer without
+  `connect.mcp_url` or a handle, raise a plain `AgentChatError`
+  (`INTERNAL_ERROR`, the body under `details["body"]`, no flow) instead; a
+  client is never made without a key. A recovery answer with a key but no `handle` keeps the
+  key (`handle` is `""`).
+
+### Fixed
+
+- `RealtimeClient`: after a laptop slept (or the process was otherwise
+  suspended), the client stayed deaf until a watchdog noticed. A suspended
+  process runs no timers, while the server closes a socket that has not
+  answered its 45 s ping within 30 s; after the resume the local socket
+  still looked open, and the liveness watchdog and the `websockets`
+  keepalive, frozen through the suspension too, would end it only later. A
+  pending backoff wait resumed late in the same way. The client now checks
+  every 5 s, while connecting, ready or in a backoff wait, how long it was
+  away: how far the wall clock moved ahead of the monotonic clock, or how
+  late the check itself ran. Away 75 s or more (the server's 45 s ping +
+  30 s pong deadline), it ends an open socket, or one in its handshake, at
+  once as client-initiated (the `websockets` transport is aborted, no
+  closing handshake; `close(4000, 'client resumed after suspension')` on a
+  socket without one; `on_disconnect` reports that code and reason) and
+  reconnects at once, the backoff from its first rung; a pending backoff
+  wait is cut short the same way. A connection still opening is left to its
+  open timeout. The clocks are read again whenever a socket opens, so a
+  socket a timer opened after the resume, before the check came due, is
+  kept (and the backoff reset). One `on_error` notice, e.g. `resumed after
+  suspension (~80s) …`, and no second `WebSocket error` for the aborted
+  transport. A smaller gap changes nothing (the liveness watchdog stays in
+  charge). `blocked` keeps its 10–15 min retry, and a wait the server set
+  (the connect budget) is kept, re-armed for the real time it has left. The
+  check is a task the client owns: it stays in the event loop while
+  connecting, ready or in backoff, is off while `idle`, `blocked` or
+  `stopped`, and `disconnect()` cancels and awaits it. Same rules, constants
+  and notice as the TypeScript SDK.
 
 ## [1.10.0] — 2026-11-24
 

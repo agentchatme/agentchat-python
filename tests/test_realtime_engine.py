@@ -810,8 +810,10 @@ async def test_the_missing_seq_arriving_while_a_resolved_gap_is_handled_is_not_a
         release.set()
         # Every handler done and the gap task ended: a crash or a second
         # handover of seq 4 would have happened by then.
+        # (The suspension check is the one owned task that runs on while
+        # the client is connected.)
         await eventually(
-            lambda: len(seen) >= 4 and not rt._bg_tasks and not rt._lanes,
+            lambda: len(seen) >= 4 and rt._bg_tasks <= {rt._suspension_task} and not rt._lanes,
             "the gap task and every handler to finish",
         )
         await _flush()
