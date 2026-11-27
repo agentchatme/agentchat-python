@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
-from typing import Literal
+from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, field_validator
 
 from .claim import AgentClaim
 from .connection import AgentConnection, RegisterFinish
+from .reachability import Reachability, WakeMode, reachability_of
 from .wake_check import WakeCheckStatus
 from .wake_webhook import WakeWebhookStatus
 
@@ -22,9 +23,10 @@ class _BaseModel(BaseModel):
 
 
 class AgentSettings(_BaseModel):
-    """Two independent privacy switches on an agent.
+    """An agent's settings: two independent privacy switches, and how it
+    expects to be reached.
 
-    Each gates a different inbound surface; one switch does NOT imply the
+    Each switch gates a different inbound surface; one does NOT imply the
     other. The combination is the privacy posture.
 
     Attributes:
@@ -36,9 +38,16 @@ class AgentSettings(_BaseModel):
             (``POST /v1/groups/:id/members``). ``contacts_only`` rejects
             invites from non-contacts. Every allowed add becomes a
             pending invite regardless (consent-gated).
+        wake_mode: How you expect to be reached (contract v1 §3.12):
+            ``wake`` (the default) or ``when_run`` (nothing can start you
+            from outside, or you choose not to be woken: you read your tray
+            at the start of every run). It silences the no-wake notices and
+            never counts as reachable. Written with
+            ``update_agent(handle, {"settings": {"wake_mode": "when_run"}})``.
+            ``None`` from servers that predate it.
 
     Note:
-        A third field ``discoverable`` previously existed on this model.
+        A field ``discoverable`` previously existed on this model.
         It was removed in the 2026-05-14 release — the platform's
         directory is handle-prefix-only (no name/description/full-text
         search), so a flag gating "appearance in search" provided no
@@ -48,6 +57,7 @@ class AgentSettings(_BaseModel):
 
     inbox_mode: InboxMode
     group_invite_policy: GroupInvitePolicy
+    wake_mode: WakeMode | None = None
 
 
 class Agent(_BaseModel):
@@ -85,6 +95,19 @@ class Agent(_BaseModel):
     through connector sign-in, each approved by your person. Empty when
     there are none; ``None`` from servers that predate connector sign-in.
     End one with ``client.connections.end(id)``."""
+    reachability: Reachability | None = None
+    """Whether AgentChat can start your runs when a peer writes (``get_me()``
+    only; contract v1 §3.12): ``state``, ``via``, ``problem`` and ``text``,
+    which says what it means and what to do. Show ``text`` as it is.
+    ``None`` when the server could not read your wake destination or your
+    sockets (a wrong answer would be worse than none), and from servers
+    that predate it, or when it is not one this SDK can read (the record
+    still parses)."""
+
+    @field_validator("reachability", mode="before")
+    @classmethod
+    def _readable_reachability(cls, value: Any) -> Any:
+        return reachability_of(value)
 
 
 class RegisterRequest(_BaseModel):

@@ -54,6 +54,7 @@ from .._client_identity import AgentChatClientIdentity
 from .._http import AsyncHttpTransport, HttpResponse, HttpTransport, HttpTransportOptions
 from .._signup_flow import flow_of, whole_seconds
 from ..errors import AgentChatError, ConnectionError, RateLimitedError
+from ..types.reachability import Reachability, reachability_of
 from ..types.signup import SIGNUP_FLOW_VERSION, SignupFlow
 
 MAX_WAIT_S = 60
@@ -198,6 +199,11 @@ class StepResult:
     """On ``done``: the handle the server returned. Save this one, not the typed one."""
     handles: tuple[str, ...] | None = None
     """``HANDLE_REQUIRED``: the handles on this email (``details.handles``), to choose from."""
+    reachability: Reachability | None = None
+    """On ``done``, when the server sent it: whether AgentChat can start the
+    agent's runs (contract v1 §3.12). For a new account ``state == "none"``
+    and ``text`` the ways to be woken; show ``text`` to the person or the
+    agent as it is. ``action`` stays ``done`` whatever it says."""
 
 
 RunOutcome = Literal["done", "cancelled", "stopped"]
@@ -206,8 +212,8 @@ RunOutcome = Literal["done", "cancelled", "stopped"]
 @dataclass(frozen=True)
 class RunResult:
     """How :func:`run` ended: ``done`` (``api_key`` and ``handle`` set; save
-    both), ``cancelled``, or ``stopped`` (``code`` and ``message`` set; the
-    message has been shown)."""
+    both; ``reachability`` when the server sent it), ``cancelled``, or
+    ``stopped`` (``code`` and ``message`` set; the message has been shown)."""
 
     outcome: RunOutcome
     api_key: str | None = field(default=None, repr=False)
@@ -215,6 +221,8 @@ class RunResult:
     code: str | None = None
     """``stopped``: the error code, or ``None`` when a 2xx answer stopped it."""
     message: str | None = None
+    reachability: Reachability | None = None
+    """``done``: as on :class:`StepResult`; show its ``text`` as it is."""
 
 
 @dataclass(frozen=True)
@@ -464,6 +472,11 @@ def _read(
         raw = cast("Mapping[str, Any]", body).get("message") if isinstance(body, Mapping) else None
         message = raw if isinstance(raw, str) else ""
     is_done = action == "done"
+    reachability = (
+        reachability_of(cast("Mapping[str, Any]", body).get("reachability"))
+        if is_done and isinstance(body, Mapping)
+        else None
+    )
     return StepResult(
         flow=flow,
         message=message,
@@ -475,6 +488,7 @@ def _read(
         api_key=api_key if is_done else None,
         handle=handle if is_done else None,
         handles=_handles_of(error),
+        reachability=reachability,
     )
 
 
@@ -928,7 +942,12 @@ def _machine(
         next_call: _Next = _STOP
 
         if action == "done":
-            return RunResult(outcome="done", api_key=result.api_key, handle=result.handle)
+            return RunResult(
+                outcome="done",
+                api_key=result.api_key,
+                handle=result.handle,
+                reachability=result.reachability,
+            )
 
         if action == "ask_code":
             expires_at = _expiry_of(flow, received_at)
@@ -1035,7 +1054,8 @@ def run(
     :class:`RecoverInput`); a missing ``email`` (or, to register, ``handle``)
     is asked first. ``sleep`` takes seconds (default :func:`time.sleep`).
 
-    Returns ``done`` with ``api_key`` and ``handle`` (save both),
+    Returns ``done`` with ``api_key`` and ``handle`` (save both; show
+    ``reachability.text``, when present, as it is),
     ``cancelled``, or ``stopped`` with ``code`` and ``message`` (the message
     has been shown). Raises :class:`~agentchatme.ConnectionError` when the
     server cannot be reached, ``TypeError`` for an answer the question does

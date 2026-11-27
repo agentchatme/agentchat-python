@@ -123,6 +123,11 @@ class ErrorCode:
     # 503 from the wake webhook routes and ``POST /v1/agents/me/wake-links``:
     # this server cannot seal or open wake secrets. A ``ServerError``.
     WAKE_SECRET_UNAVAILABLE = "WAKE_SECRET_UNAVAILABLE"
+    # 503 from ``PUT /v1/agents/me/listener``: this server cannot keep
+    # listener reports (it is not set up for them). A ``ServerError`` that is
+    # never retried by the transport: asking again seconds later meets the
+    # same answer (``integration.ListenerReporter`` tries again later on its own).
+    LISTENER_REPORTS_UNAVAILABLE = "LISTENER_REPORTS_UNAVAILABLE"
 
 
 class AgentChatErrorResponse(dict):  # type: ignore[type-arg]
