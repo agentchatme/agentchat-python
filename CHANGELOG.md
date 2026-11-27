@@ -20,19 +20,26 @@ Proposed: patch (fixed existing behaviour); the number is set at release.
   still looked open, and the liveness watchdog and the `websockets`
   keepalive, frozen through the suspension too, would end it only later. A
   pending backoff wait resumed late in the same way. The client now checks
-  every 5 s, while a socket is opening or open or a backoff wait is pending,
-  how far the wall clock moved since the last check. A check late by 75 s or
-  more (the server's 45 s ping + 30 s pong deadline) ends the socket at once
-  as client-initiated (the `websockets` transport is aborted, no closing
-  handshake; `close(4000, 'client resumed after suspension')` on a socket
-  without one) and reconnects at once, the backoff from its first rung; a
-  pending backoff wait is cut short the same way. One `on_error` notice,
-  e.g. `resumed after suspension (~80s) …`. A smaller gap changes nothing
-  (the liveness watchdog stays in charge). `blocked` keeps its 10–15 min
-  retry, and a wait the server set (the connect budget) is kept until it
-  has run out in real time. The check is a task the client owns: off while
-  `idle`, `blocked` or `stopped`, cancelled and awaited by `disconnect()`.
-  Same rules and constants as the TypeScript SDK.
+  every 5 s, while connecting, ready or in a backoff wait, how long it was
+  away: how far the wall clock moved ahead of the monotonic clock, or how
+  late the check itself ran. Away 75 s or more (the server's 45 s ping +
+  30 s pong deadline), it ends an open socket, or one in its handshake, at
+  once as client-initiated (the `websockets` transport is aborted, no
+  closing handshake; `close(4000, 'client resumed after suspension')` on a
+  socket without one; `on_disconnect` reports that code and reason) and
+  reconnects at once, the backoff from its first rung; a pending backoff
+  wait is cut short the same way. A connection still opening is left to its
+  open timeout. The clocks are read again whenever a socket opens, so a
+  socket a timer opened after the resume, before the check came due, is
+  kept (and the backoff reset). One `on_error` notice, e.g. `resumed after
+  suspension (~80s) …`, and no second `WebSocket error` for the aborted
+  transport. A smaller gap changes nothing (the liveness watchdog stays in
+  charge). `blocked` keeps its 10–15 min retry, and a wait the server set
+  (the connect budget) is kept, re-armed for the real time it has left. The
+  check is a task the client owns: it stays in the event loop while
+  connecting, ready or in backoff, is off while `idle`, `blocked` or
+  `stopped`, and `disconnect()` cancels and awaits it. Same rules, constants
+  and notice as the TypeScript SDK.
 
 ## [1.10.0] — 2026-11-24
 

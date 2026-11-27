@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import re
 import threading
 import time
 from typing import Any
@@ -538,7 +539,8 @@ async def test_explicit_liveness_timeout_counts_frames_alone_without_ping() -> N
 
 class AbortableWebSocket(MockWebSocket):
     """A socket with a transport to abort, as the ``websockets`` connection
-    has: an abort ends it at once, with no closing handshake."""
+    has. As there, an abort ends it at once with no closing handshake, the
+    socket reports 1006, and the next read raises."""
 
     def __init__(self) -> None:
         super().__init__()
@@ -553,6 +555,14 @@ class AbortableWebSocket(MockWebSocket):
                 outer._inbox.put_nowait(None)
 
         self.transport = _Transport()
+
+    async def __anext__(self) -> str:
+        msg = await self._inbox.get()
+        if msg is None:
+            if self.aborted:
+                raise RuntimeError("no close frame received or sent")
+            raise StopAsyncIteration
+        return msg
 
 
 class WallClock:
@@ -633,6 +643,13 @@ def _resumed(errors: list[BaseException]) -> list[str]:
     return [str(e) for e in errors if str(e).startswith("resumed after suspension")]
 
 
+def _away_s(notice: str) -> int:
+    """The time away a notice reports (``resumed after suspension (~Ns)``)."""
+    match = re.match(r"resumed after suspension \(~(\d+)s\)", notice)
+    assert match, notice
+    return int(match.group(1))
+
+
 @pytest.mark.asyncio
 async def test_suspension_while_ready_ends_the_socket_and_reconnects_now_from_the_first_rung(
     monkeypatch: pytest.MonkeyPatch,
@@ -650,15 +667,22 @@ async def test_suspension_while_ready_ends_the_socket_and_reconnects_now_from_th
         await first.push({"type": "hello.ok"})
         await eventually(lambda: rt.state == "ready", "ready")
 
-        # Just past the deadline (a whole second: a coarse loop clock, as on
-        # Windows, may run a 20 ms check a tick early).
+        before = len(errors)
         clock.jump(76)
         # No backoff wait was released: the attempt went out at once.
         await eventually(lambda: handout.handed == [first, second], "the reconnect")
         assert first.aborted  # the server dropped it long ago: no closing handshake
-        assert closes[-1]["initiator"] == "client"
+        # The client's close, not the aborted transport's 1006.
+        assert closes[-1] == {
+            "code": _realtime._CLIENT_CLOSE_CODE,
+            "reason": "client resumed after suspension",
+            "was_clean": False,
+            "initiator": "client",
+        }
+        # One notice, and nothing else (no "WebSocket error" for our own abort).
+        assert [str(e) for e in errors[before:]] == _resumed(errors)
         assert len(_resumed(errors)) == 1
-        assert _resumed(errors)[0].startswith("resumed after suspension (~76s)")
+        assert 76 <= _away_s(_resumed(errors)[0]) <= 78
         assert "reconnecting now" in _resumed(errors)[0]
         assert rt.blocked_reason is None
 
@@ -684,8 +708,8 @@ async def test_suspension_during_the_handshake_replaces_the_socket_the_same_way(
         clock.jump(120)
         await eventually(lambda: handout.handed == [first, second], "the reconnect")
         assert first.aborted
-        assert _resumed(errors)[0].startswith("resumed after suspension (~120s)")
-        assert not any("handshake timeout" in str(e) for e in errors)
+        assert [str(e) for e in errors] == _resumed(errors)
+        assert 120 <= _away_s(_resumed(errors)[0]) <= 122
     finally:
         await rt.disconnect()
 
@@ -707,7 +731,7 @@ async def test_suspension_during_a_backoff_wait_attempts_now_from_the_first_rung
         # Never released: the wait was cut short.
         await eventually(lambda: handout.handed == [sock], "the attempt")
         assert len(_resumed(errors)) == 1
-        assert _resumed(errors)[0].startswith("resumed after suspension (~80s)")
+        assert 80 <= _away_s(_resumed(errors)[0]) <= 82
 
         await sock.close(code=1006, reason="refused")
         await eventually(lambda: len(sleeper.delays) == 6, "the next backoff step")
@@ -725,7 +749,7 @@ async def test_a_gap_under_75_s_changes_nothing(monkeypatch: pytest.MonkeyPatch)
     try:
         # In a backoff wait...
         await _ramp(rt, sleeper, 1)
-        clock.jump(74)
+        clock.jump(70)
         await _checks(clock)
         assert rt.state == "backoff"
         assert handout.handed == []
@@ -735,7 +759,7 @@ async def test_a_gap_under_75_s_changes_nothing(monkeypatch: pytest.MonkeyPatch)
         await eventually(lambda: handout.handed == [sock], "the attempt")
         await sock.push({"type": "hello.ok"})
         await eventually(lambda: rt.state == "ready", "ready")
-        clock.jump(74)
+        clock.jump(70)
         await _checks(clock)
         assert rt.state == "ready"
         assert not sock.aborted and not sock.closed
@@ -793,6 +817,59 @@ async def test_a_connect_budget_wait_is_kept_in_real_time(monkeypatch: pytest.Mo
         clock.jump(700)  # past it, jitter included
         await eventually(lambda: handout.handed == [first, second], "the attempt")
         assert len(_resumed(errors)) == 1
+    finally:
+        await rt.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_a_connect_budget_wait_is_re_armed_for_the_real_time_it_has_left(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    first = MockWebSocket()
+    rt, handout, clock, sleeper = _suspendable(monkeypatch, [first])
+    try:
+        await rt.connect()
+        await first.close(code=1013, reason="rate_limited; retry_after=600")
+        await eventually(lambda: len(sleeper.delays) == 1, "the budget wait")
+        assert 600.0 <= sleeper.delays[0] <= 660.0
+
+        clock.jump(300)  # 300 s of it pass asleep: its timer stood still
+        await eventually(lambda: len(sleeper.delays) == 2, "the re-armed wait")
+        # What is left in real time, not the frozen timer's full remainder.
+        assert 295.0 <= sleeper.delays[1] <= 360.0
+        assert sleeper.delays[1] <= sleeper.delays[0] - 295.0
+        assert handout.handed == [first]
+        assert rt.state == "backoff"
+    finally:
+        await rt.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_a_backoff_timer_that_fires_before_the_check_keeps_its_fresh_socket(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sock = AbortableWebSocket()
+    rt, handout, clock, sleeper = _suspendable(monkeypatch, [sock], refuse=5)
+    # Checks far enough apart that the backoff timer surely comes first.
+    monkeypatch.setattr(_realtime, "_SUSPENSION_CHECK_INTERVAL_S", 0.3)
+    errors: list[BaseException] = []
+    rt.on_error(lambda e: errors.append(e))
+    try:
+        await _ramp(rt, sleeper, 5)  # attempt 5 waits about 16 s
+        clock.jump(80)
+        sleeper.release()  # the wait ends right after the wake, before the check
+        await eventually(lambda: handout.handed == [sock], "the attempt")
+        assert len(_resumed(errors)) == 1  # seen when the socket opened
+
+        await asyncio.sleep(0.8)  # two checks
+        assert not sock.aborted and not sock.closed
+        assert handout.handed == [sock]
+        assert len(_resumed(errors)) == 1
+
+        # The suspension reset the backoff: this socket failing waits the first rung.
+        await sock.close(code=1006, reason="refused")
+        await eventually(lambda: len(sleeper.delays) == 6, "the next backoff step")
+        assert 0.75 <= sleeper.delays[-1] <= 1.0
     finally:
         await rt.disconnect()
 
