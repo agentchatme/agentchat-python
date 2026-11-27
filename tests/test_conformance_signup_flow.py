@@ -21,6 +21,10 @@ from agentchatme import (
     AgentChatClient,
     AgentChatClientIdentity,
     AgentChatError,
+    ConnectorSignupError,
+    ConnectorVerifyResult,
+    RecoverVerifyResult,
+    RegisterVerifyResult,
     create_agentchat_error,
 )
 from agentchatme.integration import account
@@ -144,23 +148,19 @@ _LEGACY_READING: dict[str, tuple[str, dict[str, Any]]] = {
     ),
 }
 
-def _is_connector_call(case: dict[str, Any]) -> bool:
-    """A connector sign-up's own calls: ``AgentChatClient.register(finish=...)``
-    and ``register_status``, below."""
-    request = case["request"]
-    return "finish" in request["body"] or request["kind"] == "register_status"
-
-
-STEP_CASES = [c for c in CASES if c["request"]["kind"] in _STEP_KINDS and not _is_connector_call(c)]
-CONNECTOR_CASES = [c for c in CASES if _is_connector_call(c)]
+STEP_CASES = [c for c in CASES if c["request"]["kind"] in _STEP_KINDS]
 
 
 def test_drives_every_register_and_recover_case() -> None:
     # Rotate key is the client's rotate_key / rotate_key_verify.
     assert STEP_CASES
-    rest = [c for c in CASES if c not in STEP_CASES and not _is_connector_call(c)]
+    rest = [c for c in CASES if c not in STEP_CASES]
     for case in rest:
         assert case["request"]["kind"].startswith("rotate_key"), case["name"]
+
+
+def _served_handle(served: dict[str, Any]) -> Any:
+    return served.get("handle") or (served.get("agent") or {}).get("handle")
 
 
 def _client_for(case: dict[str, Any], seen: list[dict[str, Any]]) -> httpx.Client:
@@ -232,11 +232,10 @@ def test_start_and_submit_code(case: dict[str, Any]) -> None:
     assert result.legacy is False
     assert result.action == expect["action"]
     _expect_flow(result.flow, expect["flow"])
+    served = case["response"]["body"]
     if expect["action"] == "done":
-        served = case["response"]["body"]
         assert result.api_key == served["api_key"]
-        handle = served.get("handle") or (served.get("agent") or {}).get("handle")
-        assert result.handle == handle
+        assert result.handle == _served_handle(served)
         # reachability (contract v1 §3.12) rides on done as sent, or is absent.
         if "reachability" in served:
             assert result.reachability is not None
@@ -245,57 +244,107 @@ def test_start_and_submit_code(case: dict[str, Any]) -> None:
             assert result.reachability is None
     else:
         assert result.api_key is None
+    if expect["action"] == "connect":
+        # The flow is done with no key: the connector address comes back as sent.
+        assert result.connect == served["connect"]
+        assert result.handle == _served_handle(served)
+    else:
+        assert result.connect is None
     if result.action == "ask_code":
         assert result.flow.get("pending_id") == (
             body.get("pending_id") or (expect["flow"] or {}).get("pending_id")
         )
 
 
-# ─────────────── connector sign-up, against the fixture's responses ───────────────
+# ─────────────── the client's calls, against the fixture's responses ───────────────
+
+_START_CALLS = {"register": AgentChatClient.register, "recover": AgentChatClient.recover}
+_VERIFY_CALLS = {"verify": AgentChatClient.verify, "recover_verify": AgentChatClient.recover_verify}
+_DONE_RESULTS = {"verify": RegisterVerifyResult, "recover_verify": RecoverVerifyResult}
+
+_CLIENT_START_CASES = [c for c in STEP_CASES if c["request"]["kind"] in _START_CALLS]
+# The verify cases a client can send: a body with a pending id and a code
+# (``verify-invalid-json`` is a request no client method makes).
+_CLIENT_VERIFY_CASES = [
+    c
+    for c in STEP_CASES
+    if c["request"]["kind"] in _VERIFY_CALLS and {"pending_id", "code"} <= set(c["request"]["body"])
+]
 
 
-_UNSUPPORTED_CONNECTOR_CASES = frozenset({"recover-connector-not-available"})
-"""Connector cases this SDK cannot make yet: a recovery started with
-``finish: "connector"`` (contract v1 §3.7, 2026-11-25). Its verify answer
-carries no key, which ``recover_verify()`` cannot return yet, so ``recover()``
-does not offer ``finish``. Named here, not filtered: a new unsupported case
-fails until it is listed."""
-_SUPPORTED_CONNECTOR_CASES = [c for c in CONNECTOR_CASES if c["name"] not in _UNSUPPORTED_CONNECTOR_CASES]
-
-
-def test_every_unsupported_connector_case_is_a_fixture_case_and_a_recover_start() -> None:
-    by_name = {c["name"]: c for c in CONNECTOR_CASES}
-    for name in _UNSUPPORTED_CONNECTOR_CASES:
-        assert name in by_name
-        assert by_name[name]["request"]["kind"] == "recover"
-
-
-@pytest.mark.parametrize(
-    "case", _SUPPORTED_CONNECTOR_CASES, ids=[c["name"] for c in _SUPPORTED_CONNECTOR_CASES]
-)
-def test_connector_sign_up(case: dict[str, Any]) -> None:
+def _verify_with(case: dict[str, Any], finish: Any, http_client: httpx.Client) -> Any:
     request = case["request"]
-    assert request["kind"] in ("register", "register_status"), (
-        f"{case['name']}: add the SDK's call for {request['kind']}"
-    )
+    call = _VERIFY_CALLS[request["kind"]]
+    body = request["body"]
+    try:
+        return call(body["pending_id"], body["code"], finish=finish, base_url=API, http_client=http_client)
+    except AgentChatError as err:
+        return err
+
+
+@pytest.mark.parametrize("case", _CLIENT_START_CASES, ids=[c["name"] for c in _CLIENT_START_CASES])
+def test_client_start_calls(case: dict[str, Any]) -> None:
+    # register(**body) / recover(**body): ``finish`` goes in the body when
+    # the request has it, and nowhere else.
+    request = case["request"]
     seen: list[dict[str, Any]] = []
-    http_client = _client_for(case, seen)
     outcome: Any
     try:
-        if request["kind"] == "register_status":
-            outcome = AgentChatClient.register_status(f"{API}{request['path']}", http_client=http_client)
-        else:
-            outcome = AgentChatClient.register(**request["body"], base_url=API, http_client=http_client)
+        outcome = _START_CALLS[request["kind"]](
+            **request["body"], base_url=API, http_client=_client_for(case, seen)
+        )
     except AgentChatError as err:
         outcome = err
 
-    # The request is the fixture's: one call, the status read with no body.
-    body = None if request["method"] == "GET" else request["body"]
-    assert seen == [{"method": request["method"], "path": request["path"], "body": body}]
+    assert seen == [{"method": request["method"], "path": request["path"], "body": request["body"]}]
     if _is_error(case):
         assert isinstance(outcome, AgentChatError)
         assert (outcome.code, str(outcome)) == (case["expect"]["code"], case["expect"]["message"])
-    elif request["kind"] == "register_status":
-        assert outcome.model_dump(exclude_none=True) == case["response"]["body"]
     else:
+        # A start with finish is the ordinary pending start: the body as served.
         assert outcome == case["response"]["body"]
+
+
+@pytest.mark.parametrize("finish", [None, "connector"])
+@pytest.mark.parametrize("case", _CLIENT_VERIFY_CASES, ids=[c["name"] for c in _CLIENT_VERIFY_CASES])
+def test_client_verify_calls(case: dict[str, Any], finish: Any) -> None:
+    # verify / recover_verify, with and without finish="connector": finish
+    # is never sent, and the server's answer decides what comes back.
+    request = case["request"]
+    expect = case["expect"]
+    served = case["response"]["body"]
+    seen: list[dict[str, Any]] = []
+    outcome = _verify_with(case, finish, _client_for(case, seen))
+
+    assert seen == [{"method": request["method"], "path": request["path"], "body": request["body"]}]
+    if _is_error(case):
+        assert isinstance(outcome, AgentChatError)
+        assert not isinstance(outcome, ConnectorSignupError)
+        assert (outcome.code, str(outcome)) == (expect["code"], expect["message"])
+        return
+    if expect["action"] == "done":
+        # A key came: the ordinary result, finish or not.
+        assert isinstance(outcome, _DONE_RESULTS[request["kind"]])
+        assert outcome[1] == served["api_key"]
+        assert outcome.message == expect["message"]
+        _expect_flow(account.flow_of(outcome), expect["flow"])
+        return
+    assert expect["action"] == "connect", case["name"]
+    if finish is None:
+        # No connector result asked for: an error that still carries the address.
+        assert isinstance(outcome, ConnectorSignupError)
+        assert outcome.connect == served["connect"]
+        assert (outcome.handle, outcome.message) == (_served_handle(served), expect["message"])
+        assert str(outcome) == expect["message"]
+        assert (outcome.code, outcome.status) == ("CONNECTOR_SIGNUP", case["response"]["status"])
+        _expect_flow(account.flow_of(outcome), expect["flow"])
+        assert isinstance(outcome.result, ConnectorVerifyResult)
+        assert outcome.result.connect == served["connect"]
+        return
+    assert isinstance(outcome, ConnectorVerifyResult)
+    assert outcome.connect == served["connect"]
+    assert (outcome.handle, outcome.message) == (_served_handle(served), expect["message"])
+    assert not hasattr(outcome, "api_key")
+    for name in ("claim_url", "claim_expires_at", "claim_expires_in_s"):
+        assert getattr(outcome, name) == served.get(name)
+    _expect_flow(account.flow_of(outcome), expect["flow"])

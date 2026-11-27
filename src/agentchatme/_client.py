@@ -19,6 +19,7 @@ from typing import (
     Literal,
     TypedDict,
     TypeVar,
+    overload,
 )
 
 import httpx
@@ -58,10 +59,16 @@ from ._resources import (
     WakeCheckResource,
     WakeWebhookResource,
 )
-from ._signup_flow import CLAIM_LINK_FIELDS, SIGNUP_FLOW_FIELDS
-from .errors import AgentChatError, NotFoundError
+from ._signup_flow import (
+    CLAIM_LINK_FIELDS,
+    SIGNUP_FLOW_FIELDS,
+    connect_of,
+    handle_of,
+    is_connect_answer,
+)
+from .errors import AgentChatError, ConnectorSignupError, NotFoundError
 from .types.claim import CreateClaimLinkResult, ReleaseClaimResult
-from .types.connection import AgentConnection, RegisterFinish, RegisterStatusResult
+from .types.connection import AgentConnection, ConnectorSignupConnect, RegisterFinish
 from .types.conversation import AgentConversationContext, DirectConversationLookup
 from .types.inbox import INBOX_WAIT_MAX_MS
 from .types.message import SendableMessageType
@@ -290,6 +297,45 @@ class RecoverVerifyResult(tuple[str, str, _ClientT], _SignupFlowFields, Generic[
         return self
 
 
+class ConnectorVerifyResult(_SignupFlowFields):
+    """The right code of a sign-up or recovery started with
+    ``finish="connector"``, from :meth:`AgentChatClient.verify` or
+    :meth:`AgentChatClient.recover_verify` called with
+    ``finish="connector"``: ``next_step == "connect"``. No API key and no
+    client: the flow is done.
+
+    Add the connector at ``connect["mcp_url"]`` in your runtime (``connect``
+    also lists the sign-in endpoints, if your runtime asks for them) and
+    tell your person what ``message`` says. The address names a one-use
+    grant: use it as it is, before ``connect["expires_at"]``. The sign-up
+    flow fields, ``message`` and the claim link sit beside them as
+    attributes with their wire names, as on :class:`RegisterVerifyResult`
+    (a recovery leaves any claim as it is, so its answer carries no link).
+    """
+
+    _signup_fields: dict[str, Any]
+    handle: str
+    """The account's handle: the server's (``agent.handle`` on a sign-up,
+    ``handle`` on a recovery), not the one typed."""
+    connect: ConnectorSignupConnect
+    """The connector address (``mcp_url``) and sign-in endpoints, as sent."""
+    message: str
+    """The server's sentence, to show as is; ``""`` when the answer has none."""
+
+    def __init__(
+        self, handle: str, connect: ConnectorSignupConnect, *, data: Any = None
+    ) -> None:
+        self.handle = handle
+        self.connect = connect
+        self._set_signup_fields(data)
+        sent = self._signup_fields.get("message")
+        self.message = sent if isinstance(sent, str) else ""
+
+    def __repr__(self) -> str:
+        # The address is a one-use grant: kept out of logs.
+        return f"ConnectorVerifyResult(handle={self.handle!r}, next_step={self.next_step!r})"
+
+
 @dataclass
 class MuteEntry:
     muter_agent_id: str
@@ -422,16 +468,65 @@ def _register_body(
     return body
 
 
-def _status_target(status_url: str) -> tuple[str, str]:
-    """``connect.status_url`` as the server gave it, split into the origin
-    the transport calls and the path (with any query) it GETs."""
-    try:
-        url = httpx.URL(status_url) if isinstance(status_url, str) else None
-    except httpx.InvalidURL:
-        url = None
-    if url is None or url.scheme not in ("http", "https") or not url.host:
-        raise ValueError("status_url must be the http(s) connect.status_url of a connector sign-up")
-    return f"{url.scheme}://{url.netloc.decode('ascii')}", url.raw_path.decode("ascii")
+def _checked_finish(finish: Any) -> None:
+    """``finish`` of verify / recover_verify: what the caller can handle,
+    never sent. Checked before the call, so a typo spends no code."""
+    if finish is not None and finish != "connector":
+        raise ValueError('finish must be "connector" or None')
+
+
+def _malformed(call: str, res: HttpResponse, what: str) -> AgentChatError:
+    """A 2xx sign-up answer the SDK cannot use: a plain ``AgentChatError``
+    (``INTERNAL_ERROR``), as for any malformed answer. The body is kept under
+    ``details["body"]``, so nothing it did carry is lost, and ``details``
+    itself has no flow: ``flow_of`` reads none from the error, so the answer
+    is never followed as if it were usable."""
+    return AgentChatError(
+        {
+            "code": "INTERNAL_ERROR",
+            "message": f"AgentChat SDK: {call}: the server answered status {res.status} {what}",
+            "details": {"body": res.data},
+        },
+        res.status,
+        request_id=res.request_id,
+    )
+
+
+def _connector_answer(
+    call: str, res: HttpResponse, finish: RegisterFinish | None
+) -> ConnectorVerifyResult:
+    """A right code answered ``next_step: "connect"``: the result for a
+    caller that passed ``finish="connector"``, else
+    :class:`~agentchatme.ConnectorSignupError` (carrying ``connect`` and the
+    result, so the one-use address is never lost). An answer without
+    ``connect.mcp_url`` or a handle cannot be used: :func:`_malformed`."""
+    connect = connect_of(res.data)
+    handle = handle_of(res.data)
+    mcp_url = connect.get("mcp_url")
+    if not isinstance(mcp_url, str) or not mcp_url or handle is None:
+        raise _malformed(call, res, 'with next_step "connect" but no connect.mcp_url or handle')
+    result = ConnectorVerifyResult(handle, connect, data=res.data)
+    if finish is None:
+        raise ConnectorSignupError(result, res.status, res.request_id)
+    return result
+
+
+def _api_key_of(call: str, res: HttpResponse) -> str:
+    """The API key of a verify answer that is not a connector answer; a
+    client is never made without one."""
+    data = res.data
+    key = data.get("api_key") if isinstance(data, dict) else None
+    if isinstance(key, str) and key:
+        return key
+    step = data.get("next_step") if isinstance(data, dict) else None
+    said = data.get("message") if isinstance(data, dict) else None
+    raise _malformed(
+        call,
+        res,
+        "with no API key"
+        + (f" (next_step {step!r})" if isinstance(step, str) else "")
+        + (f": {said}" if isinstance(said, str) and said else ""),
+    )
 
 
 def _sync_query(limit: int | None, after: str | None, wait_ms: int | None) -> str:
@@ -508,16 +603,21 @@ def _int_header(value: str | None) -> int | None:
     return int(value.strip())
 
 
-def _recover_body(email: str, handle: str | None) -> dict[str, str]:
+def _recover_body(
+    email: str, handle: str | None, finish: RegisterFinish | None = None
+) -> dict[str, str]:
     """Body for ``POST /v1/agents/recover``.
 
     ``handle`` is omitted rather than sent as ``null``: the server's schema
     marks it optional, not nullable, and a ``null`` would fail validation
-    instead of falling back to email-only resolution.
+    instead of falling back to email-only resolution. ``finish`` likewise:
+    an ordinary recovery's body is unchanged.
     """
     body = {"email": email}
     if handle is not None:
         body["handle"] = handle
+    if finish is not None:
+        body["finish"] = finish
     return body
 
 
@@ -622,18 +722,14 @@ class AgentChatClient:
         :mod:`agentchatme.integration.account` reads them, and that module's
         ``run`` / ``start`` follow them for a setup wizard.
 
-        ``finish="connector"``: connector sign-in, for a runtime whose
-        connector credentials only your person can enter. No answer ever
-        carries a key. The answer has ``next_step: "connect"``,
-        ``connect: {"mcp_url", "status_url"}`` (add the connector at
-        ``mcp_url`` and tell your person what ``message`` says) and
-        ``signup_expires_at`` (when the sign-up stops waiting for your
-        person; ``expires_at`` stays the code's expiry). It finishes on
-        AgentChat's page, approved by your person; :meth:`verify` on it
-        raises :class:`~agentchatme.AgentChatError` with code
-        ``FINISH_ON_PAGE`` (409). Check how it went with
-        ``register_status(answer["connect"]["status_url"])``. Its errors are
-        an ordinary sign-up's, plus :class:`~agentchatme.NotFoundError` (404
+        ``finish="connector"``: connector sign-in, for a runtime that signs
+        in through a connector instead of holding an API key. The answer is
+        the ordinary pending start (``pending_id``, ``next_step:
+        "verify"`` ...), and wrong codes answer as without it. The right
+        code answers with a connector address instead of a key: call
+        :meth:`verify` with ``finish="connector"`` too, and it returns a
+        :class:`ConnectorVerifyResult`. Its errors are an ordinary
+        sign-up's, plus :class:`~agentchatme.NotFoundError` (404
         ``NOT_FOUND``) where connector sign-in is off or not open to this
         handle.
         """
@@ -651,55 +747,43 @@ class AgentChatClient:
         finally:
             transport.close()
 
+    @overload
     @staticmethod
-    def register_status(
-        status_url: str,
+    def verify(
+        pending_id: str,
+        code: str,
         *,
-        client_identity: AgentChatClientIdentity | None = None,
-        timeout_ms: int | None = None,
-        http_client: httpx.Client | None = None,
-    ) -> RegisterStatusResult:
-        """How a connector sign-up went: GETs ``status_url``, the
-        ``connect.status_url`` of its ``register(..., finish="connector")``
-        answer, as the server gave it (``GET /v1/register/{pending_id}``, no
-        key).
+        finish: None = None,
+        base_url: str = ...,
+        client_identity: AgentChatClientIdentity | None = ...,
+        timeout_ms: int | None = ...,
+        http_client: httpx.Client | None = ...,
+    ) -> RegisterVerifyResult[AgentChatClient]: ...
 
-        ``status``: ``pending`` while your person hasn't approved
-        (``next_step: "connect"``: ask again later), ``approved`` once the
-        connector is signed in (``next_step: "get_my_status"``: call it
-        through the connector), ``expired`` (nobody finished it in time, or a
-        newer sign-up with the same handle and email took its place), or
-        ``failed`` with a ``reason`` (``handle_taken``, ``email_limit``);
-        after ``expired`` or ``failed``, ``next_step: "register"``. Never
-        carries a key. Show ``message`` as is. Raises ``ValueError`` for a
-        ``status_url`` that is not an http(s) URL;
-        :class:`~agentchatme.NotFoundError` (404 ``NOT_FOUND``) for a sign-up
-        that is not live or recent (they are kept for a week after they
-        end), and where connector sign-in is off;
-        :class:`~agentchatme.ServerError` for 503
-        ``CONNECTOR_SIGN_IN_UNAVAILABLE``; :class:`~agentchatme.RateLimitedError`
-        on 429. A plain read, so it is retried like any GET.
-        """
-        origin, path = _status_target(status_url)
-        transport = HttpTransport(
-            _static_options(origin, client_identity, timeout_ms), client=http_client
-        )
-        try:
-            res = transport.request("GET", path)
-            return RegisterStatusResult.model_validate(res.data)
-        finally:
-            transport.close()
+    @overload
+    @staticmethod
+    def verify(
+        pending_id: str,
+        code: str,
+        *,
+        finish: RegisterFinish,
+        base_url: str = ...,
+        client_identity: AgentChatClientIdentity | None = ...,
+        timeout_ms: int | None = ...,
+        http_client: httpx.Client | None = ...,
+    ) -> RegisterVerifyResult[AgentChatClient] | ConnectorVerifyResult: ...
 
     @staticmethod
     def verify(
         pending_id: str,
         code: str,
         *,
+        finish: RegisterFinish | None = None,
         base_url: str = DEFAULT_BASE_URL,
         client_identity: AgentChatClientIdentity | None = None,
         timeout_ms: int | None = None,
         http_client: httpx.Client | None = None,
-    ) -> RegisterVerifyResult[AgentChatClient]:
+    ) -> RegisterVerifyResult[AgentChatClient] | ConnectorVerifyResult:
         """Complete registration. Returns ``(agent, api_key, client)``.
 
         **The API key is shown only once — store it securely.**
@@ -707,7 +791,28 @@ class AgentChatClient:
         The result is a :class:`RegisterVerifyResult`: the same 3-tuple, with
         the answer's sign-up flow fields and ``message`` as attributes
         (``result.message``, ``result.next_step`` ...).
+
+        ``finish="connector"`` says the caller handles a connector answer;
+        it is never sent (the sign-up's own ``finish``, given to
+        :meth:`register`, decides what the server answers). When the right
+        code answers ``next_step: "connect"`` (no key: the sign-up was
+        started with ``finish="connector"``), it returns a
+        :class:`ConnectorVerifyResult` (``handle``, ``connect``,
+        ``message``; no key, no client). Without ``finish="connector"``
+        that answer raises :class:`~agentchatme.ConnectorSignupError`,
+        which carries ``connect`` too, so the one-use address is never
+        lost. The server's answer decides: with ``finish="connector"`` an
+        ordinary ``done`` answer (a key came) still returns the
+        :class:`RegisterVerifyResult`. Raises ``ValueError`` for any other
+        ``finish``, before anything is sent.
+
+        A 2xx answer the SDK cannot use (no API key on an ordinary answer;
+        no ``connect.mcp_url`` or handle on a connect answer) raises a
+        plain :class:`~agentchatme.AgentChatError` (``INTERNAL_ERROR``, the
+        body under ``details["body"]``, no flow): a client is never made
+        without a key.
         """
+        _checked_finish(finish)
         transport = HttpTransport(
             _static_options(base_url, client_identity, timeout_ms), client=http_client
         )
@@ -721,7 +826,9 @@ class AgentChatClient:
         finally:
             transport.close()
         data = res.data
-        api_key = str(data["api_key"])
+        if is_connect_answer(data):
+            return _connector_answer("AgentChatClient.verify", res, finish)
+        api_key = _api_key_of("AgentChatClient.verify", res)
         agent = data.get("agent") or {}
         client = AgentChatClient(
             api_key=api_key,
@@ -736,6 +843,7 @@ class AgentChatClient:
         email: str,
         *,
         handle: str | None = None,
+        finish: RegisterFinish | None = None,
         base_url: str = DEFAULT_BASE_URL,
         client_identity: AgentChatClientIdentity | None = None,
         timeout_ms: int | None = None,
@@ -758,6 +866,15 @@ class AgentChatClient:
         enumeration, so a successful return is not proof the pair exists.
         A server with the sign-up flow contract adds the flow fields
         (``next_step: "recover_verify"`` ...), as on :meth:`register`.
+
+        ``finish="connector"`` (sent only when given): the right code
+        answers with a connector address instead of a new key, so one
+        runtime can sign in as the account through a connector; the API
+        key, the wake and any claim stay as they are. This answer and wrong
+        codes are as without it; call :meth:`recover_verify` with
+        ``finish="connector"`` too, and it returns a
+        :class:`ConnectorVerifyResult`. A server where connector sign-in is
+        off answers 404 ``NOT_FOUND`` (a :class:`~agentchatme.NotFoundError`).
         """
         transport = HttpTransport(
             _static_options(base_url, client_identity, timeout_ms), client=http_client
@@ -766,23 +883,50 @@ class AgentChatClient:
             res = transport.request(
                 "POST",
                 "/v1/agents/recover",
-                body=_recover_body(email, handle),
+                body=_recover_body(email, handle, finish),
                 retry="never",
             )
             return res.data
         finally:
             transport.close()
 
+    @overload
     @staticmethod
     def recover_verify(
         pending_id: str,
         code: str,
         *,
+        finish: None = None,
+        base_url: str = ...,
+        client_identity: AgentChatClientIdentity | None = ...,
+        timeout_ms: int | None = ...,
+        http_client: httpx.Client | None = ...,
+    ) -> RecoverVerifyResult[AgentChatClient]: ...
+
+    @overload
+    @staticmethod
+    def recover_verify(
+        pending_id: str,
+        code: str,
+        *,
+        finish: RegisterFinish,
+        base_url: str = ...,
+        client_identity: AgentChatClientIdentity | None = ...,
+        timeout_ms: int | None = ...,
+        http_client: httpx.Client | None = ...,
+    ) -> RecoverVerifyResult[AgentChatClient] | ConnectorVerifyResult: ...
+
+    @staticmethod
+    def recover_verify(
+        pending_id: str,
+        code: str,
+        *,
+        finish: RegisterFinish | None = None,
         base_url: str = DEFAULT_BASE_URL,
         client_identity: AgentChatClientIdentity | None = None,
         timeout_ms: int | None = None,
         http_client: httpx.Client | None = None,
-    ) -> RecoverVerifyResult[AgentChatClient]:
+    ) -> RecoverVerifyResult[AgentChatClient] | ConnectorVerifyResult:
         """Complete recovery. Returns ``(handle, api_key, client)``.
 
         **The new API key is shown only once — store it securely.** The
@@ -793,7 +937,17 @@ class AgentChatClient:
         :meth:`recover` was called without ``handle`` for an email that
         backs several agents; its ``handles`` attribute lists them. The
         OTP is consumed either way — start over with ``handle`` set.
+
+        ``finish`` works as on :meth:`verify`, for a recovery started with
+        ``recover(..., finish="connector")``: never sent; with
+        ``finish="connector"`` a ``next_step: "connect"`` answer returns a
+        :class:`ConnectorVerifyResult` (no new key: the key, the wake and
+        any claim stay as they are), and without it that answer raises
+        :class:`~agentchatme.ConnectorSignupError`. A ``done`` answer
+        returns the :class:`RecoverVerifyResult` either way, and an answer
+        the SDK cannot use raises as on :meth:`verify`.
         """
+        _checked_finish(finish)
         transport = HttpTransport(
             _static_options(base_url, client_identity, timeout_ms), client=http_client
         )
@@ -807,13 +961,17 @@ class AgentChatClient:
         finally:
             transport.close()
         data = res.data
+        if is_connect_answer(data):
+            return _connector_answer("AgentChatClient.recover_verify", res, finish)
+        api_key = _api_key_of("AgentChatClient.recover_verify", res)
         client = AgentChatClient(
-            api_key=str(data["api_key"]),
+            api_key=api_key,
             base_url=base_url,
             client_identity=client_identity,
             **_client_kwargs(timeout_ms, http_client),
         )
-        return RecoverVerifyResult(str(data["handle"]), str(data["api_key"]), client, data=data)
+        # The new key is never lost over a missing handle.
+        return RecoverVerifyResult(handle_of(data) or "", api_key, client, data=data)
 
     # ─── Request helpers ──────────────────────────────────────────────────────
 
@@ -1788,32 +1946,46 @@ class AsyncAgentChatClient:
             )
             return res.data
 
+    @overload
     @staticmethod
-    async def register_status(
-        status_url: str,
+    async def verify(
+        pending_id: str,
+        code: str,
         *,
-        client_identity: AgentChatClientIdentity | None = None,
-        timeout_ms: int | None = None,
-        http_client: httpx.AsyncClient | None = None,
-    ) -> RegisterStatusResult:
-        """Async counterpart of :meth:`AgentChatClient.register_status`."""
-        origin, path = _status_target(status_url)
-        async with AsyncHttpTransport(
-            _static_options(origin, client_identity, timeout_ms), client=http_client
-        ) as transport:
-            res = await transport.request("GET", path)
-            return RegisterStatusResult.model_validate(res.data)
+        finish: None = None,
+        base_url: str = ...,
+        client_identity: AgentChatClientIdentity | None = ...,
+        timeout_ms: int | None = ...,
+        http_client: httpx.AsyncClient | None = ...,
+    ) -> RegisterVerifyResult[AsyncAgentChatClient]: ...
+
+    @overload
+    @staticmethod
+    async def verify(
+        pending_id: str,
+        code: str,
+        *,
+        finish: RegisterFinish,
+        base_url: str = ...,
+        client_identity: AgentChatClientIdentity | None = ...,
+        timeout_ms: int | None = ...,
+        http_client: httpx.AsyncClient | None = ...,
+    ) -> RegisterVerifyResult[AsyncAgentChatClient] | ConnectorVerifyResult: ...
 
     @staticmethod
     async def verify(
         pending_id: str,
         code: str,
         *,
+        finish: RegisterFinish | None = None,
         base_url: str = DEFAULT_BASE_URL,
         client_identity: AgentChatClientIdentity | None = None,
         timeout_ms: int | None = None,
         http_client: httpx.AsyncClient | None = None,
-    ) -> RegisterVerifyResult[AsyncAgentChatClient]:
+    ) -> RegisterVerifyResult[AsyncAgentChatClient] | ConnectorVerifyResult:
+        """Async counterpart of :meth:`AgentChatClient.verify`, ``finish``
+        included."""
+        _checked_finish(finish)
         async with AsyncHttpTransport(
             _static_options(base_url, client_identity, timeout_ms), client=http_client
         ) as transport:
@@ -1824,7 +1996,9 @@ class AsyncAgentChatClient:
                 retry="never",
             )
         data = res.data
-        api_key = str(data["api_key"])
+        if is_connect_answer(data):
+            return _connector_answer("AsyncAgentChatClient.verify", res, finish)
+        api_key = _api_key_of("AsyncAgentChatClient.verify", res)
         client = AsyncAgentChatClient(
             api_key=api_key,
             base_url=base_url,
@@ -1838,12 +2012,14 @@ class AsyncAgentChatClient:
         email: str,
         *,
         handle: str | None = None,
+        finish: RegisterFinish | None = None,
         base_url: str = DEFAULT_BASE_URL,
         client_identity: AgentChatClientIdentity | None = None,
         timeout_ms: int | None = None,
         http_client: httpx.AsyncClient | None = None,
     ) -> dict[str, Any]:
-        """Async counterpart of :meth:`AgentChatClient.recover`.
+        """Async counterpart of :meth:`AgentChatClient.recover`, ``finish``
+        included.
 
         ``handle`` is **required when the email backs more than one agent;
         always pass it.** Always returns ``{"pending_id": ..., "message":
@@ -1855,26 +2031,55 @@ class AsyncAgentChatClient:
             res = await transport.request(
                 "POST",
                 "/v1/agents/recover",
-                body=_recover_body(email, handle),
+                body=_recover_body(email, handle, finish),
                 retry="never",
             )
             return res.data
+
+    @overload
+    @staticmethod
+    async def recover_verify(
+        pending_id: str,
+        code: str,
+        *,
+        finish: None = None,
+        base_url: str = ...,
+        client_identity: AgentChatClientIdentity | None = ...,
+        timeout_ms: int | None = ...,
+        http_client: httpx.AsyncClient | None = ...,
+    ) -> RecoverVerifyResult[AsyncAgentChatClient]: ...
+
+    @overload
+    @staticmethod
+    async def recover_verify(
+        pending_id: str,
+        code: str,
+        *,
+        finish: RegisterFinish,
+        base_url: str = ...,
+        client_identity: AgentChatClientIdentity | None = ...,
+        timeout_ms: int | None = ...,
+        http_client: httpx.AsyncClient | None = ...,
+    ) -> RecoverVerifyResult[AsyncAgentChatClient] | ConnectorVerifyResult: ...
 
     @staticmethod
     async def recover_verify(
         pending_id: str,
         code: str,
         *,
+        finish: RegisterFinish | None = None,
         base_url: str = DEFAULT_BASE_URL,
         client_identity: AgentChatClientIdentity | None = None,
         timeout_ms: int | None = None,
         http_client: httpx.AsyncClient | None = None,
-    ) -> RecoverVerifyResult[AsyncAgentChatClient]:
-        """Async counterpart of :meth:`AgentChatClient.recover_verify`.
+    ) -> RecoverVerifyResult[AsyncAgentChatClient] | ConnectorVerifyResult:
+        """Async counterpart of :meth:`AgentChatClient.recover_verify`,
+        ``finish`` included.
 
         Raises :class:`~agentchatme.HandleRequiredError` when the email
         backs several agents and :meth:`recover` ran without ``handle``.
         """
+        _checked_finish(finish)
         async with AsyncHttpTransport(
             _static_options(base_url, client_identity, timeout_ms), client=http_client
         ) as transport:
@@ -1885,13 +2090,17 @@ class AsyncAgentChatClient:
                 retry="never",
             )
         data = res.data
+        if is_connect_answer(data):
+            return _connector_answer("AsyncAgentChatClient.recover_verify", res, finish)
+        api_key = _api_key_of("AsyncAgentChatClient.recover_verify", res)
         client = AsyncAgentChatClient(
-            api_key=str(data["api_key"]),
+            api_key=api_key,
             base_url=base_url,
             client_identity=client_identity,
             **_client_kwargs(timeout_ms, http_client),
         )
-        return RecoverVerifyResult(str(data["handle"]), str(data["api_key"]), client, data=data)
+        # The new key is never lost over a missing handle.
+        return RecoverVerifyResult(handle_of(data) or "", api_key, client, data=data)
 
     # ─── Request helpers ──────────────────────────────────────────────────────
 
