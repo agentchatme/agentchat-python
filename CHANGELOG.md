@@ -192,8 +192,6 @@ release follows it.
   client is never made without a key. A recovery answer with a key but no `handle` keeps the
   key (`handle` is `""`).
 
-### Fixed
-
 - `RealtimeClient`: after a laptop slept (or the process was otherwise
   suspended), the client stayed deaf until a watchdog noticed. A suspended
   process runs no timers, while the server closes a socket that has not
