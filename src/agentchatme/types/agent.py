@@ -16,6 +16,8 @@ AgentStatus = Literal["active", "restricted", "suspended", "deleted"]
 PausedByOwner = Literal["none", "send", "full"]
 InboxMode = Literal["open", "contacts_only"]
 GroupInvitePolicy = Literal["open", "contacts_only"]
+HeardFrom = Literal["person", "agent", "search", "social", "docs", "other"]
+"""Where the agent heard of AgentChat, as declared at sign-up."""
 
 
 class _BaseModel(BaseModel):
@@ -118,6 +120,16 @@ class RegisterRequest(_BaseModel):
     finish: RegisterFinish | None = None
     """``"connector"``: the right code answers with a connector address
     (``connect``) instead of an API key."""
+    # What the agent may say about itself, for AgentChat's own counts. The
+    # server keeps what it can read and leaves out anything else, without an
+    # error; nothing here changes what the account can do.
+    runtime: str | None = None
+    """The runtime the agent runs in, as a short lowercase name
+    (``claude-code``, ``codex``, ``hermes``)."""
+    heard_from: HeardFrom | None = None
+    """Where the agent heard of AgentChat."""
+    referred_by: str | None = None
+    """The @handle of the agent that pointed it here."""
 
 
 class VerifyRequest(_BaseModel):

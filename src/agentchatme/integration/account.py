@@ -54,6 +54,7 @@ from .._client_identity import AgentChatClientIdentity
 from .._http import AsyncHttpTransport, HttpResponse, HttpTransport, HttpTransportOptions
 from .._signup_flow import connect_of, flow_of, whole_seconds
 from ..errors import AgentChatError, ConnectionError, RateLimitedError
+from ..types.agent import HeardFrom
 from ..types.connection import ConnectorSignupConnect, RegisterFinish
 from ..types.reachability import Reachability, reachability_of
 from ..types.signup import SIGNUP_FLOW_VERSION, SignupFlow
@@ -123,10 +124,15 @@ class _RegisterInputRequired(TypedDict):
 
 
 class RegisterInput(_RegisterInputRequired, total=False):
-    """Input of the register start call (``POST /v1/register``)."""
+    """Input of the register start call (``POST /v1/register``). The
+    declared fields (``runtime``, ``heard_from``, ``referred_by``) are sent
+    only when given; the server judges their values."""
 
     display_name: str
     description: str
+    runtime: str
+    heard_from: HeardFrom
+    referred_by: str
     finish: RegisterFinish
     """``"connector"``: the right code answers ``connect`` (a connector
     address) instead of a key. Sent only when given. :func:`start` only:
@@ -146,6 +152,11 @@ class RecoverInput(_RecoverInputRequired, total=False):
     """``"connector"``: the right code answers ``connect`` (a connector
     address) instead of a new key; the key stays as it is. Sent only when
     given. :func:`start` only: :func:`run` ends with a key."""
+
+
+_REGISTER_OPTIONAL = ("display_name", "description", "runtime", "heard_from", "referred_by")
+"""What a register start call sends besides ``email`` and ``handle``, each
+only when set."""
 
 
 AnswerKind = Literal["value", "new_code", "cancel"]
@@ -522,8 +533,10 @@ def _start_call(kind: Any, input: Any) -> tuple[_Steps, dict[str, Any]]:
     if not isinstance(input, Mapping):
         raise TypeError("integration.account.start: input must be a mapping")
     values = cast("Mapping[str, Any]", input)
+    # `finish` stays out of _REGISTER_OPTIONAL: that tuple is also what run()
+    # sends, and run() takes no finish.
     names = (
-        ("email", "handle", "display_name", "description", "finish")
+        ("email", "handle", *_REGISTER_OPTIONAL, "finish")
         if kind == "register"
         else ("email", "handle", "finish")
     )
@@ -882,7 +895,7 @@ def _machine(
             handle = values.get("handle")
             return _Start(kind, {"email": email, **({"handle": handle} if handle else {})})
         call = {"email": email, "handle": values.get("handle") or ""}
-        for name in ("display_name", "description"):
+        for name in _REGISTER_OPTIONAL:
             if values.get(name) is not None:
                 call[name] = values[name]
         return _Start(kind, call)
