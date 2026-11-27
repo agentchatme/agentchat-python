@@ -78,6 +78,49 @@ def write_atomic(path: str | Path, data: bytes | str, *, mode: int = 0o644) -> N
         raise
 
 
+def create_once(path: str | Path, data: bytes | str, *, mode: int = 0o644) -> bool:
+    """Create ``path`` with ``data`` unless it exists: ``True`` when this call
+    created it, ``False`` when a file was already there (it is left
+    untouched). The data is written and flushed to a temp file beside it
+    first and then hard-linked into place, so a reader never sees a part of
+    it, and of two processes racing to create the same file exactly one
+    wins. Where a hard link cannot be made (a file system without them) it
+    is renamed into place instead, where such a race ends with the last
+    writer's file. ``str`` data is written as UTF-8. Raises on failure."""
+    path = Path(path)
+    if isinstance(data, str):
+        data = data.encode("utf-8")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = _tmp_path_for(path)
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0)
+    created = False
+    try:
+        fd = os.open(tmp, flags, mode)
+        created = True
+        with os.fdopen(fd, "wb", closefd=True) as handle:
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+        try:
+            os.link(tmp, path)
+            return True
+        except FileExistsError:
+            return False
+        except (OSError, AttributeError, NotImplementedError):
+            # No hard link here: an existing file still wins, else the rename
+            # (which raises the real error, if there is one).
+            pass
+        if os.path.lexists(path):
+            return False
+        rename_with_retry(tmp, path)
+        created = False
+        return True
+    finally:
+        if created:
+            with contextlib.suppress(OSError):
+                tmp.unlink()
+
+
 # ─── Replacing a file someone else owns ─────────────────────────────────────
 #
 # For a file the kit did not create and must not damage: the user's

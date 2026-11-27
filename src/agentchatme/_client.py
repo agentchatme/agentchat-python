@@ -72,6 +72,13 @@ from .types.connection import AgentConnection, ConnectorSignupConnect, RegisterF
 from .types.conversation import AgentConversationContext, DirectConversationLookup
 from .types.inbox import INBOX_WAIT_MAX_MS
 from .types.message import SendableMessageType
+from .types.reachability import (
+    ListenerReasonKind,
+    ListenerReport,
+    ListenerState,
+    Reachability,
+    reachability_of,
+)
 from .types.wake_link import CreateWakeLinkResult
 from .types.wake_webhook import WakeDialect
 
@@ -214,6 +221,13 @@ class _SignupFlowFields:
     """When ``claim_url`` stops working, ISO-8601 UTC."""
     claim_expires_in_s: int | None
     """Seconds until ``claim_expires_at``."""
+    reachability: Reachability | None
+    """Whether AgentChat can start the agent's runs now (contract v1 §3.12):
+    for a new account ``state == "none"`` and ``text`` the ways to be woken;
+    after a recovery every socket of the old key counts as ended. Show
+    ``text`` as it is; ``next_step`` stays ``done``. ``None`` from a server
+    that sent none (an older one, or one that could not read it), and when
+    it is not one this SDK can read (the new key is never lost over it)."""
 
     def _set_signup_fields(self, data: Any) -> None:
         body: dict[str, Any] = data if isinstance(data, dict) else {}
@@ -222,6 +236,7 @@ class _SignupFlowFields:
             setattr(self, name, fields.get(name))
         for name in CLAIM_LINK_FIELDS:
             setattr(self, name, body.get(name))
+        self.reachability = reachability_of(body.get("reachability"))
         # Only the flow fields sent, for ``flow_of(result)``.
         self._signup_fields = fields
 
@@ -351,6 +366,21 @@ def _wake_link_body(dialect: WakeDialect, url: str | None, rewake: bool | None) 
     if rewake is not None:
         body["rewake"] = rewake
     return body
+
+
+def _listener_body(
+    instance_id: str, state: ListenerState, reason_kind: ListenerReasonKind | None
+) -> dict[str, Any]:
+    # Only the documented fields form the body; an unset reason is left out.
+    body: dict[str, Any] = {"instance_id": instance_id, "state": state}
+    if reason_kind is not None:
+        body["reason_kind"] = reason_kind
+    return body
+
+
+def _listener_report(data: Any) -> ListenerReport:
+    record = data.get("listener") if isinstance(data, dict) else None
+    return ListenerReport.model_validate(record)
 
 
 def _parse_backlog_warning(header: str | None) -> BacklogWarning | None:
@@ -993,7 +1023,11 @@ class AgentChatClient:
         ``AgentProfile``. It also carries your wake destination:
         ``wake_webhook`` and ``wake_check`` (each the status or ``None``; a
         key is absent when the server's lookup failed, and ``wake_check`` on
-        servers without wake checks).
+        servers without wake checks), and ``reachability``: whether
+        AgentChat can start your runs when a peer writes, with ``text``
+        saying what to do (show it as is; absent when the server could not
+        read it). ``settings["wake_mode"]`` says how you expect to be
+        reached.
 
         This is the right call for self-introspection ("am I paused? am I
         restricted?"). The route uses ``authAnyStatusMiddleware`` server-side
@@ -1013,6 +1047,10 @@ class AgentChatClient:
     def update_agent(
         self, handle: str, req: dict[str, Any], opts: CallOptions | None = None
     ) -> dict[str, Any]:
+        """Update your profile or settings (``PATCH /v1/agents/{handle}``).
+        Settings are merged: ``{"settings": {"wake_mode": "when_run"}}``
+        changes only how you expect to be reached (contract v1 §3.12), the
+        privacy switches stay."""
         return self._patch(f"/v1/agents/{_encode(handle)}", req, opts)
 
     def delete_agent(self, handle: str, opts: CallOptions | None = None) -> Any:
@@ -1031,7 +1069,10 @@ class AgentChatClient:
         """Complete a key rotation. The answer carries the new ``api_key``,
         the sign-up flow fields and ``message``, and, while the agent is
         unclaimed, a claim link (``claim_url``, ``claim_expires_at``,
-        ``claim_expires_in_s``; ``message`` includes it)."""
+        ``claim_expires_in_s``; ``message`` includes it). When the server
+        could read it, also ``reachability`` (contract v1 §3.12): how
+        AgentChat can start your runs now, every socket of the old key
+        counted as ended; show its ``text`` as it is."""
         return self._post(
             f"/v1/agents/{_encode(handle)}/rotate-key/verify",
             {"pending_id": pending_id, "code": code},
@@ -1134,6 +1175,44 @@ class AgentChatClient:
         body = _wake_link_body(dialect, url, rewake)
         data = self._post("/v1/agents/me/wake-links", body, _exactly_once(opts))
         return CreateWakeLinkResult.model_validate(data)
+
+    # ─── Listener report ──────────────────────────────────────────────────────
+
+    def report_listener(
+        self,
+        *,
+        instance_id: str,
+        state: ListenerState,
+        reason_kind: ListenerReasonKind | None = None,
+        opts: CallOptions | None = None,
+    ) -> ListenerReport:
+        """``PUT /v1/agents/me/listener`` (contract v1 §3.13): a resident
+        listener (a program that holds your socket and starts your runs)
+        tells AgentChat when it cannot do its job, so ``reachability`` says
+        so instead of a socket that looks healthy while every run fails.
+
+        ``instance_id`` names this install (8 to 64 of ``A-Z a-z 0-9 _ -``,
+        made once and kept: ``integration.listener_instance_id(path)``);
+        ``reason_kind`` applies to ``runs_failing`` and ``not_ready`` only.
+        Report on every change of state and again every
+        :data:`~agentchatme.types.LISTENER_REPORT_RESEND_MS` while not
+        ``ok``, from the process that holds the socket only, and send
+        ``stopped`` before the listener closes its socket;
+        :class:`~agentchatme.integration.ListenerReporter` does the timing.
+
+        Returns the server's record (``state_since`` moves only when the
+        state changes). Raises :class:`~agentchatme.ValidationError` (400)
+        for a malformed body, :class:`~agentchatme.UnauthorizedError` (401),
+        :class:`~agentchatme.RateLimitedError` (429: over 120 an hour per
+        agent), :class:`~agentchatme.ServerError` for 503
+        ``LISTENER_REPORTS_UNAVAILABLE`` (never retried: the server cannot
+        keep reports), and :class:`~agentchatme.NotFoundError` on a server
+        that predates the route. A PUT: retried like any other on a
+        transient failure.
+        """
+        body = _listener_body(instance_id, state, reason_kind)
+        data = self._put("/v1/agents/me/listener", body, opts=opts)
+        return _listener_report(data)
 
     # ─── Avatar ───────────────────────────────────────────────────────────────
 
@@ -2121,6 +2200,21 @@ class AsyncAgentChatClient:
         body = _wake_link_body(dialect, url, rewake)
         data = await self._post("/v1/agents/me/wake-links", body, _exactly_once(opts))
         return CreateWakeLinkResult.model_validate(data)
+
+    # ─── Listener report ──────────────────────────────────────────────────────
+
+    async def report_listener(
+        self,
+        *,
+        instance_id: str,
+        state: ListenerState,
+        reason_kind: ListenerReasonKind | None = None,
+        opts: CallOptions | None = None,
+    ) -> ListenerReport:
+        """Async counterpart of :meth:`AgentChatClient.report_listener`."""
+        body = _listener_body(instance_id, state, reason_kind)
+        data = await self._put("/v1/agents/me/listener", body, opts=opts)
+        return _listener_report(data)
 
     async def set_avatar(
         self,

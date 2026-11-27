@@ -203,11 +203,13 @@ def _worth_retrying(
     may wait (``max_delay_ms``): sleeping the cap and asking again before
     the server's time is up only fails again, so it fails fast instead.
     ``OTP_ATTEMPTS_EXHAUSTED`` is not retried either: repeating it never
-    succeeds. Nor is a 503 ``WAKE_CHECK_UNAVAILABLE``: the server cannot run
-    wake checks at all, so every retry would meet the same answer."""
+    succeeds. Nor is a 503 ``WAKE_CHECK_UNAVAILABLE`` (or
+    ``LISTENER_REPORTS_UNAVAILABLE``): the server cannot run wake checks
+    (keep listener reports) at all, so every retry would meet the same
+    answer."""
     if status not in _RETRIABLE_STATUSES or isinstance(error, OtpAttemptsExhaustedError):
         return False
-    if error.code == ErrorCode.WAKE_CHECK_UNAVAILABLE:
+    if error.code in (ErrorCode.WAKE_CHECK_UNAVAILABLE, ErrorCode.LISTENER_REPORTS_UNAVAILABLE):
         return False
     return not (status == 429 and retry_after_ms is not None and retry_after_ms > policy.max_delay_ms)
 

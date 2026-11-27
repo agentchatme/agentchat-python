@@ -236,6 +236,12 @@ def test_start_and_submit_code(case: dict[str, Any]) -> None:
     if expect["action"] == "done":
         assert result.api_key == served["api_key"]
         assert result.handle == _served_handle(served)
+        # reachability (contract v1 §3.12) rides on done as sent, or is absent.
+        if "reachability" in served:
+            assert result.reachability is not None
+            assert result.reachability.model_dump(mode="json") == served["reachability"]
+        else:
+            assert result.reachability is None
     else:
         assert result.api_key is None
     if expect["action"] == "connect":
