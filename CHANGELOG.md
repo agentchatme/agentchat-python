@@ -7,9 +7,9 @@ and version numbers follow
 The on-the-wire
 API is versioned separately under `/v1/...`.
 
-## Unreleased
+## [1.11.0] — 2026-11-27
 
-Proposed: minor (added behaviour: reachability, the listener report and its kit helper, connector sign-in at verify, `X-AgentChat-Platform` and the declared sign-up fields are new surface); the number is set at release.
+Minor release (added behaviour → minor +1, per VERSIONING.md): reachability, the listener report and its kit helper, resume after process suspension, connector sign-in at verify, `X-AgentChat-Platform` and the declared sign-up fields are new surface.
 
 The server changed connector sign-in on 2026-11-25: a sign-up or recovery
 with `finish: "connector"` now finishes at the verify call, whose right code
