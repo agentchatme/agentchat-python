@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import logging
 import re
 import threading
@@ -589,11 +590,15 @@ class Handout:
         self.sockets = sockets
         self.refuse = refuse
         self.handed: list[MockWebSocket] = []
+        # While set, an open waits for it (a slow TCP + TLS + upgrade).
+        self.opening: asyncio.Event | None = None
 
     async def __call__(self, _url: str, **_kw: Any) -> MockWebSocket:
         if self.refuse > 0:
             self.refuse -= 1
             raise OSError("connection refused")
+        if self.opening is not None:
+            await self.opening.wait()
         sock = self.sockets[min(len(self.handed), len(self.sockets) - 1)]
         self.handed.append(sock)
         return sock
@@ -870,6 +875,87 @@ async def test_a_backoff_timer_that_fires_before_the_check_keeps_its_fresh_socke
         await sock.close(code=1006, reason="refused")
         await eventually(lambda: len(sleeper.delays) == 6, "the next backoff step")
         assert 0.75 <= sleeper.delays[-1] <= 1.0
+    finally:
+        await rt.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_a_slow_on_error_handler_never_holds_the_hello_back(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sock = AbortableWebSocket()
+    rt, handout, clock, sleeper = _suspendable(monkeypatch, [sock], refuse=2)
+    # No check runs in this test: the suspension is seen as the socket opens.
+    monkeypatch.setattr(_realtime, "_SUSPENSION_CHECK_INTERVAL_S", 30.0)
+    held = asyncio.Event()
+    notices: list[str] = []
+
+    async def slow(err: BaseException) -> None:
+        if str(err).startswith("resumed after suspension"):
+            notices.append(str(err))
+            await held.wait()  # a handler that logs somewhere slow
+
+    rt.on_error(slow)
+    try:
+        await _ramp(rt, sleeper, 2)
+        clock.jump(80)
+        sleeper.release()
+        await eventually(lambda: handout.handed == [sock], "the attempt")
+        await eventually(lambda: len(sock.sent) == 1, "the HELLO")
+        assert json.loads(sock.sent[0])["type"] == "hello"
+        await eventually(lambda: len(notices) == 1, "the notice")
+        assert not held.is_set()  # the handler is still running
+    finally:
+        held.set()
+        await rt.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_a_check_while_an_attempt_is_opening_announces_once_and_keeps_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sock = AbortableWebSocket()
+    rt, handout, clock, sleeper = _suspendable(monkeypatch, [sock], refuse=2)
+    errors: list[BaseException] = []
+    rt.on_error(lambda e: errors.append(e))
+    try:
+        await _ramp(rt, sleeper, 2)
+        handout.opening = asyncio.Event()  # the next open hangs until set
+        sleeper.release()
+        await eventually(lambda: rt.state == "connecting", "the attempt")
+        clock.jump(80)
+        await eventually(lambda: len(_resumed(errors)) == 1, "the notice")
+        handout.opening.set()
+        await eventually(lambda: handout.handed == [sock], "the socket")
+        await _checks(clock)
+        assert not sock.aborted and not sock.closed
+        assert len(_resumed(errors)) == 1
+
+        # The suspension reset the backoff: this socket failing waits the first rung.
+        await sock.close(code=1006, reason="refused")
+        await eventually(lambda: len(sleeper.delays) == 3, "the next backoff step")
+        assert 0.75 <= sleeper.delays[-1] <= 1.0
+    finally:
+        await rt.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_a_monotonic_clock_that_goes_backward_is_no_suspension(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sock = AbortableWebSocket()
+    rt, _handout, clock, _sleeper = _suspendable(monkeypatch, [sock])
+    errors: list[BaseException] = []
+    rt.on_error(lambda e: errors.append(e))
+    try:
+        await rt.connect()
+        await sock.push({"type": "hello.ok"})
+        await eventually(lambda: rt.state == "ready", "ready")
+        # A fake monotonic clock installed mid-run, far behind the real one.
+        rt._monotonic_clock = lambda: time.monotonic() - 600.0
+        await _checks(clock)
+        assert not sock.aborted
+        assert _resumed(errors) == []
     finally:
         await rt.disconnect()
 

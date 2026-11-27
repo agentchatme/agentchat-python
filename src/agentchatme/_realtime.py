@@ -864,9 +864,10 @@ class RealtimeClient:
         # suspension never cuts a wait the server asked for short of this; it
         # re-arms it for the real time left.
         self._reconnect_not_before: float | None = None
-        # The wall clock the suspension check reads. Tests swap it to model a
-        # suspension: the clock jumps while no timer runs.
+        # The clocks the suspension check reads. Tests swap them to model a
+        # suspension (the wall clock jumps while no timer runs).
         self._wall_clock: Callable[[], float] = time.time
+        self._monotonic_clock: Callable[[], float] = time.monotonic
         # Message-id dedup shared by the live and drain paths. Survives
         # reconnects deliberately: redelivery across connections is exactly
         # the duplicate source it exists to absorb.
@@ -1002,12 +1003,9 @@ class RealtimeClient:
         self._ack_negotiated = False
         self._negotiated = frozenset()
         self._close_initiated_locally = False
+        self._resumed_from_suspension = False
         self._hello_sent = False
-        # After ``_ws`` is set: an on_error observer's connect() is a no-op
-        # here, and one that calls disconnect() ends this attempt.
-        await self._check_at_new_socket()
-        if self._ws is not ws:
-            return
+        self._check_at_new_socket()
 
         hello = json.dumps(
             {
@@ -1302,12 +1300,15 @@ class RealtimeClient:
         process, some VMs) or the loop was starved, the overdue check runs
         late instead: its lateness past the check's schedule."""
         wall = self._wall_clock()
-        mono = time.monotonic()
+        mono = self._monotonic_clock()
         wall_s = wall - self._last_wall_reading
         mono_s = mono - self._last_mono_reading
         self._last_wall_reading = wall
         self._last_mono_reading = mono
-        return max(wall_s - mono_s, wall_s - _SUSPENSION_CHECK_INTERVAL_S)
+        # A monotonic clock that went backward is not one (a test's fake
+        # clock installed mid-run): its lead says nothing.
+        lead_s = wall_s - mono_s if mono_s >= 0 else 0.0
+        return max(lead_s, wall_s - _SUSPENSION_CHECK_INTERVAL_S)
 
     async def _suspension_watch(self) -> None:
         """Check every ``_SUSPENSION_CHECK_INTERVAL_S`` how long the process
@@ -1322,16 +1323,18 @@ class RealtimeClient:
         except asyncio.CancelledError:
             return
 
-    async def _check_at_new_socket(self) -> None:
+    def _check_at_new_socket(self) -> None:
         """A socket was just opened. After a resume, a timer due before the
         check (a backoff step) may open it first: reading the clocks here
         keeps the check from taking it for one that lived through the
-        suspension, and the suspension is handled here."""
+        suspension, and the suspension is handled here. The notice is
+        spawned: a slow ``on_error`` handler must never hold the HELLO back
+        past the server's 5 s HELLO deadline."""
         away_s = self._time_away()
         if away_s < _SERVER_HEARTBEAT_DEADLINE_S:
             return
         self._reconnect_attempts = 0
-        await self._announce_resume(away_s)
+        self._spawn(self._announce_resume(away_s))
 
     async def _resume_after_suspension(self, away_s: float) -> None:
         """The process was away for at least ``_SERVER_HEARTBEAT_DEADLINE_S``:
@@ -1348,18 +1351,16 @@ class RealtimeClient:
             return
         self._reconnect_attempts = 0
         ws = self._ws
-        if ws is None:
-            pending = self._reconnect_task
-            if self._state != "backoff" or pending is None or pending.done():
-                # No socket and no wait: an attempt is starting (or a close
-                # is being handled), with a fresh socket next.
-                return
+        pending = self._reconnect_task
+        if ws is None and self._state == "backoff" and pending is not None and not pending.done():
             not_before = self._reconnect_not_before
             server_wait_left_s = 0.0 if not_before is None else not_before - self._wall_clock()
             if server_wait_left_s > 0:
                 pending.cancel()
                 self._reconnect_task = asyncio.create_task(self._reconnect_after(server_wait_left_s))
                 return
+        # Announced whatever there is to end: also when an attempt is already
+        # opening (its socket is fresh) or a close is being handled.
         await self._announce_resume(away_s)
         if self._disposed:
             return
