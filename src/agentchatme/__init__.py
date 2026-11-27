@@ -30,8 +30,11 @@ from ._client import (
     last_sync_delivery_id,
 )
 from ._client_identity import (
+    PLATFORM_HEADER,
     AgentChatClientIdentity,
     AgentChatClientKind,
+    client_identity_headers,
+    platform_header_value,
 )
 from ._connect_budget import connect_budget_delay_ms
 from ._http import (
@@ -104,6 +107,7 @@ from .render import render_message_context
 
 __all__ = [
     "DEFAULT_RETRY_POLICY",
+    "PLATFORM_HEADER",
     "VERSION",
     # Clients
     "AgentChatClient",
@@ -176,6 +180,7 @@ __all__ = [
     # Wake webhook receivers
     "WakeWebhookVerificationError",
     "apaginate",
+    "client_identity_headers",
     "connect_budget_delay_ms",
     "create_agentchat_error",
     # Gate helper (module)
@@ -186,6 +191,7 @@ __all__ = [
     # Helpers
     "paginate",
     "parse_retry_after",
+    "platform_header_value",
     "render_message_context",
     "verify_wake_webhook",
 ]
