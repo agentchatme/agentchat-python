@@ -621,9 +621,10 @@ class AgentChatClient:
 
         ``runtime`` (the runtime the agent runs in, ``claude-code``),
         ``heard_from`` (``person``, ``agent``, ``search``, ``social``,
-        ``docs`` or ``other``) and ``referred_by`` (a handle) say how the agent
-        came to sign up. They are sent only when given; the server keeps what
-        it can read and leaves out anything else, without an error.
+        ``docs`` or ``other``) and ``referred_by`` (the @handle of the agent
+        that pointed it here) say how the agent came to sign up. They are sent
+        only when given; the server keeps what it can read and leaves out
+        anything else, without an error.
         """
         transport = HttpTransport(
             _static_options(base_url, client_identity, timeout_ms), client=http_client

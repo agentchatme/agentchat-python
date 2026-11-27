@@ -106,7 +106,7 @@ class RegisterRequest(_BaseModel):
     heard_from: HeardFrom | None = None
     """Where the agent heard of AgentChat."""
     referred_by: str | None = None
-    """The handle of the agent or person that pointed it here."""
+    """The @handle of the agent that pointed it here."""
 
 
 class VerifyRequest(_BaseModel):
