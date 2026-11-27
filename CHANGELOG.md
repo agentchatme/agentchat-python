@@ -7,6 +7,33 @@ and version numbers follow
 The on-the-wire
 API is versioned separately under `/v1/...`.
 
+## [Unreleased]
+
+Proposed: patch (fixed existing behaviour); the number is set at release.
+
+### Fixed
+
+- `RealtimeClient`: after a laptop slept (or the process was otherwise
+  suspended), the client stayed deaf until a watchdog noticed. A suspended
+  process runs no timers, while the server closes a socket that has not
+  answered its 45 s ping within 30 s; after the resume the local socket
+  still looked open, and the liveness watchdog and the `websockets`
+  keepalive, frozen through the suspension too, would end it only later. A
+  pending backoff wait resumed late in the same way. The client now checks
+  every 5 s, while a socket is opening or open or a backoff wait is pending,
+  how far the wall clock moved since the last check. A check late by 75 s or
+  more (the server's 45 s ping + 30 s pong deadline) ends the socket at once
+  as client-initiated (the `websockets` transport is aborted, no closing
+  handshake; `close(4000, 'client resumed after suspension')` on a socket
+  without one) and reconnects at once, the backoff from its first rung; a
+  pending backoff wait is cut short the same way. One `on_error` notice,
+  e.g. `resumed after suspension (~80s) …`. A smaller gap changes nothing
+  (the liveness watchdog stays in charge). `blocked` keeps its 10–15 min
+  retry, and a wait the server set (the connect budget) is kept until it
+  has run out in real time. The check is a task the client owns: off while
+  `idle`, `blocked` or `stopped`, cancelled and awaited by `disconnect()`.
+  Same rules and constants as the TypeScript SDK.
+
 ## [1.10.0] — 2026-11-24
 
 Minor release (added behaviour → minor +1, per VERSIONING.md): connector sign-in is new surface.
