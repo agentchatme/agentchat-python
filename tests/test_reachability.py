@@ -311,23 +311,6 @@ async def test_async_report_listener() -> None:
     assert json.loads(seen[0].content) == {"instance_id": "inst_0123456789abcdef", "state": "not_ready", "reason_kind": "not_signed_in"}
 
 
-# ─────────────── recover: finish ───────────────
-
-
-@respx.mock
-async def test_recover_sends_finish_only_when_given() -> None:
-    answer = {"pending_id": "pnd_1", "message": "If @example-relay is registered ..."}
-    seen = _capture(respx.post(f"{BASE}/v1/agents/recover"), 200, answer)
-    AgentChatClient.recover("relay@example.com", handle="example-relay", base_url=BASE)
-    AgentChatClient.recover("relay@example.com", handle="example-relay", finish="connector", base_url=BASE)
-    await AsyncAgentChatClient.recover("relay@example.com", handle="example-relay", finish="connector", base_url=BASE)
-    assert [json.loads(r.content) for r in seen] == [
-        {"email": "relay@example.com", "handle": "example-relay"},
-        {"email": "relay@example.com", "handle": "example-relay", "finish": "connector"},
-        {"email": "relay@example.com", "handle": "example-relay", "finish": "connector"},
-    ]
-
-
 # ─────────────── tray notices on the receive path ───────────────
 
 
@@ -335,12 +318,15 @@ def test_a_notice_this_sdk_cannot_read_never_breaks_the_tray() -> None:
     tray = json.loads((FIXTURES / "tray.v1.sample.json").read_text(encoding="utf-8"))
     readable = {"kind": "no_wake_yet", "since": "2026-11-28T09:30:00.000Z", "text": "You joined ..."}
     later = {"kind": "later_kind", "text": "A later notice.", "later_field": [1, 2]}
-    broken = [{"kind": "no_wake"}, {"text": "no kind"}, "a string", {"kind": "wake_failing", "text": "t", "status": "four hundred"}]
-    model = InboxTray.model_validate({**tray, "notices": [readable, *broken, later]})
+    # A later kind may use a known field name for a value of another type: still a notice.
+    reuses = {"kind": "later_kind_2", "text": "t", "status": "four hundred", "since": 5}
+    broken = [{"kind": "no_wake"}, {"text": "no kind"}, "a string", {"kind": 7, "text": "t"}]
+    model = InboxTray.model_validate({**tray, "notices": [readable, *broken, later, reuses]})
     assert model.notices is not None
-    assert [n.kind for n in model.notices] == ["no_wake_yet", "later_kind"]
+    assert [n.kind for n in model.notices] == ["no_wake_yet", "later_kind", "later_kind_2"]
     assert model.notices[1].text == "A later notice."
     assert model.notices[1].model_dump(mode="json", exclude_unset=True) == later
+    assert model.notices[2].model_dump(mode="json", exclude_unset=True) == reuses
     assert InboxTray.model_validate({**tray, "notices": "not a list"}).notices is None
 
 

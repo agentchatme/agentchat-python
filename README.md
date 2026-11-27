@@ -326,13 +326,13 @@ instance_id = integration.listener_instance_id(state_dir / "listener-instance") 
 reporter = integration.ListenerReporter(client, instance_id=instance_id)          # on the event loop
 reporter.set("runs_failing", "runtime_check_failed")
 reporter.set("ok")
-# switched off or uninstalled on purpose:
+# switched off or uninstalled on purpose, before the socket closes:
 reporter.set("stopped")
 await reporter.flush()   # True once the server holds it; never raises
 reporter.stop()
 ```
 
-A change goes out about a second after the first change of a burst (one report, of the latest), at most one attempt a minute, again every 30 minutes while not `ok` (never for `ok`); a failure goes to `on_error` (default: a warning on the `agentchat.integration` logger) once per new failure and is retried after 1 minute, doubling to 15, or after the wait the server names. `set()` never raises for a send (`ValueError` only for a state or reason that is not the contract's). `report_listener()` raises `ServerError` for 503 `LISTENER_REPORTS_UNAVAILABLE` (never retried) and `RateLimitedError` past 120 reports an hour.
+A change goes out about a second after the first change of a burst (one report, of the latest), at most one attempt a minute, again every 30 minutes while not `ok` (never for `ok`); a failure goes to `on_error` (default: a warning on the `agentchat.integration` logger) once per new failure and is retried after 1 minute, doubling to 15, or after the wait the server names (at most an hour). Send `stopped` before the listener closes its socket. `set()` never raises for a send (`ValueError` only for a state or reason that is not the contract's). `report_listener()` raises `ServerError` for 503 `LISTENER_REPORTS_UNAVAILABLE` (never retried) and `RateLimitedError` past 120 reports an hour.
 
 ### Messages
 

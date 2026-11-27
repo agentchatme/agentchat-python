@@ -52,10 +52,13 @@ Proposed: minor (added behaviour: reachability, the listener report and its kit 
   minutes while not `ok`, and never re-sends `ok`. A failure goes to
   `on_error` (default: a warning on the `agentchat.integration` logger)
   once per new failure and is retried after 1 minute, doubling to 15, or
-  after the wait the server names (429 `Retry-After`, a 429/503
-  `retry_after_s`); it never raises into the caller. `await flush()` sends
-  now and returns whether the server holds it (for `stopped` before exit);
-  `stop()` cancels its timer and abandons a report under way. `status()` is
+  after the wait the server names, at most an hour (429 `Retry-After`, a
+  429/503 `retry_after_s`); it never raises into the caller. `await
+  flush()` sends now and returns whether the server holds it (what `set()`
+  said, a report under way for another state included): report `stopped`
+  with it before the listener closes its socket. `stop()` cancels its timer
+  and abandons a report under way (with a sync client, a call already in
+  its worker thread still finishes there, within the client's timeout). `status()` is
   a snapshot for a status command (`ListenerReporterStatus`,
   `AcceptedReport`). `integration.listener_instance_id(path)` makes the
   install's id once (22 URL-safe random characters, mode 0600) and reuses
@@ -64,10 +67,12 @@ Proposed: minor (added behaviour: reachability, the listener report and its kit 
 - Tray notices are typed: `InboxTray.notices` (`TrayNotice`: `kind`,
   `text`, and the fields of each kind; `TrayNoticeKind` adds `no_wake_yet`
   and `socket_offline` to `wake_failing`, `no_wake`, `woken_undelivered`).
-  An unknown kind is kept; a notice this SDK cannot read is left out, never
-  a reason the tray fails to parse.
-- `recover(email, handle=..., finish="connector")` (both clients) sends
-  `finish` (contract v1 §3.7, connector recovery), only when given.
+  An unknown kind is kept; a notice this SDK cannot read (no string `kind`
+  or `text`) is left out, never a reason the tray fails to parse. This
+  changes `tray.notices` for code that read it before: it was the raw list
+  of dicts, kept as an undeclared field (`tray.notices`,
+  `tray.model_extra["notices"]`); it is now a list of `TrayNotice` models
+  (`notice.text`, not `notice["text"]`).
 - Conformance fixtures copied from the published contract: new
   `reachability.v1.json`, `notice.no-wake-yet.v1.json`,
   `notice.socket-offline.v1.json` and `notice.woken-undelivered.v1.json`;
@@ -76,7 +81,9 @@ Proposed: minor (added behaviour: reachability, the listener report and its kit 
   on the register done case, the connector recovery cases),
   `texts.sample.json` (manual 2.4.26) and `manifest.sha256` updated. The
   conformance tests accept every reachability and notice example and keep
-  values and fields they do not know.
+  values and fields they do not know. One connector case is listed as not
+  supported yet: a recovery started with `finish: "connector"`, whose verify
+  answer carries no key (`recover()` does not offer `finish`).
 
 ## [1.10.0] — 2026-11-24
 

@@ -16,8 +16,8 @@ reporter decides when to send it:
 - a change back to what the server already holds before it was sent is no
   report at all;
 - a failure is retried after 1 minute, doubling to 15 (``retry_ms``,
-  ``retry_max_ms``), or after the wait the server names (a 429's
-  ``Retry-After``, a 429 / 503 body's ``retry_after_s``).
+  ``retry_max_ms``), or after the wait the server names, at most an hour (a
+  429's ``Retry-After``, a 429 / 503 body's ``retry_after_s``).
 
 It never raises into the caller: a failure goes to ``on_error`` (once per new
 failure, not once per retry; default: a warning on the ``agentchat.integration``
@@ -25,9 +25,12 @@ logger). It runs on an asyncio loop: call :meth:`ListenerReporter.set` and
 :meth:`~ListenerReporter.stop` from the loop's thread, with an
 :class:`~agentchatme.AsyncAgentChatClient` or an
 :class:`~agentchatme.AgentChatClient` (a sync client's call runs in a worker
-thread). Report from the process that holds the socket only (a standby
-reports nothing). To report ``stopped`` before exiting: ``set("stopped")``,
-``await flush()``, then ``stop()``.
+thread: a report under way when :meth:`~ListenerReporter.stop` is called
+then still finishes there, within the client's timeout and retries). Report
+from the process that holds the socket only (a standby reports nothing).
+When the listener is switched off or uninstalled, report ``stopped`` before
+it closes its socket: ``set("stopped")``, ``await flush()``, then ``stop()``,
+then close the socket.
 
 :func:`listener_instance_id` makes the install's id once and reuses it.
 
@@ -63,6 +66,9 @@ LISTENER_REPORT_RETRY_MS = 60_000
 """The first retry after a failed attempt; doubles per failure up to
 :data:`LISTENER_REPORT_RETRY_MAX_MS`."""
 LISTENER_REPORT_RETRY_MAX_MS = 15 * 60_000
+
+_SERVER_WAIT_MAX_MS = 60 * 60_000
+"""The longest wait a server's answer can set (its report budget is counted per hour)."""
 
 _STATES = frozenset({"ok", "runs_failing", "not_ready", "stopped"})
 _REASONS = frozenset(
@@ -124,16 +130,17 @@ def _reason_of(state: str, reason_kind: str | None) -> str | None:
 
 
 def _server_wait_ms(err: BaseException) -> float | None:
-    """The wait the server named for this failure, in ms, or ``None``."""
+    """The wait the server named for this failure, in ms (at most an hour), or ``None``."""
+    ms: float | None = None
     if isinstance(err, RateLimitedError) and err.retry_after_ms is not None:
-        return float(max(0, err.retry_after_ms))
-    if (
+        ms = float(err.retry_after_ms)
+    elif (
         isinstance(err, AgentChatError)
         and err.status in (429, 503)
         and err.retry_after_s is not None
     ):
-        return float(err.retry_after_s * 1000)
-    return None
+        ms = float(err.retry_after_s * 1000)
+    return None if ms is None else min(float(_SERVER_WAIT_MAX_MS), max(0.0, ms))
 
 
 def _failure_text(err: BaseException) -> str:
@@ -149,6 +156,17 @@ def _iso(epoch_ms: float) -> str:
 
 def _now_ms() -> float:
     return time.time() * 1000.0
+
+
+async def _outcome(task: asyncio.Task[bool]) -> bool:
+    """The send's answer, waited for without being cancelled by it: a send
+    that :meth:`ListenerReporter.stop` cancelled (even before it started) is
+    ``False``, never a ``CancelledError`` for the caller. Cancelling the
+    caller still cancels the wait (not the send)."""
+    await asyncio.wait({task})
+    if task.cancelled():
+        return False
+    return task.result()
 
 
 class ListenerReporter:
@@ -223,6 +241,10 @@ class ListenerReporter:
             return
         report = _Report(state, _reason_of(state, reason_kind))
         if report == self._desired:
+            # Nothing new; but if nothing is armed or under way (an earlier
+            # set() found no running loop), make sure what is due is.
+            if self._timer is None and self._in_flight is None:
+                self._schedule()
             return
         # The wait runs from the first change the server has not heard of, so
         # a state that keeps changing is still reported, at its latest.
@@ -243,15 +265,14 @@ class ListenerReporter:
             if not self._pending():
                 return True
             task, sent = self._in_flight, self._in_flight_report
-            if task is not None:
-                accepted = await asyncio.shield(task)
-                # The send under way was for what set() still says: its answer is the answer.
-                if sent == self._desired:
-                    return accepted
-                continue
-            if self._now() < self._server_wait_until:
-                return False
-            return await asyncio.shield(self._send())
+            if task is None:
+                if self._now() < self._server_wait_until:
+                    return False
+                task, sent = self._send(), self._desired
+            accepted = await _outcome(task)
+            # The send under way was for what set() still says: its answer is the answer.
+            if sent == self._desired or self._stopped:
+                return accepted
 
     def stop(self) -> None:
         """Stop: no more reports, its timer cancelled, a report under way
@@ -282,7 +303,14 @@ class ListenerReporter:
     # ─── when to send ────────────────────────────────────────────────────
 
     def _pending(self) -> bool:
-        return self._desired is not None and self._desired != self._reported
+        """Whether the server does not (or will not, once the report under way
+        lands) hold what ``set()`` said: a report in flight for another state
+        counts, since it will replace what the server holds."""
+        if self._desired is None:
+            return False
+        if self._in_flight is not None and self._in_flight_report != self._desired:
+            return True
+        return self._desired != self._reported
 
     def _next_due(self) -> float | None:
         """When the next attempt is due, or ``None`` when nothing is to be sent."""
@@ -368,7 +396,9 @@ class ListenerReporter:
             if inspect.iscoroutinefunction(call):
                 await call(**kwargs)
             else:
-                await asyncio.to_thread(call, **kwargs)
+                answer = await asyncio.to_thread(call, **kwargs)
+                if inspect.isawaitable(answer):
+                    await answer
         except asyncio.CancelledError:
             # Abandoned by stop(): nothing to tell.
             if self._stopped:

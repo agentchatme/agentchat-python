@@ -186,25 +186,27 @@ class TrayNotice(_BaseModel):
     """A :data:`TrayNoticeKind`, or one a later server added."""
     text: str
     """Written by the server for you. Show it as it is."""
-    since: str | None = None
-    """When it began (every kind; ``wake_failing`` may say ``None``)."""
-    last_at: str | None = None
+    # The per-kind fields are kept as sent, not checked: a later kind may use
+    # one of these names for a value of another type, and is still a notice.
+    since: Any = None
+    """When it began, ISO-8601 UTC (every kind; ``wake_failing`` may say ``None``)."""
+    last_at: Any = None
     """``wake_failing``: the newest failed wake."""
-    status: int | None = None
+    status: Any = None
     """``wake_failing``: the HTTP status the trigger answered (``None``: nothing answered)."""
-    transport: str | None = None
+    transport: Any = None
     """``woken_undelivered``: ``webhook`` or ``check``."""
-    received_by: str | None = None
+    received_by: Any = None
     """``woken_undelivered`` on a wake check: when its poller took the wake."""
-    waiting_since: str | None = None
+    waiting_since: Any = None
     """``woken_undelivered``, ``socket_offline``: since when the oldest waiting
     message has waited."""
 
 
 def _readable_notices(value: Any) -> list[TrayNotice] | None:
     """The tray's ``notices``, each one this SDK can read: one that is not
-    (no string ``kind`` or ``text``, a field of the wrong type) is left out,
-    so a notice is never a reason the tray fails to parse."""
+    (no string ``kind`` or ``text``) is left out, so a notice is never a
+    reason the tray fails to parse."""
     if not isinstance(value, list):
         return None
     items: list[Any] = value

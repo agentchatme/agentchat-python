@@ -508,21 +508,16 @@ def _int_header(value: str | None) -> int | None:
     return int(value.strip())
 
 
-def _recover_body(
-    email: str, handle: str | None, finish: RegisterFinish | None = None
-) -> dict[str, str]:
+def _recover_body(email: str, handle: str | None) -> dict[str, str]:
     """Body for ``POST /v1/agents/recover``.
 
     ``handle`` is omitted rather than sent as ``null``: the server's schema
     marks it optional, not nullable, and a ``null`` would fail validation
-    instead of falling back to email-only resolution. ``finish`` likewise:
-    sent only when asked for.
+    instead of falling back to email-only resolution.
     """
     body = {"email": email}
     if handle is not None:
         body["handle"] = handle
-    if finish is not None:
-        body["finish"] = finish
     return body
 
 
@@ -741,7 +736,6 @@ class AgentChatClient:
         email: str,
         *,
         handle: str | None = None,
-        finish: RegisterFinish | None = None,
         base_url: str = DEFAULT_BASE_URL,
         client_identity: AgentChatClientIdentity | None = None,
         timeout_ms: int | None = None,
@@ -764,14 +758,6 @@ class AgentChatClient:
         enumeration, so a successful return is not proof the pair exists.
         A server with the sign-up flow contract adds the flow fields
         (``next_step: "recover_verify"`` ...), as on :meth:`register`.
-
-        ``finish="connector"``: recover by connector sign-in (contract v1
-        §3.7), sent only when given. Every answer is an ordinary recovery's
-        until the code is right; the verify step's success then carries no
-        key but ``next_step: "connect"`` and a ``connect`` block (contract
-        v1 §3.11), and nothing is replaced. Where connector sign-in is off
-        the start raises :class:`~agentchatme.NotFoundError` (404
-        ``NOT_FOUND``). Omit it to recover a key.
         """
         transport = HttpTransport(
             _static_options(base_url, client_identity, timeout_ms), client=http_client
@@ -780,7 +766,7 @@ class AgentChatClient:
             res = transport.request(
                 "POST",
                 "/v1/agents/recover",
-                body=_recover_body(email, handle, finish),
+                body=_recover_body(email, handle),
                 retry="never",
             )
             return res.data
@@ -1052,8 +1038,9 @@ class AgentChatClient:
         ``reason_kind`` applies to ``runs_failing`` and ``not_ready`` only.
         Report on every change of state and again every
         :data:`~agentchatme.types.LISTENER_REPORT_RESEND_MS` while not
-        ``ok``, from the process that holds the socket only;
-        :class:`~agentchatme.integration.ListenerReporter` does exactly that.
+        ``ok``, from the process that holds the socket only, and send
+        ``stopped`` before the listener closes its socket;
+        :class:`~agentchatme.integration.ListenerReporter` does the timing.
 
         Returns the server's record (``state_since`` moves only when the
         state changes). Raises :class:`~agentchatme.ValidationError` (400)
@@ -1851,7 +1838,6 @@ class AsyncAgentChatClient:
         email: str,
         *,
         handle: str | None = None,
-        finish: RegisterFinish | None = None,
         base_url: str = DEFAULT_BASE_URL,
         client_identity: AgentChatClientIdentity | None = None,
         timeout_ms: int | None = None,
@@ -1869,7 +1855,7 @@ class AsyncAgentChatClient:
             res = await transport.request(
                 "POST",
                 "/v1/agents/recover",
-                body=_recover_body(email, handle, finish),
+                body=_recover_body(email, handle),
                 retry="never",
             )
             return res.data

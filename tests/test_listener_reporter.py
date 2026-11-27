@@ -452,6 +452,103 @@ async def test_flush_keeps_a_wait_the_server_named() -> None:
     reporter.stop()
 
 
+async def test_flush_while_another_state_is_under_way_waits_then_sends_what_set_says() -> None:
+    clock = _Clock()
+    gate = asyncio.Event()
+
+    class _Gated(_Client):
+        async def report_listener(self, **kwargs: Any) -> dict[str, Any]:
+            if len(self.calls) == 1:  # the second report waits for the gate
+                self.calls.append(kwargs)
+                await gate.wait()
+                return {"instance_id": kwargs["instance_id"], "state": kwargs["state"]}
+            return await super().report_listener(**kwargs)
+
+    client = _Gated()
+    reporter = _reporter(client, clock)
+    reporter.set("ok")
+    await clock.advance(MIN)  # the server holds ok
+    reporter.set("runs_failing")
+    await clock.advance(MIN)  # under way, held
+    assert len(client.calls) == 2
+    reporter.set("ok")  # the check recovered, while runs_failing is in flight
+    assert reporter.status().pending is True  # runs_failing will land and replace ok
+    flushed = asyncio.ensure_future(reporter.flush())
+    await _settle()
+    gate.set()
+    assert await flushed is True
+    assert client.sent() == [
+        {"state": "ok"},
+        {"state": "runs_failing", "reason_kind": "other"},
+        {"state": "ok"},
+    ]
+    status = reporter.status()
+    assert status.pending is False
+    assert status.reported is not None and status.reported.state == "ok"
+    reporter.stop()
+
+
+async def test_stop_before_the_send_starts_makes_flush_false_not_cancelled() -> None:
+    clock, client = _Clock(), _Client()
+    reporter = _reporter(client, clock)
+    reporter.set("stopped")
+    asyncio.get_running_loop().call_soon(reporter.stop)  # e.g. a signal handler
+    assert await reporter.flush() is False
+    await _settle()
+    assert client.calls == []
+
+
+async def test_a_server_wait_is_kept_to_at_most_an_hour() -> None:
+    limited = _api_error(
+        429, {"code": "RATE_LIMITED", "message": "Too many requests"}, {"Retry-After": "86400"}
+    )
+    clock, client = _Clock(), _Client([limited, "ok"])
+    reporter = _reporter(client, clock)
+    reporter.set("runs_failing")
+    await clock.advance(1_000)
+    await clock.advance(60 * MIN - 1)
+    assert len(client.calls) == 1
+    await clock.advance(1)
+    assert len(client.calls) == 2
+    reporter.stop()
+
+
+async def test_a_sync_method_that_returns_an_awaitable_is_awaited() -> None:
+    clock = _Clock()
+    inner = _Client()
+
+    class _Wrapped:
+        def report_listener(self, **kwargs: Any) -> Any:
+            return inner.report_listener(**kwargs)  # a coroutine, from a plain function
+
+    reporter = _reporter(_Wrapped(), clock)
+    reporter.set("ok")
+    assert await reporter.flush() is True
+    assert inner.sent() == [{"state": "ok"}]
+    reporter.stop()
+
+
+async def test_a_set_made_before_the_loop_ran_is_sent_by_the_next_same_set_on_the_loop() -> None:
+    client = _Client()
+    errors: list[str] = []
+    holder: dict[str, ListenerReporter] = {}
+
+    def before_the_loop() -> None:
+        reporter = ListenerReporter(
+            client, instance_id=ID, coalesce_ms=10, on_error=lambda e: errors.append(str(e))
+        )
+        reporter.set("not_ready", "not_signed_in")  # no loop in this thread yet
+        holder["r"] = reporter
+
+    await asyncio.to_thread(before_the_loop)
+    reporter = holder["r"]
+    assert errors and "no running asyncio loop" in errors[0]
+    reporter.set("not_ready", "not_signed_in")  # the same state, now on the loop
+    await asyncio.sleep(0.1)
+    assert client.sent() == [{"state": "not_ready", "reason_kind": "not_signed_in"}]
+    reporter.stop()
+
+
 async def test_stop_stops_no_report_after_no_timer_a_report_under_way_abandoned() -> None:
     clock, client = _Clock(), _Client()
     client.hold = asyncio.Event()
