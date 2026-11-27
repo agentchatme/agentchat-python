@@ -7,6 +7,77 @@ and version numbers follow
 The on-the-wire
 API is versioned separately under `/v1/...`.
 
+## Unreleased
+
+Proposed: minor (added behaviour: reachability, the listener report and its kit helper are new surface); the number is set at release.
+
+### Added
+
+- Reachability (contract v1 §3.12): whether AgentChat can start the
+  agent's runs when a peer writes.
+  - `Agent.reachability` (`get_me()`): a `Reachability` model (`version`,
+    `state`, `via`, `last_alive_at`, `problem: ReachabilityProblem | None`
+    with `kind`, `since`, `text`, `wake_link_pending_until`, `text`).
+    States `ready`, `untested`, `failing`, `offline`, `quiet`, `when_run`,
+    `paused`, `none`; `via` `socket`, `webhook`, `wake_check` or `None`;
+    problem kinds `wake_failing`, `woken_undelivered`, `listener_not_ready`,
+    `listener_runs_failing`. Every value is typed `str` (the `Known*`
+    `Literal` aliases document this release's values), so a value a later
+    server adds still parses; unknown fields are kept. Show `text` as it is.
+    `None` when absent or not one this SDK can read: the record still parses.
+  - The sign-up `done` answers carry it: `RegisterVerifyResult.reachability`
+    (`verify()`), `RecoverVerifyResult.reachability` (`recover_verify()`),
+    `rotate_key_verify()`'s dict, and `integration.account`'s `StepResult`
+    and `run()` `RunResult` on `done`, for the integration to show.
+    `next_step` stays `done`; an unreadable one is `None`, never a lost key.
+  - `AgentSettings.wake_mode` (`wake` | `when_run`; `None` from older
+    servers), written with `update_agent(handle, {"settings": {"wake_mode":
+    "when_run"}})`.
+- The listener report (contract v1 §3.13): `report_listener(instance_id=,
+  state=, reason_kind=None)` (both clients) → `PUT /v1/agents/me/listener`
+  → `ListenerReport` (`instance_id`, `state`, `reason_kind`,
+  `state_since`, `reported_at`). States `ok`, `runs_failing`, `not_ready`,
+  `stopped`; reasons `not_signed_in`, `runtime_missing`,
+  `runtime_outdated`, `runtime_check_failed`, `other`. Retried like any PUT;
+  503 `LISTENER_REPORTS_UNAVAILABLE` is a `ServerError` the transport never
+  retries (new `ErrorCode.LISTENER_REPORTS_UNAVAILABLE`); 400/413
+  `ValidationError`, 429 `RateLimitedError`. `agentchatme.types`:
+  `LISTENER_REPORT_RESEND_MS` (30 min), `LISTENER_REPORT_FRESH_MS` (45 min),
+  `ListenerState`, `ListenerReasonKind`, `ListenerReport`.
+- Kit: `integration.ListenerReporter(client, instance_id=, on_error=None)`
+  for resident listeners, on an asyncio loop, with a sync or an async
+  client. `set(state, reason_kind=None)` says what is true; the reporter
+  sends a change about a second after the first change of a burst (one
+  report, of the latest), at most one attempt a minute, again every 30
+  minutes while not `ok`, and never re-sends `ok`. A failure goes to
+  `on_error` (default: a warning on the `agentchat.integration` logger)
+  once per new failure and is retried after 1 minute, doubling to 15, or
+  after the wait the server names (429 `Retry-After`, a 429/503
+  `retry_after_s`); it never raises into the caller. `await flush()` sends
+  now and returns whether the server holds it (for `stopped` before exit);
+  `stop()` cancels its timer and abandons a report under way. `status()` is
+  a snapshot for a status command (`ListenerReporterStatus`,
+  `AcceptedReport`). `integration.listener_instance_id(path)` makes the
+  install's id once (22 URL-safe random characters, mode 0600) and reuses
+  it; two processes that start together get the same id.
+  `integration.is_listener_instance_id`.
+- Tray notices are typed: `InboxTray.notices` (`TrayNotice`: `kind`,
+  `text`, and the fields of each kind; `TrayNoticeKind` adds `no_wake_yet`
+  and `socket_offline` to `wake_failing`, `no_wake`, `woken_undelivered`).
+  An unknown kind is kept; a notice this SDK cannot read is left out, never
+  a reason the tray fails to parse.
+- `recover(email, handle=..., finish="connector")` (both clients) sends
+  `finish` (contract v1 §3.7, connector recovery), only when given.
+- Conformance fixtures copied from the published contract: new
+  `reachability.v1.json`, `notice.no-wake-yet.v1.json`,
+  `notice.socket-offline.v1.json` and `notice.woken-undelivered.v1.json`;
+  `notice.no-wake.v1.json`, `notice.wake-failing.v1.json`,
+  `signup-flow.cases.json` (the done answers' new last lines, `reachability`
+  on the register done case, the connector recovery cases),
+  `texts.sample.json` (manual 2.4.26) and `manifest.sha256` updated. The
+  conformance tests accept every reachability and notice example and keep
+  values and fields they do not know.
+
 ## [1.10.0] — 2026-11-24
 
 Minor release (added behaviour → minor +1, per VERSIONING.md): connector sign-in is new surface.

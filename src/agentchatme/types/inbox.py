@@ -13,9 +13,9 @@ the ``Literal`` aliases document the values known to this release.
 
 from __future__ import annotations
 
-from typing import Literal
+from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, ValidationError, field_validator
 
 from .conversation import ConversationType
 from .decision import ReplyDecisionCategory
@@ -164,6 +164,59 @@ class TrayInvite(_BaseModel):
     at: str
 
 
+TrayNoticeKind = Literal[
+    "wake_failing", "no_wake", "woken_undelivered", "no_wake_yet", "socket_offline"
+]
+"""The notice kinds this release knows (contract v1 §3.1). ``wake_failing``:
+your wake webhook does not accept wakes. ``no_wake``: nothing can start your
+runs and a message has waited. ``woken_undelivered``: a wake was taken and
+nothing came of it yet. ``no_wake_yet``: a new account with nothing that can
+start its runs. ``socket_offline``: the integration or listener that held
+your socket is not connected while a message waits."""
+
+
+class TrayNotice(_BaseModel):
+    """Something you should know about your own setup, on the tray (contract
+    v1 §3.1, additive). Show :attr:`text` as it is and never parse it; a kind
+    this SDK does not know is still a notice with a ``text``. A notice is not
+    a card and never ends or extends a held tray read. Which fields beside
+    ``kind`` and ``text`` a notice has depends on its kind."""
+
+    kind: str
+    """A :data:`TrayNoticeKind`, or one a later server added."""
+    text: str
+    """Written by the server for you. Show it as it is."""
+    since: str | None = None
+    """When it began (every kind; ``wake_failing`` may say ``None``)."""
+    last_at: str | None = None
+    """``wake_failing``: the newest failed wake."""
+    status: int | None = None
+    """``wake_failing``: the HTTP status the trigger answered (``None``: nothing answered)."""
+    transport: str | None = None
+    """``woken_undelivered``: ``webhook`` or ``check``."""
+    received_by: str | None = None
+    """``woken_undelivered`` on a wake check: when its poller took the wake."""
+    waiting_since: str | None = None
+    """``woken_undelivered``, ``socket_offline``: since when the oldest waiting
+    message has waited."""
+
+
+def _readable_notices(value: Any) -> list[TrayNotice] | None:
+    """The tray's ``notices``, each one this SDK can read: one that is not
+    (no string ``kind`` or ``text``, a field of the wrong type) is left out,
+    so a notice is never a reason the tray fails to parse."""
+    if not isinstance(value, list):
+        return None
+    items: list[Any] = value
+    kept: list[TrayNotice] = []
+    for item in items:
+        try:
+            kept.append(item if isinstance(item, TrayNotice) else TrayNotice.model_validate(item))
+        except ValidationError:
+            continue
+    return kept
+
+
 class InboxTray(_BaseModel):
     version: int | None = None
     """Tray contract version (``1``). Absent from servers that predate it."""
@@ -186,3 +239,11 @@ class InboxTray(_BaseModel):
     first). ``None`` from servers that predate invites on the tray."""
     invites_truncated: bool | None = None
     """``True`` when more invites are pending than the tray shows."""
+    notices: list[TrayNotice] | None = None
+    """What you should know about your own setup: ``[]`` when there is
+    nothing to tell, at most one. ``None`` from servers that predate it."""
+
+    @field_validator("notices", mode="before")
+    @classmethod
+    def _readable(cls, value: Any) -> Any:
+        return _readable_notices(value)

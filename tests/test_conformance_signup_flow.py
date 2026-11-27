@@ -237,6 +237,12 @@ def test_start_and_submit_code(case: dict[str, Any]) -> None:
         assert result.api_key == served["api_key"]
         handle = served.get("handle") or (served.get("agent") or {}).get("handle")
         assert result.handle == handle
+        # reachability (contract v1 §3.12) rides on done as sent, or is absent.
+        if "reachability" in served:
+            assert result.reachability is not None
+            assert result.reachability.model_dump(mode="json") == served["reachability"]
+        else:
+            assert result.reachability is None
     else:
         assert result.api_key is None
     if result.action == "ask_code":
@@ -257,6 +263,15 @@ def test_connector_sign_up(case: dict[str, Any]) -> None:
     try:
         if request["kind"] == "register_status":
             outcome = AgentChatClient.register_status(f"{API}{request['path']}", http_client=http_client)
+        elif request["kind"] == "recover":
+            start = request["body"]
+            outcome = AgentChatClient.recover(
+                start["email"],
+                handle=start.get("handle"),
+                finish=start["finish"],
+                base_url=API,
+                http_client=http_client,
+            )
         else:
             outcome = AgentChatClient.register(**request["body"], base_url=API, http_client=http_client)
     except AgentChatError as err:
