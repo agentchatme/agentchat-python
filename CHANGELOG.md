@@ -7,6 +7,86 @@ and version numbers follow
 The on-the-wire
 API is versioned separately under `/v1/...`.
 
+## [Unreleased]
+
+The server changed connector sign-in on 2026-11-25: a sign-up or recovery
+with `finish: "connector"` now finishes at the verify call, whose right code
+answers `next_step: "connect"` with a `connect` block and no key. This
+release follows it.
+
+### Added
+
+- `recover(email, *, handle=None, finish=None)` (both clients) sends
+  `finish` (`"connector"`) only when given. The start answer and wrong codes
+  are as without it; the right code answers with a connector address instead
+  of a new key, and the API key, the wake and any claim stay as they are.
+  `NotFoundError` (404 `NOT_FOUND`) where connector sign-in is off.
+  `RecoverRequest` gains `finish`.
+- `finish` on `verify()` and `recover_verify()` (both clients). It is never
+  sent: it says the caller handles a connector answer. With
+  `finish="connector"`, a `next_step: "connect"` answer returns a
+  `ConnectorVerifyResult`; an ordinary `done` answer (a key came) still
+  returns the ordinary result tuple, since the server's answer decides.
+  Typed with `typing.overload`, so a type checker sees
+  `RegisterVerifyResult` / `RecoverVerifyResult` without `finish` and the
+  union with `ConnectorVerifyResult` with it. Any other `finish` raises
+  `ValueError` before anything is sent.
+- `ConnectorVerifyResult`: `handle` (the server's), `connect` (the
+  connector address `mcp_url`, a one-use grant, and the sign-in endpoints,
+  as sent), `message`, the sign-up flow fields and the claim link
+  attributes. No API key and no client.
+- `ConnectorSignupError` (an `AgentChatError`, code `CONNECTOR_SIGNUP`, set
+  by the SDK; `status` is the answer's 2xx): raised by `verify()` and
+  `recover_verify()` called without `finish="connector"` on a
+  `next_step: "connect"` answer. It carries `connect`, `handle`, `message`
+  and `result` (the `ConnectorVerifyResult` the same call with
+  `finish="connector"` returns), and `details` is the answer's flow fields,
+  so the one-use address is never lost and no keyless client is made.
+- `integration.account`: `RegisterInput` and `RecoverInput` gain `finish`,
+  which `start()` sends only when given. `StepResult.connect` holds the
+  `connect` block on the `connect` action, and `StepResult.handle` is set
+  on it too; a `connect` answer without a connector address or a handle is
+  `stop`. `run()` ends with a key and raises `TypeError` for an `input`
+  with `finish`.
+- Conformance fixtures: every file of the published contract copied byte
+  for byte (manual 2.4.26): `signup-flow.cases.json` (the connector cases
+  at the verify step, `recover-connector-not-available`; the
+  `register_status` cases are gone), `texts.sample.json`, the notice
+  files, and the new `notice.woken-undelivered.v1.json`,
+  `notice.no-wake-yet.v1.json`, `notice.socket-offline.v1.json` and
+  `reachability.v1.json`. The SDK does not read `reachability` yet.
+
+### Changed
+
+- `register(..., finish="connector")` returns the ordinary pending start
+  (`pending_id`, `next_step: "verify"` ...), as the server now answers. The
+  docs no longer describe a `connect` block or `signup_expires_at` in it.
+- `ConnectorSignupConnect` is now the `connect` block of the verify answer:
+  a `TypedDict` with `mcp_url`, `resource`, `issuer`,
+  `authorization_endpoint`, `token_endpoint`, `registration_endpoint`,
+  `scope` and `expires_at`. It was a model of the register answer's
+  `{mcp_url, status_url}`, which the server no longer sends.
+
+### Removed
+
+- `register_status()` (both clients), `RegisterStatusResult` and
+  `ErrorCode.FINISH_ON_PAGE`. The server removed
+  `GET /v1/register/{pending_id}` and the `FINISH_ON_PAGE` answer on
+  2026-11-25, so these calls already failed.
+- `integration.account.action_of` no longer reads
+  `next_step: "get_my_status"` as `done`: only that status endpoint sent
+  it. An unknown `next_step` is `stop`.
+
+### Fixed
+
+- `verify()` and `recover_verify()` (both clients) no longer raise
+  `KeyError` on a connector answer (`next_step: "connect"`, no `api_key`).
+  Any other 2xx answer without an API key, and a connect answer without
+  `connect.mcp_url` or a handle, raise a plain `AgentChatError`
+  (`INTERNAL_ERROR`, `details` the body) instead; a client is never made
+  without a key. A recovery answer with a key but no `handle` keeps the
+  key (`handle` is `""`).
+
 ## [1.10.0] — 2026-11-24
 
 Minor release (added behaviour → minor +1, per VERSIONING.md): connector sign-in is new surface.

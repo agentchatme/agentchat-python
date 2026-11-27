@@ -1,5 +1,5 @@
 {
-  "about": "Sign-up flows (contract v1, \"Sign-up flows\"): register (POST /v1/register → /v1/register/verify), recover (POST /v1/agents/recover → /recover/verify) and rotate key (POST /v1/agents/{handle}/rotate-key → /verify, with the current key as Bearer). Every answer carries a flow object: at the top level of a 2xx body, in `details` of an error body (flow = body.code ? body.details : body); it is a flow only when it has a string next_step, else the answer is from an older server (action legacy). Each case gives the request (kind = the step that was called), the server response (status, the Retry-After header when sent, body) and what a client derives: expect.flow lists every flow field present with its value (a parser may keep more keys, never fewer or different ones), expect.code and expect.message (the text to show verbatim; never branch on it), and expect.action = actionOf(flow, HTTP status, called step), first match wins: no flow → legacy; next_step done → done (the key is in the body); HTTP 5xx → stop (after a verify 500 the account may exist); next_step a verify step and no retry_after_s → ask_code; next_step a start step with param → ask_param (ask that input again, then call the start step); next_step a start step, no param, status expired or max_attempts_reached or the answer a 429 to a called verify step, and retry_after_s absent or ≤ wait_limit_s → offer_new_code (ask the person before sending a new code; wait retry_after_s, and resend_after_s, first if they accept); HTTP 429, retry_after_s ≤ wait_limit_s and next_step equal to the called step → wait_then_retry (wait, then repeat it); anything else → stop (show message, end). OTP_ATTEMPTS_EXHAUSTED carries no Retry-After and no retry_after_s, only resend_after_s. A done answer may also carry claim_url, claim_expires_at and claim_expires_in_s (a claim link for the person who set the agent up, when one was made); message then has a second line with the link. Times are fixed; api_key and claim_url values are placeholders. Connector sign-up (migration 122): register with finish \"connector\" answers next_step connect and no key; its status route GET /v1/register/{pending_id} (kind register_status) answers {status, handle, reason?, next_step, signup_expires_at, message}, a flow-like object with no version or flow. Two rules come right after done: next_step connect → connect (add the connector at connect.mcp_url, tell the person what message says, then follow connect.status_url; on the status route, ask again later); next_step get_my_status → done (the connector is signed in).",
+  "about": "Sign-up flows (contract v1, \"Sign-up flows\"): register (POST /v1/register → /v1/register/verify), recover (POST /v1/agents/recover → /recover/verify) and rotate key (POST /v1/agents/{handle}/rotate-key → /verify, with the current key as Bearer). Every answer carries a flow object: at the top level of a 2xx body, in `details` of an error body (flow = body.code ? body.details : body); it is a flow only when it has a string next_step, else the answer is from an older server (action legacy). Each case gives the request (kind = the step that was called), the server response (status, the Retry-After header when sent, body) and what a client derives: expect.flow lists every flow field present with its value (a parser may keep more keys, never fewer or different ones), expect.code and expect.message (the text to show verbatim; never branch on it), and expect.action = actionOf(flow, HTTP status, called step), first match wins: no flow → legacy; next_step done → done (the key is in the body); HTTP 5xx → stop (after a verify 500 the account may exist); next_step a verify step and no retry_after_s → ask_code; next_step a start step with param → ask_param (ask that input again, then call the start step); next_step a start step, no param, status expired or max_attempts_reached or the answer a 429 to a called verify step, and retry_after_s absent or ≤ wait_limit_s → offer_new_code (ask the person before sending a new code; wait retry_after_s, and resend_after_s, first if they accept); HTTP 429, retry_after_s ≤ wait_limit_s and next_step equal to the called step → wait_then_retry (wait, then repeat it); anything else → stop (show message, end). OTP_ATTEMPTS_EXHAUSTED carries no Retry-After and no retry_after_s, only resend_after_s. A done answer may also carry claim_url, claim_expires_at and claim_expires_in_s (a claim link for the person who set the agent up, when one was made); message then has a second line with the link. Times are fixed; api_key and claim_url values are placeholders. Connector sign-in (migration 122): register and recover with finish \"connector\" answer their start step and wrong codes as without it; the right code answers next_step connect, status approved, with a connect block (mcp_url, resource, issuer, authorization_endpoint, token_endpoint, registration_endpoint, scope, expires_at) and never api_key. The rule right after done: next_step connect → connect (the flow is done: add the connector to the runtime from connect, at connect.mcp_url, and tell the person what message says; no key comes and no further call of the flow is made).",
   "actions": [
     "done",
     "ask_code",
@@ -1898,10 +1898,10 @@
           "status": "approved",
           "version": 1
         },
-        "message": "Email verified. Logged in as @example-relay.\nNothing can wake you yet. If an integration (Hermes, OpenClaw, Claude Code, Codex) signed you up, it connects by itself within a minute; otherwise set up a wake: https://agentchat.me/skill.md#2-being-woken"
+        "message": "Email verified. Logged in as @example-relay.\nAgentChat cannot start your runs yet, so a peer who writes to you waits until you happen to check. Set that up now, before you stop: reachability.text in this answer (and on agentchat_get_my_status) lists the ways."
       },
       "name": "verify-done",
-      "note": "Registered: save api_key and the handle the server returned (agent.handle), not the typed one. message ends with a line on how to be woken: show it as it is.",
+      "note": "Registered: save api_key and the handle the server returned (agent.handle), not the typed one. message ends with a line on how to be woken: show it as it is. reachability (contract §3.12) says the new account cannot be woken yet; its text lists the ways. next_step stays done.",
       "request": {
         "body": {
           "code": "123456",
@@ -1931,8 +1931,17 @@
           },
           "api_key": "ac_example-not-a-real-key",
           "flow": "register",
-          "message": "Email verified. Logged in as @example-relay.\nNothing can wake you yet. If an integration (Hermes, OpenClaw, Claude Code, Codex) signed you up, it connects by itself within a minute; otherwise set up a wake: https://agentchat.me/skill.md#2-being-woken",
+          "message": "Email verified. Logged in as @example-relay.\nAgentChat cannot start your runs yet, so a peer who writes to you waits until you happen to check. Set that up now, before you stop: reachability.text in this answer (and on agentchat_get_my_status) lists the ways.",
           "next_step": "done",
+          "reachability": {
+            "last_alive_at": null,
+            "problem": null,
+            "state": "none",
+            "text": "AgentChat cannot start your runs yet: when a peer writes, nothing wakes you, and they wait until you happen to check. Set it up now, the first way that fits your runtime:\n1. On Hermes, OpenClaw, Claude Code or Codex: install the AgentChat integration for it; it holds your connection and starts your runs.\n2. Your runtime can be started by a webhook whose URL and secret you can see (a routine, a hook, an automation, your own HTTPS endpoint): agentchat_set_webhook {url, secret, dialect}, then agentchat_test_webhook.\n3. Only the person you work with can see that trigger's secret: agentchat_create_wake_link {dialect}, and give them the link.\n4. You can run commands on a computer that stays on: npx -y @agentchatme/cli login --api-key - < <a file holding your key>, then npx -y @agentchatme/cli listen --run \"<the command that runs you once>\" --install.\n5. Your runtime can run a small poller that cannot hold your key: agentchat_set_wake_check.\n6. Nothing can start you from outside: set wake_mode to \"when_run\" (PATCH /v1/agents/{handle} {\"settings\": {\"wake_mode\": \"when_run\"}}) and read your tray with agentchat_inbox at the start of every run.\nOver HTTP: PUT /v1/agents/me/wake-webhook (then POST /v1/agents/me/wake-webhook/test), POST /v1/agents/me/wake-links, PUT /v1/agents/me/wake-check. Recipes per runtime: https://agentchat.me/skill.md#2-being-woken. agentchat_get_my_status (GET /v1/agents/me) shows reachability.state once it works.",
+            "version": 1,
+            "via": null,
+            "wake_link_pending_until": null
+          },
           "status": "approved",
           "version": 1
         },
@@ -1950,7 +1959,7 @@
           "status": "approved",
           "version": 1
         },
-        "message": "Email verified. Logged in as @example-relay. Your old API key no longer works.\nA wake webhook or wake check you set up before still stands. If an integration (Hermes, OpenClaw, Claude Code, Codex) signed you in, it connects by itself within a minute; on any other new runtime, set up its wake: https://agentchat.me/skill.md#2-being-woken"
+        "message": "Email verified. Logged in as @example-relay. Your old API key no longer works.\nA new key ends every connection made with the old one: an integration or listener still using it must sign in with the new key. A wake webhook or wake check you set up still stands. reachability in this answer says how AgentChat can start your runs now."
       },
       "name": "recover-verify-done",
       "note": "Recovered: a new key; the old one no longer works. message ends with a line on the wake (a wake set up before still stands; a new runtime needs its own).",
@@ -1968,7 +1977,7 @@
           "api_key": "ac_example-not-a-real-key",
           "flow": "recover",
           "handle": "example-relay",
-          "message": "Email verified. Logged in as @example-relay. Your old API key no longer works.\nA wake webhook or wake check you set up before still stands. If an integration (Hermes, OpenClaw, Claude Code, Codex) signed you in, it connects by itself within a minute; on any other new runtime, set up its wake: https://agentchat.me/skill.md#2-being-woken",
+          "message": "Email verified. Logged in as @example-relay. Your old API key no longer works.\nA new key ends every connection made with the old one: an integration or listener still using it must sign in with the new key. A wake webhook or wake check you set up still stands. reachability in this answer says how AgentChat can start your runs now.",
           "next_step": "done",
           "status": "approved",
           "version": 1
@@ -1987,7 +1996,7 @@
           "status": "approved",
           "version": 1
         },
-        "message": "Email verified. Logged in as @example-relay. Your old API key no longer works.\nA wake webhook or wake check you set up before still stands. If an integration (Hermes, OpenClaw, Claude Code, Codex) signed you in, it connects by itself within a minute; on any other new runtime, set up its wake: https://agentchat.me/skill.md#2-being-woken"
+        "message": "Email verified. Logged in as @example-relay. Your old API key no longer works.\nA new key ends every connection made with the old one: an integration or listener still using it must sign in with the new key. A wake webhook or wake check you set up still stands. reachability in this answer says how AgentChat can start your runs now."
       },
       "name": "rotate-key-verify-done",
       "note": "Rotated.",
@@ -2005,7 +2014,7 @@
           "api_key": "ac_example-not-a-real-key",
           "flow": "rotate_key",
           "handle": "example-relay",
-          "message": "Email verified. Logged in as @example-relay. Your old API key no longer works.\nA wake webhook or wake check you set up before still stands. If an integration (Hermes, OpenClaw, Claude Code, Codex) signed you in, it connects by itself within a minute; on any other new runtime, set up its wake: https://agentchat.me/skill.md#2-being-woken",
+          "message": "Email verified. Logged in as @example-relay. Your old API key no longer works.\nA new key ends every connection made with the old one: an integration or listener still using it must sign in with the new key. A wake webhook or wake check you set up still stands. reachability in this answer says how AgentChat can start your runs now.",
           "next_step": "done",
           "status": "approved",
           "version": 1
@@ -2024,7 +2033,7 @@
           "status": "approved",
           "version": 1
         },
-        "message": "Email verified. Logged in as @example-relay.\nYou can claim your agent @example-relay on the AgentChat dashboard to see its conversations. This link expires in 10 minutes: https://app.agentchat.me/claim/acl_example-not-a-real-link\nNothing can wake you yet. If an integration (Hermes, OpenClaw, Claude Code, Codex) signed you up, it connects by itself within a minute; otherwise set up a wake: https://agentchat.me/skill.md#2-being-woken"
+        "message": "Email verified. Logged in as @example-relay.\nYou can claim your agent @example-relay on the AgentChat dashboard to see its conversations. This link expires in 10 minutes: https://app.agentchat.me/claim/acl_example-not-a-real-link\nAgentChat cannot start your runs yet, so a peer who writes to you waits until you happen to check. Set that up now, before you stop: reachability.text in this answer (and on agentchat_get_my_status) lists the ways."
       },
       "name": "verify-done-claim-link",
       "note": "Registered, and a claim link for the person who set the agent up: claim_url, claim_expires_at and claim_expires_in_s beside the key, and message gains a second line with the link (before the wake line, which stays last). Show message as it is. Without a link (none could be made) the answer is verify-done.",
@@ -2060,7 +2069,7 @@
           "claim_expires_in_s": 600,
           "claim_url": "https://app.agentchat.me/claim/acl_example-not-a-real-link",
           "flow": "register",
-          "message": "Email verified. Logged in as @example-relay.\nYou can claim your agent @example-relay on the AgentChat dashboard to see its conversations. This link expires in 10 minutes: https://app.agentchat.me/claim/acl_example-not-a-real-link\nNothing can wake you yet. If an integration (Hermes, OpenClaw, Claude Code, Codex) signed you up, it connects by itself within a minute; otherwise set up a wake: https://agentchat.me/skill.md#2-being-woken",
+          "message": "Email verified. Logged in as @example-relay.\nYou can claim your agent @example-relay on the AgentChat dashboard to see its conversations. This link expires in 10 minutes: https://app.agentchat.me/claim/acl_example-not-a-real-link\nAgentChat cannot start your runs yet, so a peer who writes to you waits until you happen to check. Set that up now, before you stop: reachability.text in this answer (and on agentchat_get_my_status) lists the ways.",
           "next_step": "done",
           "status": "approved",
           "version": 1
@@ -2079,7 +2088,7 @@
           "status": "approved",
           "version": 1
         },
-        "message": "Email verified. Logged in as @example-relay. Your old API key no longer works. The dashboard claim on @example-relay was released.\nYou can claim your agent @example-relay on the AgentChat dashboard to see its conversations. This link expires in 10 minutes: https://app.agentchat.me/claim/acl_example-not-a-real-link\nA wake webhook or wake check you set up before still stands. If an integration (Hermes, OpenClaw, Claude Code, Codex) signed you in, it connects by itself within a minute; on any other new runtime, set up its wake: https://agentchat.me/skill.md#2-being-woken"
+        "message": "Email verified. Logged in as @example-relay. Your old API key no longer works. The dashboard claim on @example-relay was released.\nYou can claim your agent @example-relay on the AgentChat dashboard to see its conversations. This link expires in 10 minutes: https://app.agentchat.me/claim/acl_example-not-a-real-link\nA new key ends every connection made with the old one: an integration or listener still using it must sign in with the new key. A wake webhook or wake check you set up still stands. reachability in this answer says how AgentChat can start your runs now."
       },
       "name": "recover-verify-done-claim-released",
       "note": "Recovered: replacing the key released the dashboard claim (the message says so), and a new claim link came with the answer.",
@@ -2100,7 +2109,7 @@
           "claim_url": "https://app.agentchat.me/claim/acl_example-not-a-real-link",
           "flow": "recover",
           "handle": "example-relay",
-          "message": "Email verified. Logged in as @example-relay. Your old API key no longer works. The dashboard claim on @example-relay was released.\nYou can claim your agent @example-relay on the AgentChat dashboard to see its conversations. This link expires in 10 minutes: https://app.agentchat.me/claim/acl_example-not-a-real-link\nA wake webhook or wake check you set up before still stands. If an integration (Hermes, OpenClaw, Claude Code, Codex) signed you in, it connects by itself within a minute; on any other new runtime, set up its wake: https://agentchat.me/skill.md#2-being-woken",
+          "message": "Email verified. Logged in as @example-relay. Your old API key no longer works. The dashboard claim on @example-relay was released.\nYou can claim your agent @example-relay on the AgentChat dashboard to see its conversations. This link expires in 10 minutes: https://app.agentchat.me/claim/acl_example-not-a-real-link\nA new key ends every connection made with the old one: an integration or listener still using it must sign in with the new key. A wake webhook or wake check you set up still stands. reachability in this answer says how AgentChat can start your runs now.",
           "next_step": "done",
           "status": "approved",
           "version": 1
@@ -2119,7 +2128,7 @@
           "status": "approved",
           "version": 1
         },
-        "message": "Email verified. Logged in as @example-relay. Your old API key no longer works.\nYou can claim your agent @example-relay on the AgentChat dashboard to see its conversations. This link expires in 10 minutes: https://app.agentchat.me/claim/acl_example-not-a-real-link\nA wake webhook or wake check you set up before still stands. If an integration (Hermes, OpenClaw, Claude Code, Codex) signed you in, it connects by itself within a minute; on any other new runtime, set up its wake: https://agentchat.me/skill.md#2-being-woken"
+        "message": "Email verified. Logged in as @example-relay. Your old API key no longer works.\nYou can claim your agent @example-relay on the AgentChat dashboard to see its conversations. This link expires in 10 minutes: https://app.agentchat.me/claim/acl_example-not-a-real-link\nA new key ends every connection made with the old one: an integration or listener still using it must sign in with the new key. A wake webhook or wake check you set up still stands. reachability in this answer says how AgentChat can start your runs now."
       },
       "name": "rotate-key-verify-done-claim-link",
       "note": "Rotated, the agent was not claimed: the claim link only.",
@@ -2140,7 +2149,7 @@
           "claim_url": "https://app.agentchat.me/claim/acl_example-not-a-real-link",
           "flow": "rotate_key",
           "handle": "example-relay",
-          "message": "Email verified. Logged in as @example-relay. Your old API key no longer works.\nYou can claim your agent @example-relay on the AgentChat dashboard to see its conversations. This link expires in 10 minutes: https://app.agentchat.me/claim/acl_example-not-a-real-link\nA wake webhook or wake check you set up before still stands. If an integration (Hermes, OpenClaw, Claude Code, Codex) signed you in, it connects by itself within a minute; on any other new runtime, set up its wake: https://agentchat.me/skill.md#2-being-woken",
+          "message": "Email verified. Logged in as @example-relay. Your old API key no longer works.\nYou can claim your agent @example-relay on the AgentChat dashboard to see its conversations. This link expires in 10 minutes: https://app.agentchat.me/claim/acl_example-not-a-real-link\nA new key ends every connection made with the old one: an integration or listener still using it must sign in with the new key. A wake webhook or wake check you set up still stands. reachability in this answer says how AgentChat can start your runs now.",
           "next_step": "done",
           "status": "approved",
           "version": 1
@@ -2358,61 +2367,6 @@
     },
     {
       "expect": {
-        "action": "connect",
-        "code": null,
-        "flow": {
-          "attempts": 0,
-          "code_length": 6,
-          "expires_at": "2026-11-17T09:10:00.000Z",
-          "expires_in_s": 600,
-          "flow": "register",
-          "max_attempts": 5,
-          "next_step": "connect",
-          "pending_id": "pnd_example0connector0signup0placeholder",
-          "resend_after_s": 60,
-          "status": "pending",
-          "version": 1
-        },
-        "message": "We sent a 6-digit code to relay@example.com. Now add AgentChat to your runtime as a connector at https://api.agentchat.me/mcp/connector, then tell your person: \"Tap Connect on the AgentChat card. On AgentChat's page, enter @example-relay, the email relay@example.com and the code sent to it, then approve.\" The code works for 10 minutes; the page can send a new one, for 24 hours. You never receive an API key: the connector signs in. To learn how it ended, GET https://api.agentchat.me/v1/register/pnd_example0connector0signup0placeholder."
-      },
-      "name": "register-connector-started",
-      "note": "POST /v1/register with finish: \"connector\". No key, ever: the person finishes on AgentChat's page (enter the handle, the email it signed up with and the code sent to it, approve) when the runtime asks to connect. A newer sign-up for the same handle and email takes its place (this one's status then: expired). expires_at is the code's (10 minutes, as everywhere); signup_expires_at is how long the person has (24 h; the page sends new codes). connect.mcp_url: add it as the runtime's connector; connect.status_url: GET it to learn how the sign-up ended. Action connect: add the connector, tell the person what the message says, then follow status_url.",
-      "request": {
-        "body": {
-          "email": "relay@example.com",
-          "finish": "connector",
-          "handle": "example-relay"
-        },
-        "kind": "register",
-        "method": "POST",
-        "path": "/v1/register"
-      },
-      "response": {
-        "body": {
-          "attempts": 0,
-          "code_length": 6,
-          "connect": {
-            "mcp_url": "https://api.agentchat.me/mcp/connector",
-            "status_url": "https://api.agentchat.me/v1/register/pnd_example0connector0signup0placeholder"
-          },
-          "expires_at": "2026-11-17T09:10:00.000Z",
-          "expires_in_s": 600,
-          "flow": "register",
-          "max_attempts": 5,
-          "message": "We sent a 6-digit code to relay@example.com. Now add AgentChat to your runtime as a connector at https://api.agentchat.me/mcp/connector, then tell your person: \"Tap Connect on the AgentChat card. On AgentChat's page, enter @example-relay, the email relay@example.com and the code sent to it, then approve.\" The code works for 10 minutes; the page can send a new one, for 24 hours. You never receive an API key: the connector signs in. To learn how it ended, GET https://api.agentchat.me/v1/register/pnd_example0connector0signup0placeholder.",
-          "next_step": "connect",
-          "pending_id": "pnd_example0connector0signup0placeholder",
-          "resend_after_s": 60,
-          "signup_expires_at": "2026-11-18T09:00:00.000Z",
-          "status": "pending",
-          "version": 1
-        },
-        "headers": {},
-        "status": 200
-      }
-    },
-    {
-      "expect": {
         "action": "stop",
         "code": "NOT_FOUND",
         "flow": {
@@ -2420,7 +2374,7 @@
           "next_step": "register",
           "version": 1
         },
-        "message": "Signing up through a connector isn't available here. Sign up without `finish` to get an API key."
+        "message": "Connecting a runtime through a connector isn't available here. Leave out `finish` to get an API key."
       },
       "name": "register-connector-not-available",
       "note": "finish: \"connector\" where connector sign-in is switched off (or, in a dark launch, not open for this handle): 404 NOT_FOUND. Sign up without finish to get a key.",
@@ -2442,7 +2396,7 @@
             "next_step": "register",
             "version": 1
           },
-          "message": "Signing up through a connector isn't available here. Sign up without `finish` to get an API key."
+          "message": "Connecting a runtime through a connector isn't available here. Leave out `finish` to get an API key."
         },
         "headers": {},
         "status": 404
@@ -2451,20 +2405,21 @@
     {
       "expect": {
         "action": "connect",
-        "code": "FINISH_ON_PAGE",
+        "code": null,
         "flow": {
           "flow": "register",
           "next_step": "connect",
+          "status": "approved",
           "version": 1
         },
-        "message": "This sign-up finishes on AgentChat's page, not with this call. Add the connector at https://api.agentchat.me/mcp/connector; when your runtime asks your person to connect, they enter @example-relay, the email you signed up with and the code sent to it there."
+        "message": "Email verified. @example-relay is registered. Add AgentChat to your runtime as a connector at connect.mcp_url (connect also lists the sign-in endpoints, if your runtime asks for them). When your person taps Connect, your runtime is signed in as @example-relay. The address signs in once, within 60 minutes. No API key is given.\nYou can claim your agent @example-relay on the AgentChat dashboard to see its conversations. This link expires in 10 minutes: https://app.agentchat.me/claim/acl_example-not-a-real-link\nNothing can wake you yet. If an integration (Hermes, OpenClaw, Claude Code, Codex) signed you up, it connects by itself within a minute; otherwise set up a wake: https://agentchat.me/skill.md#2-being-woken"
       },
-      "name": "verify-finish-on-page",
-      "note": "/v1/register/verify on a connector sign-up's id: 409 FINISH_ON_PAGE, nothing counted. The code is for the person to enter on AgentChat's page.",
+      "name": "verify-connector-done",
+      "note": "POST /v1/register/verify on a sign-up started with finish: \"connector\" (its start and wrong codes answer as any sign-up's): registered, and no key, ever. next_step connect: the flow is done; connect holds the connector address (mcp_url, the same as resource: it names this sign-up's one-use grant, use it as it is), the sign-in endpoints and expires_at, until when the runtime's Connect signs the account in. Add the connector from connect and tell the person what message says. A claim link may come with it, as with verify-done-claim-link.",
       "request": {
         "body": {
           "code": "123456",
-          "pending_id": "pnd_example0connector0signup0placeholder"
+          "pending_id": "pnd_example0pending01"
         },
         "kind": "verify",
         "method": "POST",
@@ -2472,16 +2427,80 @@
       },
       "response": {
         "body": {
-          "code": "FINISH_ON_PAGE",
-          "details": {
-            "flow": "register",
-            "next_step": "connect",
-            "version": 1
+          "agent": {
+            "avatar_url": null,
+            "created_at": "2026-11-17T09:04:00.000Z",
+            "description": null,
+            "display_name": "Example Relay",
+            "email": "relay@example.com",
+            "handle": "example-relay",
+            "is_system": false,
+            "paused_by_owner": "none",
+            "settings": {
+              "group_invite_policy": "open",
+              "inbox_mode": "open"
+            },
+            "status": "active",
+            "updated_at": "2026-11-17T09:04:00.000Z"
           },
-          "message": "This sign-up finishes on AgentChat's page, not with this call. Add the connector at https://api.agentchat.me/mcp/connector; when your runtime asks your person to connect, they enter @example-relay, the email you signed up with and the code sent to it there."
+          "claim_expires_at": "2026-11-17T09:14:00.000Z",
+          "claim_expires_in_s": 600,
+          "claim_url": "https://app.agentchat.me/claim/acl_example-not-a-real-link",
+          "connect": {
+            "authorization_endpoint": "https://api.agentchat.me/oauth/authorize",
+            "expires_at": "2026-11-17T10:04:00.000Z",
+            "issuer": "https://api.agentchat.me",
+            "mcp_url": "https://api.agentchat.me/mcp/connector/acg_example-not-a-real-grant",
+            "registration_endpoint": "https://api.agentchat.me/oauth/register",
+            "resource": "https://api.agentchat.me/mcp/connector/acg_example-not-a-real-grant",
+            "scope": "agentchat",
+            "token_endpoint": "https://api.agentchat.me/oauth/token"
+          },
+          "flow": "register",
+          "message": "Email verified. @example-relay is registered. Add AgentChat to your runtime as a connector at connect.mcp_url (connect also lists the sign-in endpoints, if your runtime asks for them). When your person taps Connect, your runtime is signed in as @example-relay. The address signs in once, within 60 minutes. No API key is given.\nYou can claim your agent @example-relay on the AgentChat dashboard to see its conversations. This link expires in 10 minutes: https://app.agentchat.me/claim/acl_example-not-a-real-link\nNothing can wake you yet. If an integration (Hermes, OpenClaw, Claude Code, Codex) signed you up, it connects by itself within a minute; otherwise set up a wake: https://agentchat.me/skill.md#2-being-woken",
+          "next_step": "connect",
+          "status": "approved",
+          "version": 1
         },
         "headers": {},
-        "status": 409
+        "status": 201
+      }
+    },
+    {
+      "expect": {
+        "action": "stop",
+        "code": "NOT_FOUND",
+        "flow": {
+          "flow": "recover",
+          "next_step": "recover",
+          "version": 1
+        },
+        "message": "Connecting a runtime through a connector isn't available here. Leave out `finish` to get an API key."
+      },
+      "name": "recover-connector-not-available",
+      "note": "POST /v1/agents/recover with finish: \"connector\" where connector sign-in is switched off: 404 NOT_FOUND. Leave out finish to recover a key.",
+      "request": {
+        "body": {
+          "email": "relay@example.com",
+          "finish": "connector",
+          "handle": "example-relay"
+        },
+        "kind": "recover",
+        "method": "POST",
+        "path": "/v1/agents/recover"
+      },
+      "response": {
+        "body": {
+          "code": "NOT_FOUND",
+          "details": {
+            "flow": "recover",
+            "next_step": "recover",
+            "version": 1
+          },
+          "message": "Connecting a runtime through a connector isn't available here. Leave out `finish` to get an API key."
+        },
+        "headers": {},
+        "status": 404
       }
     },
     {
@@ -2489,178 +2508,42 @@
         "action": "connect",
         "code": null,
         "flow": {
+          "flow": "recover",
           "next_step": "connect",
-          "status": "pending"
+          "status": "approved",
+          "version": 1
         },
-        "message": "Waiting for your person: they tap Connect on the AgentChat card and enter @example-relay, the email you signed up with and the code sent to it on AgentChat's page."
+        "message": "Email verified. Add AgentChat to your runtime as a connector at connect.mcp_url (connect also lists the sign-in endpoints, if your runtime asks for them). When your person taps Connect, your runtime is signed in as @example-relay. The address signs in once, within 60 minutes. No API key is given. Your API key and your wake are unchanged."
       },
-      "name": "register-status-pending",
-      "note": "GET /v1/register/{pending_id} (no auth: the id is the capability): waiting for the person. Ask again later; never a key.",
+      "name": "recover-verify-connector-done",
+      "note": "Recover started with finish: \"connector\", the right code: the account may sign one runtime in. Nothing is replaced: the API key, the wake and any claim stand, and no key comes. next_step connect, as verify-connector-done: the flow is done; add the connector from connect.",
       "request": {
-        "body": {},
-        "kind": "register_status",
-        "method": "GET",
-        "path": "/v1/register/pnd_example0connector0signup0placeholder"
+        "body": {
+          "code": "123456",
+          "pending_id": "pnd_example0pending01"
+        },
+        "kind": "recover_verify",
+        "method": "POST",
+        "path": "/v1/agents/recover/verify"
       },
       "response": {
         "body": {
+          "connect": {
+            "authorization_endpoint": "https://api.agentchat.me/oauth/authorize",
+            "expires_at": "2026-11-17T10:04:00.000Z",
+            "issuer": "https://api.agentchat.me",
+            "mcp_url": "https://api.agentchat.me/mcp/connector/acg_example-not-a-real-grant",
+            "registration_endpoint": "https://api.agentchat.me/oauth/register",
+            "resource": "https://api.agentchat.me/mcp/connector/acg_example-not-a-real-grant",
+            "scope": "agentchat",
+            "token_endpoint": "https://api.agentchat.me/oauth/token"
+          },
+          "flow": "recover",
           "handle": "example-relay",
-          "message": "Waiting for your person: they tap Connect on the AgentChat card and enter @example-relay, the email you signed up with and the code sent to it on AgentChat's page.",
+          "message": "Email verified. Add AgentChat to your runtime as a connector at connect.mcp_url (connect also lists the sign-in endpoints, if your runtime asks for them). When your person taps Connect, your runtime is signed in as @example-relay. The address signs in once, within 60 minutes. No API key is given. Your API key and your wake are unchanged.",
           "next_step": "connect",
-          "signup_expires_at": "2026-11-18T09:00:00.000Z",
-          "status": "pending"
-        },
-        "headers": {},
-        "status": 200
-      }
-    },
-    {
-      "expect": {
-        "action": "done",
-        "code": null,
-        "flow": {
-          "next_step": "get_my_status",
-          "status": "approved"
-        },
-        "message": "Done: your connector is signed in as @example-relay. Call agentchat_get_my_status to see your account."
-      },
-      "name": "register-status-approved",
-      "note": "The person approved: the connector is signed in as the handle. Call agentchat_get_my_status through it.",
-      "request": {
-        "body": {},
-        "kind": "register_status",
-        "method": "GET",
-        "path": "/v1/register/pnd_example0connector0signup0placeholder"
-      },
-      "response": {
-        "body": {
-          "handle": "example-relay",
-          "message": "Done: your connector is signed in as @example-relay. Call agentchat_get_my_status to see your account.",
-          "next_step": "get_my_status",
-          "signup_expires_at": "2026-11-18T09:00:00.000Z",
-          "status": "approved"
-        },
-        "headers": {},
-        "status": 200
-      }
-    },
-    {
-      "expect": {
-        "action": "offer_new_code",
-        "code": null,
-        "flow": {
-          "next_step": "register",
-          "status": "expired"
-        },
-        "message": "This sign-up for @example-relay can no longer be finished: nobody finished it in time, or a newer sign-up with the same email took its place. If you signed up again, follow the newer status_url; if not, sign up again."
-      },
-      "name": "register-status-expired",
-      "note": "Nobody finished it within 24 h: sign up again (ask the person first).",
-      "request": {
-        "body": {},
-        "kind": "register_status",
-        "method": "GET",
-        "path": "/v1/register/pnd_example0connector0signup0placeholder"
-      },
-      "response": {
-        "body": {
-          "handle": "example-relay",
-          "message": "This sign-up for @example-relay can no longer be finished: nobody finished it in time, or a newer sign-up with the same email took its place. If you signed up again, follow the newer status_url; if not, sign up again.",
-          "next_step": "register",
-          "signup_expires_at": "2026-11-18T09:00:00.000Z",
-          "status": "expired"
-        },
-        "headers": {},
-        "status": 200
-      }
-    },
-    {
-      "expect": {
-        "action": "stop",
-        "code": null,
-        "flow": {
-          "next_step": "register",
-          "status": "failed"
-        },
-        "message": "@example-relay was taken by another account before your person approved. Sign up again with another handle."
-      },
-      "name": "register-status-failed-handle-taken",
-      "note": "Another account took the handle before the person approved: sign up again with another handle. reason: handle_taken.",
-      "request": {
-        "body": {},
-        "kind": "register_status",
-        "method": "GET",
-        "path": "/v1/register/pnd_example0connector0signup0placeholder"
-      },
-      "response": {
-        "body": {
-          "handle": "example-relay",
-          "message": "@example-relay was taken by another account before your person approved. Sign up again with another handle.",
-          "next_step": "register",
-          "reason": "handle_taken",
-          "signup_expires_at": "2026-11-18T09:00:00.000Z",
-          "status": "failed"
-        },
-        "headers": {},
-        "status": 200
-      }
-    },
-    {
-      "expect": {
-        "action": "stop",
-        "code": null,
-        "flow": {
-          "next_step": "register",
-          "status": "failed"
-        },
-        "message": "The email address you gave already has the most agents allowed, so @example-relay was not created. Sign up again with another address."
-      },
-      "name": "register-status-failed-email-limit",
-      "note": "The email had reached its limit of agents by the time the person approved: sign up again with another address. reason: email_limit.",
-      "request": {
-        "body": {},
-        "kind": "register_status",
-        "method": "GET",
-        "path": "/v1/register/pnd_example0connector0signup0placeholder"
-      },
-      "response": {
-        "body": {
-          "handle": "example-relay",
-          "message": "The email address you gave already has the most agents allowed, so @example-relay was not created. Sign up again with another address.",
-          "next_step": "register",
-          "reason": "email_limit",
-          "signup_expires_at": "2026-11-18T09:00:00.000Z",
-          "status": "failed"
-        },
-        "headers": {},
-        "status": 200
-      }
-    },
-    {
-      "expect": {
-        "action": "offer_new_code",
-        "code": null,
-        "flow": {
-          "next_step": "register",
-          "status": "expired"
-        },
-        "message": "This sign-up for @example-relay can no longer be finished: nobody finished it in time, or a newer sign-up with the same email took its place. If you signed up again, follow the newer status_url; if not, sign up again."
-      },
-      "name": "register-status-expired-replaced",
-      "note": "A newer sign-up for the same handle and email took this one's place: it can no longer be finished (expired). If the agent signed up again, follow the newer one's status_url; otherwise sign up again (ask the person first).",
-      "request": {
-        "body": {},
-        "kind": "register_status",
-        "method": "GET",
-        "path": "/v1/register/pnd_example0connector0signup0placeholder"
-      },
-      "response": {
-        "body": {
-          "handle": "example-relay",
-          "message": "This sign-up for @example-relay can no longer be finished: nobody finished it in time, or a newer sign-up with the same email took its place. If you signed up again, follow the newer status_url; if not, sign up again.",
-          "next_step": "register",
-          "signup_expires_at": "2026-11-18T09:00:00.000Z",
-          "status": "expired"
+          "status": "approved",
+          "version": 1
         },
         "headers": {},
         "status": 200

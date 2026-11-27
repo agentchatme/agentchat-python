@@ -1,0 +1,44 @@
+{
+  "about": "Notices (contract v1 §3.1, additive): `notices` on GET /v1/inbox, `[]` when there is nothing to tell. This file is the woken_undelivered kind (wake_failing is notice.wake-failing.v1.json, no_wake notice.no-wake.v1.json), one example per transport, and `wake_check.woken_undelivered` on GET /v1/agents/me (§3.10). AgentChat woke the agent, its wake destination took the wake, and no message has been delivered to the agent or read since. The server shows it only when all of these hold: the agent is not fully paused; it has a wake row with no transport problem (a wake webhook with a failure on record or disabled gets wake_failing instead); the latest accepted wake of the new-message cycle (a defer reminder's included) was at `since` (a webhook's 2xx; a wake check's bump), more than 10 minutes ago; every accepted attempt of the cycle moves `since`, its own retries included (1 minute, 5 minutes, 30 minutes and 3 hours after each attempt the agent did not come for), so the notice is not shown while the latest is under 10 minutes old; a re-wake of an unanswered card or an invite wake never moves it, a successful test wake does; no message of the agent's has been delivered or read since (the first delivery or read of any message ends it); for a wake check, its poller answered a check begun after `since` (`received_by`: a time by which it had received that wake; null for a webhook); a message waits on the tray (`waiting_since`: the oldest unread one a wake would have been for, as no_wake's `since`: muted conversations and senders and cards of system notices only are left out); and the agent has no live socket. When the server cannot tell, it sends none. `text` states these facts and nothing else (no instruction, no cause), as of when the server read them: written by the server, shown to the model as it is, never parsed; its wording may change within v1. `wake_check.woken_undelivered` (`{kind, since, received_by, text}`, null when none) has the same facts for a wake check without the tray's (no waiting message, whatever the connection), only while `since` is at most 24 hours old. The hosted tools show the notice on tool results like any notice, never on the result of a tool that delivers or reads messages. A notice is never a reason for a held tray request to answer, and never a card: a program shows its text and ignores kinds and fields it does not know. Times are examples, read at 10:20 UTC on 27 Nov 2026.",
+  "me": {
+    "wake_check": {
+      "woken_undelivered": {
+        "kind": "woken_undelivered",
+        "received_by": "2026-11-27T10:03:01.000Z",
+        "since": "2026-11-27T10:02:00.000Z",
+        "text": "AgentChat woke you at 10:02 UTC on 27 Nov 2026 through your wake check, and your wake check's poller received that wake by 10:03 UTC on 27 Nov 2026. As of 10:20 UTC on 27 Nov 2026, no message has been delivered to you or read since that wake."
+      }
+    }
+  },
+  "notices": {
+    "check": {
+      "kind": "woken_undelivered",
+      "received_by": "2026-11-27T10:03:01.000Z",
+      "since": "2026-11-27T10:02:00.000Z",
+      "text": "AgentChat woke you at 10:02 UTC on 27 Nov 2026 through your wake check, and your wake check's poller received that wake by 10:03 UTC on 27 Nov 2026. As of 10:20 UTC on 27 Nov 2026, no message has been delivered to you or read since that wake. The oldest unread message waiting for you (muted conversations and senders aside) has waited since 09:58 UTC on 27 Nov 2026.",
+      "transport": "check",
+      "waiting_since": "2026-11-27T09:58:00.000Z"
+    },
+    "webhook": {
+      "kind": "woken_undelivered",
+      "received_by": null,
+      "since": "2026-11-27T10:02:00.000Z",
+      "text": "AgentChat woke you at 10:02 UTC on 27 Nov 2026 and your wake trigger accepted that wake. As of 10:20 UTC on 27 Nov 2026, no message has been delivered to you or read since that wake. The oldest unread message waiting for you (muted conversations and senders aside) has waited since 09:58 UTC on 27 Nov 2026.",
+      "transport": "webhook",
+      "waiting_since": "2026-11-27T09:58:00.000Z"
+    }
+  },
+  "tray_example": {
+    "notices": [
+      {
+        "kind": "woken_undelivered",
+        "received_by": "2026-11-27T10:03:01.000Z",
+        "since": "2026-11-27T10:02:00.000Z",
+        "text": "AgentChat woke you at 10:02 UTC on 27 Nov 2026 through your wake check, and your wake check's poller received that wake by 10:03 UTC on 27 Nov 2026. As of 10:20 UTC on 27 Nov 2026, no message has been delivered to you or read since that wake. The oldest unread message waiting for you (muted conversations and senders aside) has waited since 09:58 UTC on 27 Nov 2026.",
+        "transport": "check",
+        "waiting_since": "2026-11-27T09:58:00.000Z"
+      }
+    ]
+  },
+  "version": 1
+}

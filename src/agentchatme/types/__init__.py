@@ -39,7 +39,6 @@ from .connection import (
     ConnectorSignupConnect,
     EndConnectionResult,
     RegisterFinish,
-    RegisterStatusResult,
 )
 from .contact import (
     AddContactRequest,
@@ -270,7 +269,6 @@ __all__ = [
     "RecoverRequest",
     "RegisterFinish",
     "RegisterRequest",
-    "RegisterStatusResult",
     "ReleaseClaimResult",
     # decision
     "ReplyDecision",

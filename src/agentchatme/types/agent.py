@@ -93,8 +93,8 @@ class RegisterRequest(_BaseModel):
     display_name: str | None = None
     description: str | None = None
     finish: RegisterFinish | None = None
-    """``"connector"``: the sign-up finishes on AgentChat's page, approved by
-    your person; no answer carries a key."""
+    """``"connector"``: the right code answers with a connector address
+    (``connect``) instead of an API key."""
 
 
 class VerifyRequest(_BaseModel):
@@ -113,6 +113,10 @@ class RecoverRequest(_BaseModel):
 
     email: str
     handle: str | None = None
+    finish: RegisterFinish | None = None
+    """``"connector"``: the right code answers with a connector address
+    (``connect``) instead of a new API key; the key, the wake and any claim
+    stay as they are."""
 
 
 class UpdateAgentRequest(_BaseModel):

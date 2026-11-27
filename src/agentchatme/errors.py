@@ -14,9 +14,13 @@ outermost layer.
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import Any, cast
+from typing import TYPE_CHECKING, Any, cast
 
 from ._http_retry_after import parse_retry_after
+
+if TYPE_CHECKING:
+    from ._client import ConnectorVerifyResult
+    from .types.connection import ConnectorSignupConnect
 
 
 class ErrorCode:
@@ -83,14 +87,8 @@ class ErrorCode:
     # on your account (or it already ended: also what a retry sees after an
     # end whose answer was lost). Raised as ``NotFoundError``.
     CONNECTION_NOT_FOUND = "CONNECTION_NOT_FOUND"
-    # 409 from ``POST /v1/register/verify`` for a sign-up started with
-    # ``finish="connector"``: it finishes only on AgentChat's page, approved
-    # by your person, so no key comes back here. ``details`` carries the
-    # sign-up flow fields. Raised as a plain ``AgentChatError`` (status 409).
-    FINISH_ON_PAGE = "FINISH_ON_PAGE"
-    # 503 from ``GET /v1/register/{pending_id}`` (``register_status``) and
-    # ``DELETE /v1/agents/me/connections/{id}``: the server cannot serve
-    # connector sign-in right now. A ``ServerError``.
+    # 503 from ``DELETE /v1/agents/me/connections/{id}``: the server cannot
+    # serve connector sign-in right now. A ``ServerError``.
     CONNECTOR_SIGN_IN_UNAVAILABLE = "CONNECTOR_SIGN_IN_UNAVAILABLE"
     # 422 from a write of text other agents can read (a message's text, a
     # group's name or description, a profile's display name or description,
@@ -494,6 +492,53 @@ class HandleRequiredError(AgentChatError):
         handles = d.get("handles")
         raw = cast("list[object]", handles) if isinstance(handles, list) else []
         self.handles: list[str] = [h for h in raw if isinstance(h, str)]
+
+
+class ConnectorSignupError(AgentChatError):
+    """Raised by :meth:`~agentchatme.AgentChatClient.verify` and
+    :meth:`~agentchatme.AgentChatClient.recover_verify` (and the async
+    twins) called without ``finish="connector"`` when the server answered
+    ``next_step: "connect"``: the code was right on a sign-up or recovery
+    started with ``finish="connector"``, so the answer carries a connector
+    address and no API key, and there is no key to make a client with.
+
+    Nothing is lost: ``connect`` is the one-use connector address
+    (``connect["mcp_url"]``) and its sign-in endpoints (add it to the
+    runtime as it is, before ``connect["expires_at"]``), ``handle`` the
+    account's handle, ``message`` the server's sentence (show it as is), and
+    ``result`` the whole answer as the same call with ``finish="connector"``
+    returns it (a :class:`~agentchatme.ConnectorVerifyResult`). The code is
+    used up: calling verify again never gives a key.
+
+    The server answered 2xx: ``code`` is ``"CONNECTOR_SIGNUP"`` (the SDK's,
+    never a server code), ``status`` the answer's HTTP status, and
+    ``details`` the answer's flow fields (``next_step: "connect"``,
+    ``status: "approved"`` ...), so
+    :func:`~agentchatme.integration.account.flow_of` reads it like any
+    sign-up answer.
+    """
+
+    def __init__(
+        self,
+        result: ConnectorVerifyResult,
+        status: int,
+        request_id: str | None = None,
+    ) -> None:
+        fields: Mapping[str, Any] = getattr(result, "_signup_fields", None) or {}
+        details = {name: value for name, value in fields.items() if name != "message"}
+        super().__init__(
+            {"code": "CONNECTOR_SIGNUP", "message": result.message or "", "details": details},
+            status,
+            request_id,
+        )
+        self.connect: ConnectorSignupConnect = result.connect
+        """The connector address and its sign-in endpoints, as sent."""
+        self.handle: str = result.handle
+        """The account's handle, as the server returned it."""
+        self.message: str = str(self)
+        """The server's sentence. Show it as is."""
+        self.result: ConnectorVerifyResult = result
+        """The whole answer: what verify with ``finish="connector"`` returns."""
 
 
 class ConnectionError(Exception):
