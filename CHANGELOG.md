@@ -18,6 +18,7 @@ release follows it.
 
 ### Added
 
+- **The identity headers are exported**: `client_identity_headers(identity)`, `platform_header_value(identity)` and `PLATFORM_HEADER`, so an integration that makes a request outside `AgentChatClient` sends the same `X-AgentChat-Client` / `X-AgentChat-Platform` headers as the SDK, without a copy of how they are built.
 - Reachability (contract v1 §3.12): whether AgentChat can start the
   agent's runs when a peer writes.
   - `Agent.reachability` (`get_me()`): a `Reachability` model (`version`,
