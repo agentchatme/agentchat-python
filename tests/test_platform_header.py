@@ -12,7 +12,7 @@ import os
 import platform
 import re
 import sys
-from types import SimpleNamespace
+import sysconfig
 from typing import Any, Callable
 
 import httpx
@@ -133,6 +133,19 @@ def test_a_value_that_is_not_a_string_is_left_out() -> None:
     assert platform_header_value(odd, PlatformFacts(os=1, arch=True)) is None  # type: ignore[arg-type]
 
 
+def test_a_str_subclass_cannot_put_other_text_on_the_wire() -> None:
+    class Sly(str):
+        def __format__(self, spec: str) -> str:
+            return 'x", evil="y'
+
+        def __str__(self) -> str:
+            return 'x", evil="y'
+
+    sly = Sly("hermes/0.9.2")
+    install = Sly(INSTALL)
+    assert platform_header_value(identity(host=sly, install_id=install, install_method=sly), PlatformFacts()) is None
+
+
 @pytest.mark.parametrize(
     "install_id",
     [
@@ -156,7 +169,8 @@ def test_every_member_at_its_longest_stays_under_512_bytes() -> None:
     )
     assert value is not None
     assert len(parse_string_dictionary(value)) == 6
-    assert len(value.encode("utf-8")) <= 512
+    # 6 members, five of them at 64 characters, install at 26, and 5 ", ".
+    assert len(value.encode("utf-8")) == 404
 
 
 def test_no_member_left_means_no_value_and_no_header(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -217,10 +231,25 @@ def test_facts_in_node_s_vocabulary() -> None:
         ("loongarch64", "loong64"),
         ("s390x", "s390x"),
         ("riscv64", "riscv64"),
+        ("powerpc64le", "ppc64"),
+        ("ppc", "ppc"),
     ],
 )
 def test_arch_is_named_as_node_names_it(machine: str, arch: str) -> None:
     assert facts_of(machine=machine).arch == arch
+
+
+@pytest.mark.parametrize(
+    "machine",
+    [
+        pytest.param("00F84C0C4C00", id="AIX: the machine's id"),
+        pytest.param("i86pc", id="Solaris: no bitness"),
+        pytest.param("sun4v", id="SPARC: no Node name"),
+        pytest.param("something-new", id="unknown"),
+    ],
+)
+def test_a_machine_name_node_does_not_have_is_left_out(machine: str) -> None:
+    assert facts_of(machine=machine).arch is None
 
 
 @pytest.mark.parametrize(
@@ -246,15 +275,30 @@ def test_the_platform_alone_when_the_release_is_unknown_or_out_of_shape() -> Non
     assert facts_of(machine=None, implementation=None).arch is None
 
 
-def test_the_windows_release_is_the_real_build_like_node_s(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.skipif(sys.platform != "win32", reason="reads Windows' own version")
+def test_the_windows_release_is_the_running_build_from_rtl_get_version() -> None:
+    release = runtime_module._os_release()
+    assert re.fullmatch(r"\d+\.\d+\.\d+", release), release
+    major, minor, build = (int(part) for part in release.split("."))
+    file_version = sys.getwindowsversion().platform_version
+    # kernel32.dll's file version can lag the running build (feature
+    # updates keep the base build's files), never lead it.
+    assert (major, minor) == file_version[:2]
+    assert build >= file_version[2]
+    assert platform_facts().os == f"win32/{release}"
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="reads Windows' own build")
+def test_the_windows_arch_is_the_interpreter_s_build() -> None:
+    expected = {"win-amd64": "x64", "win-arm64": "arm64", "win32": "ia32"}[sysconfig.get_platform()]
+    assert platform_facts().arch == expected
+
+
+def test_the_windows_machine_comes_from_the_interpreter_build(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(sys, "platform", "win32")
-    monkeypatch.setattr(
-        sys,
-        "getwindowsversion",
-        lambda: SimpleNamespace(major=10, minor=0, build=22000, platform_version=(10, 0, 22631)),
-        raising=False,
-    )
-    assert runtime_module._os_release() == "10.0.22631"
+    for build, machine in (("win-amd64", "amd64"), ("win-arm64", "arm64"), ("win32", "x86"), ("mingw", "")):
+        monkeypatch.setattr(sysconfig, "get_platform", lambda build=build: build)
+        assert runtime_module._machine() == machine
 
 
 def test_a_release_that_cannot_be_read_is_left_out(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -269,7 +313,7 @@ def test_a_release_that_cannot_be_read_is_left_out(monkeypatch: pytest.MonkeyPat
 def test_this_process_facts_are_read_once() -> None:
     facts = platform_facts()
     assert platform_facts() is facts
-    impl = platform.python_implementation().lower()
+    impl = sys.implementation.name
     assert facts.runtime is not None and facts.runtime.startswith(f"{impl}/")
     if impl == "cpython":
         assert facts.runtime == f"cpython/{platform.python_version()}"
@@ -277,7 +321,12 @@ def test_this_process_facts_are_read_once() -> None:
     assert facts.os is not None and facts.os.startswith(name)
     if sys.platform != "win32":
         assert facts.os == f"{name}/{os.uname().release}"
-    assert facts.arch == runtime_module._node_arch(platform.machine())
+    assert facts.arch in {"x64", "arm64", "ia32", "arm", "ppc64", "ppc", "s390x", "s390", "riscv64", "loong64", "mips"}
+    machine = platform.machine().lower()
+    if machine in ("x86_64", "amd64"):
+        assert facts.arch == "x64"
+    if machine in ("arm64", "aarch64"):
+        assert facts.arch == "arm64"
 
 
 # ─────────────── where the value goes ───────────────
@@ -486,6 +535,22 @@ def test_account_run_sends_them_with_the_register_call() -> None:
     assert result.outcome == "cancelled"
     assert srv.seen[0].url.path == "/v1/register"
     assert srv.body_of() == {"email": "a@example.com", "handle": "alice", **DECLARED}
+
+
+def test_account_run_recover_sends_none_of_them() -> None:
+    srv = Recorder(body={"pending_id": "pnd_1", "message": "sent"})
+    result = account.run(
+        kind="recover",
+        input={"email": "a@example.com", "handle": "alice", **DECLARED},
+        client_identity=FULL,
+        api_base=API,
+        http_client=srv.client(),
+        show=lambda _message: None,
+        ask=lambda _question: account.AccountAnswer("cancel"),
+    )
+    assert result.outcome == "cancelled"
+    assert srv.seen[0].url.path == "/v1/agents/recover"
+    assert srv.body_of() == {"email": "a@example.com", "handle": "alice"}
 
 
 async def test_account_run_async_sends_them_with_the_register_call() -> None:

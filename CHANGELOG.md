@@ -22,11 +22,14 @@ Proposed: minor (added behaviour); the number is set at release.
     `runtime` (the implementation and its own version, `cpython/3.12.4`,
     `pypy/7.3.17`). It reads them once per process.
   - They use the TypeScript SDK's names, so both SDKs send the same values:
-    - `platform.machine()` becomes Node's arch (`x86_64`/`AMD64` → `x64`,
-      `aarch64` → `arm64`);
+    - the machine name becomes Node's arch (`x86_64`/`AMD64` → `x64`,
+      `aarch64` → `arm64`); a name Node has no arch for is left out;
     - `sys.platform` loses its version suffix (`freebsd14` → `freebsd`);
-    - on Windows the release is the real build (`10.0.22631`), as Node's
-      `os.release()` gives it.
+    - on Windows the release is the running build from `RtlGetVersion`
+      (`10.0.22631`), as Node's `os.release()` gives it.
+  - Reading them starts no process and runs no WMI query. On Windows the
+    arch comes from the interpreter's own build (`sysconfig.get_platform()`),
+    not `platform.machine()`.
   - Every value must match `^[A-Za-z0-9][A-Za-z0-9._+/-]{0,63}$`, and
     `install` must match `^ins_[A-Za-z0-9_-]{22}$`. A value of any other
     shape is left out and never repaired, so the whole value stays under

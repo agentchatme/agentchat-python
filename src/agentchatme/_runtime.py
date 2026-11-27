@@ -16,6 +16,7 @@ import os
 import platform
 import re
 import sys
+import sysconfig
 from dataclasses import dataclass
 from typing import Callable
 
@@ -56,7 +57,9 @@ newline through)."""
 
 
 def is_platform_value(value: object) -> bool:
-    return isinstance(value, str) and PLATFORM_VALUE.fullmatch(value) is not None
+    # `type(...) is str`, not isinstance: a str subclass could format itself
+    # as other text than the one checked here.
+    return type(value) is str and PLATFORM_VALUE.fullmatch(value) is not None
 
 
 @dataclass(frozen=True)
@@ -75,7 +78,9 @@ class PlatformFacts:
     ``pypy/7.3.17``)."""
 
 
-# platform.machine() → Node's process.arch, so both SDKs send one vocabulary.
+# Machine names → Node's process.arch, so both SDKs send one vocabulary. A
+# closed list: a name it does not know is left out, never passed through
+# (on AIX the machine name is the machine's id).
 _NODE_ARCH = {
     "x86_64": "x64",
     "amd64": "x64",
@@ -87,18 +92,27 @@ _NODE_ARCH = {
     "i586": "ia32",
     "i686": "ia32",
     "x86": "ia32",
+    "arm": "arm",
+    "armv5tel": "arm",
+    "armv6l": "arm",
+    "armv7l": "arm",
+    "armv8l": "arm",
     "ppc64le": "ppc64",
     "ppc64": "ppc64",
+    "powerpc64le": "ppc64",
+    "powerpc64": "ppc64",
+    "ppc": "ppc",
+    "powerpc": "ppc",
+    "s390x": "s390x",
+    "s390": "s390",
+    "riscv64": "riscv64",
     "loongarch64": "loong64",
+    "mips": "mips",
 }
 
 
-def _node_arch(machine: str) -> str:
-    name = machine.strip().lower()
-    if name in _NODE_ARCH:
-        return _NODE_ARCH[name]
-    # armv6l, armv7l, armv8l (32-bit ARM): Node's `arm`.
-    return "arm" if name.startswith("arm") else name
+def _node_arch(machine: str) -> str | None:
+    return _NODE_ARCH.get(machine.strip().lower())
 
 
 def _node_platform(sys_platform: str) -> str:
@@ -116,8 +130,8 @@ def platform_facts_of(
     """The platform facts from what the interpreter reports, in Node's names:
     ``sys.platform`` without a version suffix (``freebsd14`` → ``freebsd``,
     ``sunos5`` → ``sunos``; ``win32`` is a name, not a version, and stays),
-    ``platform.machine()`` as ``process.arch``. A release that does not have
-    the value shape leaves the platform alone."""
+    the machine name as ``process.arch`` (an unknown one is left out). A
+    release that does not have the value shape leaves the platform alone."""
     name = _node_platform(sys_platform) if sys_platform else ""
     with_release = f"{name}/{release}" if name and release else None
     return PlatformFacts(
@@ -133,12 +147,41 @@ def platform_facts_of(
 
 def _os_release() -> str:
     """The kernel release, as Node's ``os.release()`` gives it: the uname
-    release on POSIX, ``<major>.<minor>.<build>`` of the real OS on Windows
-    (``platform.release()`` would say only ``10`` or ``11``)."""
+    release on POSIX; on Windows ``<major>.<minor>.<build>`` of the running
+    OS from ``RtlGetVersion``, the call Node makes. (``platform.release()``
+    says only ``10`` or ``11``; ``platform_version`` is kernel32.dll's file
+    version, which stays at the base build across feature updates; and
+    ``platform.version()`` starts a ``ver`` shell or a WMI query.)"""
     if sys.platform == "win32":
-        major, minor, build = sys.getwindowsversion().platform_version
-        return f"{major}.{minor}.{build}"
+        import ctypes
+
+        class _OsVersionInfo(ctypes.Structure):
+            _fields_ = (  # OSVERSIONINFOW
+                ("size", ctypes.c_ulong),
+                ("major", ctypes.c_ulong),
+                ("minor", ctypes.c_ulong),
+                ("build", ctypes.c_ulong),
+                ("platform_id", ctypes.c_ulong),
+                ("csd", ctypes.c_wchar * 128),
+            )
+
+        info = _OsVersionInfo()
+        info.size = ctypes.sizeof(info)
+        if ctypes.WinDLL("ntdll").RtlGetVersion(ctypes.byref(info)) != 0:
+            raise OSError("RtlGetVersion failed")
+        return f"{info.major}.{info.minor}.{info.build}"
     return os.uname().release
+
+
+def _machine() -> str:
+    """The machine name, cheaply: ``os.uname()`` on POSIX; on Windows the
+    interpreter's own build (``platform.machine()`` would start a ``ver``
+    shell or a WMI query there)."""
+    if sys.platform == "win32":
+        return {"win-amd64": "amd64", "win-arm64": "arm64", "win-arm32": "arm", "win32": "x86"}.get(
+            sysconfig.get_platform(), ""
+        )
+    return os.uname().machine
 
 
 def _implementation_version() -> str:
@@ -161,11 +204,12 @@ def _read(source: Callable[[], object]) -> str | None:
 @functools.lru_cache(maxsize=1)
 def platform_facts() -> PlatformFacts:
     """This process's platform facts: read once, then kept (they cannot
-    change while it runs)."""
+    change while it runs). The implementation is ``sys.implementation``'s
+    name and version (``cpython``, ``pypy``, ``graalpy``)."""
     return platform_facts_of(
         sys_platform=sys.platform,
         release=_read(_os_release),
-        machine=_read(platform.machine),
-        implementation=_read(platform.python_implementation),
+        machine=_read(_machine),
+        implementation=_read(lambda: sys.implementation.name),
         implementation_version=_read(_implementation_version),
     )

@@ -51,7 +51,7 @@ _INSTALL_ID = re.compile(r"ins_[A-Za-z0-9_-]{22}")
 
 
 def _is_install_id(value: object) -> bool:
-    return isinstance(value, str) and _INSTALL_ID.fullmatch(value) is not None
+    return type(value) is str and _INSTALL_ID.fullmatch(value) is not None
 
 
 def platform_header_value(
@@ -67,7 +67,7 @@ def platform_header_value(
     - Every value ``^[A-Za-z0-9][A-Za-z0-9._+/-]{0,63}$``; ``install``
       ``^ins_[A-Za-z0-9_-]{22}$``. A value of another shape is left out,
       never repaired. So nothing needs escaping, and the whole value stays
-      under 512 bytes (at most 454).
+      under 512 bytes (at most 404).
 
     ``None`` when no member is left: then nothing is sent.
     """
