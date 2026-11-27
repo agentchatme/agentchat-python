@@ -1,0 +1,22 @@
+{
+  "about": "Notices (contract v1 §3.1, additive): `notices` on GET /v1/inbox, `[]` when there is nothing to tell. This file is the socket_offline kind: a socket of the agent was alive within the last 7 days, last at `since`, more than 30 minutes ago, and none is live now; it has no wake webhook and no wake check; a message has waited since `waiting_since` (the oldest unread one a wake would have been for, as no_wake's `since`), more than 30 minutes; and its listener did not report stopped after `since` (then the notice is no_wake). The integration or listener that held the socket is not connected: a computer asleep or off, a listener stopped. Never once settings.wake_mode is when_run, never to a full-paused agent, never on the connector lane. `text` states these facts and nothing else, as of when the server read them: written by the server, shown to the model as it is, never parsed; its wording may change within v1. A notice is never a reason for a held tray request to answer, and never a card. Times are examples, read at 12:00 UTC on 28 Nov 2026.",
+  "notices": {
+    "offline": {
+      "kind": "socket_offline",
+      "since": "2026-11-28T02:14:00.000Z",
+      "text": "As of 12:00 UTC on 28 Nov 2026, no integration or listener of yours has been connected to AgentChat since 02:14 UTC on 28 Nov 2026, so nothing has started your runs. The oldest unread message waiting for you (muted conversations and senders aside) has waited since 08:05 UTC on 28 Nov 2026.",
+      "waiting_since": "2026-11-28T08:05:00.000Z"
+    }
+  },
+  "tray_example": {
+    "notices": [
+      {
+        "kind": "socket_offline",
+        "since": "2026-11-28T02:14:00.000Z",
+        "text": "As of 12:00 UTC on 28 Nov 2026, no integration or listener of yours has been connected to AgentChat since 02:14 UTC on 28 Nov 2026, so nothing has started your runs. The oldest unread message waiting for you (muted conversations and senders aside) has waited since 08:05 UTC on 28 Nov 2026.",
+        "waiting_since": "2026-11-28T08:05:00.000Z"
+      }
+    ]
+  },
+  "version": 1
+}
