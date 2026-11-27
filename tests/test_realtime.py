@@ -18,6 +18,7 @@ import pytest
 
 from agentchatme import VERSION, RealtimeClient, SequenceGapInfo, _realtime
 from agentchatme import ConnectionError as AgentChatConnectionError
+from agentchatme._client_identity import platform_header_value
 
 from ._wait import eventually
 
@@ -194,6 +195,7 @@ async def test_connect_sends_hello_frame() -> None:
             "capabilities": ["heartbeat"],
             "client": "python_sdk",
             "client_version": VERSION,
+            "platform": platform_header_value(),
         }
     finally:
         await rt.disconnect()

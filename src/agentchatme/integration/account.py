@@ -54,6 +54,7 @@ from .._client_identity import AgentChatClientIdentity
 from .._http import AsyncHttpTransport, HttpResponse, HttpTransport, HttpTransportOptions
 from .._signup_flow import flow_of, whole_seconds
 from ..errors import AgentChatError, ConnectionError, RateLimitedError
+from ..types.agent import HeardFrom
 from ..types.signup import SIGNUP_FLOW_VERSION, SignupFlow
 
 MAX_WAIT_S = 60
@@ -120,10 +121,15 @@ class _RegisterInputRequired(TypedDict):
 
 
 class RegisterInput(_RegisterInputRequired, total=False):
-    """Input of the register start call (``POST /v1/register``)."""
+    """Input of the register start call (``POST /v1/register``). The
+    declared fields (``runtime``, ``heard_from``, ``referred_by``) are sent
+    only when given; the server judges their values."""
 
     display_name: str
     description: str
+    runtime: str
+    heard_from: HeardFrom
+    referred_by: str
 
 
 class _RecoverInputRequired(TypedDict):
@@ -135,6 +141,11 @@ class RecoverInput(_RecoverInputRequired, total=False):
     ``handle`` whenever it is known."""
 
     handle: str
+
+
+_REGISTER_OPTIONAL = ("display_name", "description", "runtime", "heard_from", "referred_by")
+"""What a register start call sends besides ``email`` and ``handle``, each
+only when set."""
 
 
 AnswerKind = Literal["value", "new_code", "cancel"]
@@ -485,11 +496,7 @@ def _start_call(kind: Any, input: Any) -> tuple[_Steps, dict[str, Any]]:
     if not isinstance(input, Mapping):
         raise TypeError("integration.account.start: input must be a mapping")
     values = cast("Mapping[str, Any]", input)
-    names = (
-        ("email", "handle", "display_name", "description")
-        if kind == "register"
-        else ("email", "handle")
-    )
+    names = ("email", "handle", *_REGISTER_OPTIONAL) if kind == "register" else ("email", "handle")
     # Optional fields are sent only when set: the server validates a present
     # field, so None must be absent, never null.
     return steps, {name: values[name] for name in names if values.get(name) is not None}
@@ -843,7 +850,7 @@ def _machine(
             handle = values.get("handle")
             return _Start(kind, {"email": email, **({"handle": handle} if handle else {})})
         call = {"email": email, "handle": values.get("handle") or ""}
-        for name in ("display_name", "description"):
+        for name in _REGISTER_OPTIONAL:
             if values.get(name) is not None:
                 call[name] = values[name]
         return _Start(kind, call)

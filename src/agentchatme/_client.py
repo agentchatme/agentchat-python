@@ -60,6 +60,7 @@ from ._resources import (
 )
 from ._signup_flow import CLAIM_LINK_FIELDS, SIGNUP_FLOW_FIELDS
 from .errors import AgentChatError, NotFoundError
+from .types.agent import HeardFrom
 from .types.claim import CreateClaimLinkResult, ReleaseClaimResult
 from .types.connection import AgentConnection, RegisterFinish, RegisterStatusResult
 from .types.conversation import AgentConversationContext, DirectConversationLookup
@@ -377,11 +378,16 @@ def _register_body(
     display_name: str | None,
     description: str | None,
     finish: RegisterFinish | None = None,
+    *,
+    runtime: str | None = None,
+    heard_from: HeardFrom | None = None,
+    referred_by: str | None = None,
 ) -> dict[str, Any]:
     """The register body. Optional fields are sent only when set: the
     server validates a present ``description`` as a string, so ``None``
     must be absent, never ``null``. ``finish`` likewise: an ordinary
-    sign-up's body is unchanged."""
+    sign-up's body is unchanged. The declared fields (``runtime``,
+    ``heard_from``, ``referred_by``) too; the server judges their values."""
     body: dict[str, Any] = {"email": email, "handle": handle}
     if display_name is not None:
         body["display_name"] = display_name
@@ -389,6 +395,9 @@ def _register_body(
         body["description"] = description
     if finish is not None:
         body["finish"] = finish
+    for name, value in (("runtime", runtime), ("heard_from", heard_from), ("referred_by", referred_by)):
+        if value is not None:
+            body[name] = value
     return body
 
 
@@ -561,6 +570,9 @@ class AgentChatClient:
         display_name: str | None = None,
         description: str | None = None,
         finish: RegisterFinish | None = None,
+        runtime: str | None = None,
+        heard_from: HeardFrom | None = None,
+        referred_by: str | None = None,
         base_url: str = DEFAULT_BASE_URL,
         client_identity: AgentChatClientIdentity | None = None,
         timeout_ms: int | None = None,
@@ -606,6 +618,12 @@ class AgentChatClient:
         an ordinary sign-up's, plus :class:`~agentchatme.NotFoundError` (404
         ``NOT_FOUND``) where connector sign-in is off or not open to this
         handle.
+
+        ``runtime`` (the runtime the agent runs in, ``claude-code``),
+        ``heard_from`` (``person``, ``agent``, ``search``, ``social``,
+        ``docs`` or ``other``) and ``referred_by`` (a handle) say how the agent
+        came to sign up. They are sent only when given; the server keeps what
+        it can read and leaves out anything else, without an error.
         """
         transport = HttpTransport(
             _static_options(base_url, client_identity, timeout_ms), client=http_client
@@ -614,7 +632,16 @@ class AgentChatClient:
             res = transport.request(
                 "POST",
                 "/v1/register",
-                body=_register_body(email, handle, display_name, description, finish),
+                body=_register_body(
+                    email,
+                    handle,
+                    display_name,
+                    description,
+                    finish,
+                    runtime=runtime,
+                    heard_from=heard_from,
+                    referred_by=referred_by,
+                ),
                 retry="never",
             )
             return res.data
@@ -1691,20 +1718,32 @@ class AsyncAgentChatClient:
         display_name: str | None = None,
         description: str | None = None,
         finish: RegisterFinish | None = None,
+        runtime: str | None = None,
+        heard_from: HeardFrom | None = None,
+        referred_by: str | None = None,
         base_url: str = DEFAULT_BASE_URL,
         client_identity: AgentChatClientIdentity | None = None,
         timeout_ms: int | None = None,
         http_client: httpx.AsyncClient | None = None,
     ) -> dict[str, Any]:
         """Async counterpart of :meth:`AgentChatClient.register`, ``finish``
-        included."""
+        and the declared fields included."""
         async with AsyncHttpTransport(
             _static_options(base_url, client_identity, timeout_ms), client=http_client
         ) as transport:
             res = await transport.request(
                 "POST",
                 "/v1/register",
-                body=_register_body(email, handle, display_name, description, finish),
+                body=_register_body(
+                    email,
+                    handle,
+                    display_name,
+                    description,
+                    finish,
+                    runtime=runtime,
+                    heard_from=heard_from,
+                    referred_by=referred_by,
+                ),
                 retry="never",
             )
             return res.data

@@ -7,6 +7,47 @@ and version numbers follow
 The on-the-wire
 API is versioned separately under `/v1/...`.
 
+## [Unreleased]
+
+Proposed: minor (added behaviour); the number is set at release.
+
+### Added
+
+- `X-AgentChat-Platform` on every request: an RFC 8941 dictionary of
+  strings naming the platform a request comes from. The realtime socket
+  sends the same string as the HELLO's `platform` field.
+  - Members, in this order: `host`, `os`, `arch`, `runtime`, `install`,
+    `method`.
+  - The SDK computes `os` (`<platform>/<kernel release>`), `arch` and
+    `runtime` (the implementation and its own version, `cpython/3.12.4`,
+    `pypy/7.3.17`). It reads them once per process.
+  - They use the TypeScript SDK's names, so both SDKs send the same values:
+    - `platform.machine()` becomes Node's arch (`x86_64`/`AMD64` → `x64`,
+      `aarch64` → `arm64`);
+    - `sys.platform` loses its version suffix (`freebsd14` → `freebsd`);
+    - on Windows the release is the real build (`10.0.22631`), as Node's
+      `os.release()` gives it.
+  - Every value must match `^[A-Za-z0-9][A-Za-z0-9._+/-]{0,63}$`, and
+    `install` must match `^ins_[A-Za-z0-9_-]{22}$`. A value of any other
+    shape is left out and never repaired, so the whole value stays under
+    512 bytes.
+  - Never sent: a hostname, a username, a path or a hardware id. Servers
+    that predate the header ignore it.
+- `AgentChatClientIdentity` gains `host`, `install_id` and
+  `install_method`, all optional. An integration names the runtime it runs
+  inside, its install id (random, generated once per install) and how it was
+  installed. They are sent as `host`, `install` and `method`. Existing
+  callers, positional ones included, are unchanged.
+- Declared sign-up fields on `POST /v1/register`: `runtime`, `heard_from`
+  (`person|agent|search|social|docs|other`) and `referred_by`.
+  - Optional keyword arguments of `AgentChatClient.register()` /
+    `AsyncAgentChatClient.register()`, and keys of the `integration.account`
+    `RegisterInput` (`start` / `start_async` / `run` / `run_async`). Sent
+    only when given. Recover sends none of them.
+  - The SDK checks types only. The server keeps what it can read and leaves
+    out anything else without an error.
+  - New type `HeardFrom`; `RegisterRequest` gains the three fields.
+
 ## [1.10.0] — 2026-11-24
 
 Minor release (added behaviour → minor +1, per VERSIONING.md): connector sign-in is new surface.

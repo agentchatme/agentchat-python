@@ -77,7 +77,11 @@ from typing import (
 )
 
 from ._client import last_sync_delivery_id
-from ._client_identity import DEFAULT_CLIENT_IDENTITY, AgentChatClientIdentity
+from ._client_identity import (
+    DEFAULT_CLIENT_IDENTITY,
+    AgentChatClientIdentity,
+    platform_header_value,
+)
 from ._connect_budget import connect_budget_delay_ms
 from .errors import ConnectionError as _RealtimeConnectionError
 
@@ -954,6 +958,7 @@ class RealtimeClient:
         self._close_initiated_locally = False
         self._hello_sent = False
 
+        platform = platform_header_value(self._opts.client_identity)
         hello = json.dumps(
             {
                 "type": "hello",
@@ -967,6 +972,8 @@ class RealtimeClient:
                     if self._opts.client_identity.version
                     else {}
                 ),
+                # The X-AgentChat-Platform value, for a socket that carries no headers.
+                **({"platform": platform} if platform is not None else {}),
             }
         )
         # Before the awaited send: a message.new handler attached while the
