@@ -5,9 +5,12 @@
 # manifest against the published one. Separate from the tests on purpose:
 # they run under a network guard.)
 #
-# Run by CI on every push to main and every pull request into main, and
-# weekly by weekly.yml, so a contract change on the server is flagged
-# between pushes here. Works from any directory:
+# Run by publish.yml before every release (no release against a stale
+# contract), and weekly by weekly.yml, which flags fixtures still behind the
+# contract after the hourly copy (contract-fixtures.yml). Not by CI: a pull
+# request never turns red because agentchat.me published a new contract.
+# To copy a new contract in: bash scripts/copy-contract-fixtures.sh. Works
+# from any directory:
 #   bash scripts/check-contract-fixtures.sh
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -17,7 +20,7 @@ local_manifest="conformance/v1/manifest.sha256"
 published="$(mktemp)"
 trap 'rm -f "$published"' EXIT
 
-if ! curl -fsSL --connect-timeout 10 --max-time 30 --retry 3 "$url" -o "$published"; then
+if ! curl -fsSL --connect-timeout 10 --max-time 30 --retry 3 -H 'Cache-Control: no-cache' "$url" -o "$published"; then
   echo "::error::Could not fetch the published manifest ($url)."
   exit 1
 fi

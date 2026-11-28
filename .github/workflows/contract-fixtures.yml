@@ -1,0 +1,78 @@
+name: Contract fixtures
+
+# Copies the published contract's conformance fixtures
+# (https://agentchat.me/contract/v1/conformance/) into conformance/v1/, byte
+# for byte, and opens a pull request when they differ from main's. CI checks
+# the copy like any change, and a green copy auto-merges. A copy that stays red
+# is a real incompatibility between this SDK and the published contract: it
+# waits, red, for whoever fixes the SDK or the contract.
+#
+# One pull request at a time, from the branch contract-fixtures/copy: a later
+# copy updates the open one (.github/scripts/contract-fixtures-pr.sh).
+#
+# When it runs: hourly, and by hand (Actions → Contract fixtures → Run
+# workflow). How soon a copy lands blocks nothing: CI never compares with the
+# published contract, and publish.yml refuses a release against a stale one.
+# A `repository_dispatch` of type `contract-published` also starts it; its
+# optional `client_payload.manifest_sha256`, the sha256 of a new
+# manifest.sha256, makes the copy wait up to 15 minutes for agentchat.me to
+# serve that manifest.
+#
+# It works with the workflow's own token, no secret. GitHub holds the pull
+# request runs that token's pushes cause until someone with write access taps
+# "Approve workflows to run", so the job starts the required checks itself
+# (ci.yml, and pr-verification.yml for the copy pull request); they land on
+# the branch's head commit, where the pull request's checks are read. Opening
+# the pull request needs the repository setting "Allow GitHub Actions to
+# create and approve pull requests" (Settings → Actions → General).
+#
+# CI on pull requests and main checks only the checked-in fixtures (the
+# tests check every file against the checked-in manifest); publish.yml
+# refuses a release whose fixtures differ from the published contract.
+#
+# Its own file, not a trigger in ci.yml: GitHub turns scheduled workflows off
+# in a public repository after 60 days without activity, and that must only
+# ever stop this file. Actions → Contract fixtures → "Enable workflow" turns it
+# back on.
+
+on:
+  schedule:
+    - cron: "41 * * * *" # hourly, at :41
+  repository_dispatch:
+    types: [contract-published]
+  workflow_dispatch:
+    inputs:
+      expect_manifest_sha256:
+        description: "Optional: the sha256 of the manifest.sha256 to wait for"
+        required: false
+        default: ""
+
+permissions:
+  contents: write # push the copy branch
+  pull-requests: write # open, update or close the copy pull request
+  actions: write # start the required checks on the branch (this token's pushes start none that run unapproved)
+
+concurrency:
+  group: contract-fixtures
+  cancel-in-progress: false
+
+jobs:
+  copy:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 0
+
+      - name: Copy the published fixtures; open or update the pull request
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          EXPECT_MANIFEST: ${{ github.event.client_payload.manifest_sha256 || inputs.expect_manifest_sha256 }}
+        # Both scripts run from a copy outside the checkout: the job switches
+        # the checkout to the copy branch, and a branch someone else pushed to
+        # must not choose the code that runs with this token.
+        run: |
+          cp .github/scripts/contract-fixtures-pr.sh scripts/copy-contract-fixtures.sh "$RUNNER_TEMP/"
+          COPIER="$RUNNER_TEMP/copy-contract-fixtures.sh" bash "$RUNNER_TEMP/contract-fixtures-pr.sh"
