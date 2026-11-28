@@ -7,18 +7,30 @@ name: PR verification
 # reads only the description, from the event payload; it does not judge what
 # the lines say. Editing the description re-runs it.
 #
-# `pull_request` only (never `pull_request_target`): the job gets a read-only
+# `pull_request` (never `pull_request_target`): the job gets a read-only
 # token and no secrets, even for a PR from a fork.
+#
+# `workflow_dispatch` with a PR number: contract-fixtures.yml starts this on
+# its copy branch, because pull request runs from the workflow token's pushes
+# wait for a person to approve them. The run reads that PR through the API
+# and checks it only when the PR's head is the commit this run is on, where
+# its result counts.
 on:
   pull_request:
     types: [opened, edited, reopened, synchronize]
+  workflow_dispatch:
+    inputs:
+      pr:
+        description: "The number of the pull request whose head is the branch this runs on"
+        required: true
 
 permissions:
   contents: read
+  pull-requests: read # the dispatched run reads its pull request
 
 # The newest event carries the newest description; an older run is moot.
 concurrency:
-  group: pr-verification-${{ github.event.pull_request.number }}
+  group: pr-verification-${{ github.event.pull_request.number || inputs.pr }}
   cancel-in-progress: true
 
 jobs:
@@ -26,12 +38,37 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
+      # A dispatched run: the pull request, as the pull_request event would
+      # carry it, written to a file the checker reads in place of the event.
+      - name: Read the pull request (dispatched run)
+        id: dispatched
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ inputs.pr }}
+          REPO: ${{ github.repository }}
+          RUN_SHA: ${{ github.sha }}
+        run: |
+          if ! [[ "$PR" =~ ^[1-9][0-9]{0,9}$ ]]; then
+            echo "::error title=PR verification::The pr input must be a pull request number."
+            exit 2
+          fi
+          gh api "repos/$REPO/pulls/$PR" > "$RUNNER_TEMP/pull.json"
+          head="$(jq -r '.head.repo.full_name + "@" + .head.sha' "$RUNNER_TEMP/pull.json")"
+          if [ "$head" != "$REPO@$RUN_SHA" ]; then
+            echo "::error title=PR verification::#$PR's head is $head, not $REPO@$RUN_SHA, the commit this run is on."
+            exit 1
+          fi
+          jq '{pull_request: .}' "$RUNNER_TEMP/pull.json" > "$RUNNER_TEMP/event.json"
+          echo "base_sha=$(jq -r '.base.sha' "$RUNNER_TEMP/pull.json")" >> "$GITHUB_OUTPUT"
+          echo "event_path=$RUNNER_TEMP/event.json" >> "$GITHUB_OUTPUT"
+
       # The checker comes from the base branch, so a PR cannot change the rule
       # it is checked against. Only the one script is checked out.
       - name: Check out the checker (base branch)
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
-          ref: ${{ github.event.pull_request.base.sha }}
+          ref: ${{ github.event.pull_request.base.sha || steps.dispatched.outputs.base_sha }}
           sparse-checkout: .github/scripts/pr-verification.py
           sparse-checkout-cone-mode: false
           persist-credentials: false
@@ -45,8 +82,10 @@ jobs:
           sparse-checkout-cone-mode: false
           persist-credentials: false
 
-      # Reads the body and author from $GITHUB_EVENT_PATH; writes the result
-      # to $GITHUB_STEP_SUMMARY. PRs opened by dependabot[bot] or
-      # github-actions[bot] pass.
+      # Reads the body and author from $GITHUB_EVENT_PATH (the dispatched
+      # run's file in its place); writes the result to $GITHUB_STEP_SUMMARY.
+      # PRs opened by dependabot[bot] or github-actions[bot] pass.
       - name: Check the Verification section
-        run: python3 .github/scripts/pr-verification.py
+        env:
+          DISPATCHED_EVENT: ${{ steps.dispatched.outputs.event_path }}
+        run: GITHUB_EVENT_PATH="${DISPATCHED_EVENT:-$GITHUB_EVENT_PATH}" python3 .github/scripts/pr-verification.py

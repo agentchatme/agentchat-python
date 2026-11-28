@@ -92,6 +92,15 @@ jobs:
               exit 1
             fi
           fi
+
+      # No release against a stale contract: the conformance fixtures must be
+      # the contract agentchat.me publishes, byte for byte. CI checks them
+      # only against their own manifest; contract-fixtures.yml copies a new
+      # contract in. Not for target=test (TestPyPI, a dry run).
+      - name: Conformance fixtures match the published contract
+        if: ${{ github.event_name == 'push' || github.event.inputs.target == 'prod' }}
+        run: bash scripts/check-contract-fixtures.sh
+
   # Re-run the full check matrix on the tagged commit. Don't trust prior
   # CI status — someone could tag a feature branch directly.
   test:
