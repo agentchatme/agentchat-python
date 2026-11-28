@@ -24,7 +24,11 @@ name: Contract fixtures
 # (ci.yml, and pr-verification.yml for the copy pull request); they land on
 # the branch's head commit, where the pull request's checks are read. Opening
 # the pull request needs the repository setting "Allow GitHub Actions to
-# create and approve pull requests" (Settings → Actions → General).
+# create and approve pull requests" (Settings → Actions → General). That
+# setting also lets a workflow token approve pull requests: harmless while
+# main's ruleset requires no approving review. If it ever requires one,
+# revisit the setting first, or a workflow could approve its own copy pull
+# request.
 #
 # CI on pull requests and main checks only the checked-in fixtures (the
 # tests check every file against the checked-in manifest); publish.yml
